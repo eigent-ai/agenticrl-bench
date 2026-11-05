@@ -1,0 +1,26 @@
+148:def _tar_dir(local_dir: str | os.PathLike) -> bytes:
+149-    buf = io.BytesIO()
+150-    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+151-        tf.add(str(local_dir), arcname=".")
+152-    return buf.getvalue()
+153-
+154-
+155-def _untar(data: bytes, dest: str | os.PathLike) -> None:
+156-    dest = Path(dest)
+157-    dest.mkdir(parents=True, exist_ok=True)
+158-    with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tf:
+159-        try:
+160-            tf.extractall(dest, filter="data")
+161-        except TypeError:  # Python < 3.12 without extraction filters
+162-            for m in tf.getmembers():
+163-                target = (dest / m.name).resolve()
+164-                if not str(target).startswith(str(dest.resolve())) or m.issym() or m.islnk() or m.isdev():
+165-                    continue
+166-                tf.extract(m, dest)
+167-
+168-
+169-# ============================================================================ sync
+170-
+171-
+172-class BrokerClient:
+173-    def __init__(self, socket_path: str | None = None, connect_timeout: float = 30.0):

@@ -1,0 +1,2 @@
+- [SQL RL ground rules](sql-rl-constraints.md) — stock Miles/SGLang, changes only in examples/sql_agent, launcher recipe fixed
+- [SQL rescue findings](sql-rescue-findings.md) — stale prefix cache under in-place pushes; rescue loses to plain GRPO; see /app/NOTES.md

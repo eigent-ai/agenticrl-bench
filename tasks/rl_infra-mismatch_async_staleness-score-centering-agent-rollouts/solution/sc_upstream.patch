@@ -1,0 +1,1827 @@
+diff --git a/miles/backends/megatron_utils/model.py b/miles/backends/megatron_utils/model.py
+index b22d2dc137..ae613d244e 100644
+--- a/miles/backends/megatron_utils/model.py
++++ b/miles/backends/megatron_utils/model.py
+@@ -439,7 +439,7 @@ def run_forward_backward_pass(
+ 
+     sampling_mask_keys = (
+         ("rollout_sampling_mask_ids", "rollout_sampling_mask_offsets")
+-        if args.use_sampling_support_replay and args.loss_type == "policy_loss"
++        if args.use_sampling_support_replay and args.loss_type in ("policy_loss", "score_centering")
+         else ()
+     )
+ 
+@@ -476,6 +476,9 @@ def run_forward_backward_pass(
+                 "advantages",
+                 "returns",
+                 "rollout_log_probs",
++                "rollout_topk_token_ids",
++                "rollout_topk_lengths",
++                "rollout_topk_log_probs",
+                 "max_seq_lens",
+                 "witness_ids",
+                 "opd_reverse_kl",
+@@ -528,7 +531,9 @@ def run_forward_backward_pass(
+             if (x := batch["multimodal_train_inputs"]) is not None:
+                 forward_kwargs.update(x)
+ 
+-            output_tensor = model(**forward_kwargs, fp32_output=args.loss_type not in ("policy_loss", "sft_loss"))
++            output_tensor = model(
++                **forward_kwargs, fp32_output=args.loss_type not in ("policy_loss", "sft_loss", "score_centering")
++            )
+ 
+         for m, old_stage in zip(all_replay_managers, old_stages, strict=True):
+             m.stage = old_stage
+diff --git a/miles/backends/training_utils/data/context_parallel.py b/miles/backends/training_utils/data/context_parallel.py
+index a0fb6da436..910e5f04aa 100644
+--- a/miles/backends/training_utils/data/context_parallel.py
++++ b/miles/backends/training_utils/data/context_parallel.py
+@@ -342,7 +342,8 @@ def allgather_cp_redistribute(
+     Args:
+         res: Dict mapping metric names to lists of per-sample tensors.
+         logits: Model output used only to determine the local sequence length
+-            (``logits.size(1)``).
++            (``logits.size(1)``). For ``bshd``, each batch row has its own
++            sequence window.
+         args: Configuration (needs ``qkv_format``).
+         total_lengths: Total sequence lengths (prompt + response) per sample.
+         response_lengths: Response segment lengths per sample.
+@@ -362,24 +363,28 @@ def allgather_cp_redistribute(
+         seq_start = 0
+         for value, total_length, response_length in zip(values, total_lengths, response_lengths, strict=False):
+             prompt_length = total_length - response_length
+-            logit_global_start = seq_start + prompt_length - 1
+-            logit_global_end = seq_start + total_length - 1
++            sample_start = 0 if args.qkv_format == "bshd" else seq_start
++            logit_global_start = sample_start + prompt_length - 1
++            logit_global_end = sample_start + total_length - 1
+ 
+             s = max(logit_global_start, chunk_start)
+             e = min(logit_global_end, chunk_end)
+ 
+             if e <= s:
+                 # This rank has no response logprobs for this sample
+-                full_resp = torch.zeros(
+-                    response_length,
+-                    dtype=value.dtype,
+-                    device=value.device,
+-                    requires_grad=True,
++                full_resp = (
++                    torch.zeros(
++                        (response_length, *value.shape[1:]),
++                        dtype=value.dtype,
++                        device=value.device,
++                        requires_grad=True,
++                    )
++                    + value.sum() * 0
+                 )
+             else:
+                 resp_start = s - logit_global_start
+                 resp_end = e - logit_global_start
+-                full_resp = F.pad(value, (resp_start, response_length - resp_end))
++                full_resp = F.pad(value, (0, 0) * (value.ndim - 1) + (resp_start, response_length - resp_end))
+ 
+             assert full_resp.size(0) == response_length, f"Expected {response_length}, got {full_resp.size(0)}"
+             full_resps.append(full_resp)
+diff --git a/miles/backends/training_utils/loss/hub/logit_processors.py b/miles/backends/training_utils/loss/hub/logit_processors.py
+index 4066096031..100ff22a21 100644
+--- a/miles/backends/training_utils/loss/hub/logit_processors.py
++++ b/miles/backends/training_utils/loss/hub/logit_processors.py
+@@ -9,6 +9,7 @@ from miles.backends.training_utils.data.context_parallel import (
+ )
+ from miles.backends.training_utils.data.sampling_mask import build_local_sampling_mask
+ from miles.backends.training_utils.loss.hub.math_utils import calculate_log_probs_and_entropy
++from miles.backends.training_utils.loss.hub.score_centering import selected_log_probs_and_entropy
+ from miles.backends.training_utils.parallel import get_parallel_state
+ from miles.utils.sampling_mask import RolloutSamplingMask
+ 
+@@ -89,16 +90,23 @@ def _iter_response_chunks(
+             tokens_chunk = tokens[-response_length:] if response_length else tokens[0:0]
+             response_indices = range(response_length) if include_response_indices else ()
+         elif args.allgather_cp:
+-            # DSA: global concat then contiguous CP split. Each rank owns logits for
+-            # global positions [chunk_start, chunk_end).
+-            logits_local_len = logits.size(0)
++            # THD concatenates samples before the CP split. BSHD splits each
++            # padded sample independently, then flattens the local batch.
++            if qkv_format == "bshd":
++                logits_local_len = max_seq_len // cp_size
++                logits_offset = i * logits_local_len
++                sample_start = 0
++            else:
++                logits_local_len = logits.size(0)
++                logits_offset = 0
++                sample_start = seq_start
+             cp_rank = parallel_state.cp.rank
+             chunk_start = cp_rank * logits_local_len
+             chunk_end = chunk_start + logits_local_len
+ 
+             prompt_length = total_length - response_length
+-            resp_token_start = seq_start + prompt_length
+-            resp_token_end = seq_start + total_length
++            resp_token_start = sample_start + prompt_length
++            resp_token_end = sample_start + total_length
+             logit_global_start = resp_token_start - 1
+             logit_global_end = resp_token_end - 1
+ 
+@@ -109,8 +117,8 @@ def _iter_response_chunks(
+                 tokens_chunk = tokens[0:0]
+                 response_indices = ()
+             else:
+-                logits_chunk = logits[s - chunk_start : e - chunk_start]
+-                tokens_chunk = tokens[(s + 1) - seq_start : (e + 1) - seq_start]
++                logits_chunk = logits[logits_offset + s - chunk_start : logits_offset + e - chunk_start]
++                tokens_chunk = tokens[(s + 1) - sample_start : (e + 1) - sample_start]
+                 response_indices = (
+                     range(
+                         s - logit_global_start,
+@@ -253,19 +261,34 @@ def get_log_probs_and_entropy(
+                 response_indices,
+                 tp_rank=parallel_state.tp.rank,
+             )
+-        log_prob, entropy = calculate_log_probs_and_entropy(
+-            logits_chunk,
+-            tokens_chunk,
+-            parallel_state.tp.group,
+-            with_entropy=with_entropy,
+-            entropy_requires_grad=entropy_requires_grad,
+-            chunk_size=args.log_probs_chunk_size,
+-            true_on_policy=args.true_on_policy_mode,
+-            vocab_size=getattr(args, "vocab_size", None),
+-            sampling_mask=sampling_mask,
+-            temperature=1.0 if args.true_on_policy_mode else args.rollout_temperature,
+-            debug_unified_grad_fused_logprob=args.debug_unified_grad_fused_logprob,
+-        )
++        if getattr(args, "loss_type", None) == "score_centering" and sampling_mask is None:
++            # Reference KL compares these with the score-centering actor score, which
++            # normalizes over the true vocabulary instead of Megatron's padded one.
++            log_prob, entropy = selected_log_probs_and_entropy(
++                logits_chunk,
++                tokens_chunk.unsqueeze(-1),
++                group=parallel_state.tp.group if parallel_state.tp.size > 1 else None,
++                vocab_size=getattr(args, "vocab_size", None),
++                temperature=args.rollout_temperature,
++                chunk_size=args.log_probs_chunk_size,
++                with_entropy=with_entropy,
++            )
++            if not entropy_requires_grad:
++                entropy = entropy.detach()
++        else:
++            log_prob, entropy = calculate_log_probs_and_entropy(
++                logits_chunk,
++                tokens_chunk,
++                parallel_state.tp.group,
++                with_entropy=with_entropy,
++                entropy_requires_grad=entropy_requires_grad,
++                chunk_size=args.log_probs_chunk_size,
++                true_on_policy=args.true_on_policy_mode,
++                vocab_size=getattr(args, "vocab_size", None),
++                sampling_mask=sampling_mask,
++                temperature=1.0 if args.true_on_policy_mode else args.rollout_temperature,
++                debug_unified_grad_fused_logprob=args.debug_unified_grad_fused_logprob,
++            )
+ 
+         log_probs_list.append(log_prob.squeeze(-1))
+         if with_entropy:
+diff --git a/miles/backends/training_utils/loss/hub/losses.py b/miles/backends/training_utils/loss/hub/losses.py
+index e2e3e90155..b48b7ab762 100644
+--- a/miles/backends/training_utils/loss/hub/losses.py
++++ b/miles/backends/training_utils/loss/hub/losses.py
+@@ -19,6 +19,7 @@ from miles.backends.training_utils.loss.hub.math_utils import (
+     compute_opsm_mask,
+     compute_policy_loss,
+ )
++from miles.backends.training_utils.loss.hub.score_centering_loss import score_centering_loss_function
+ from miles.backends.training_utils.parallel import get_parallel_state
+ from miles.utils.function_registry import load_function
+ from miles.utils.types import RolloutBatch
+@@ -518,6 +519,8 @@ def get_loss_function(args: Namespace, loss_fn: str | None = None) -> LossFuncti
+ 
+         return TINKER_LOSS_FUNCTIONS[loss_fn]
+     match args.loss_type:
++        case "score_centering":
++            return score_centering_loss_function
+         case "policy_loss":
+             return policy_loss_function
+         case "value_loss":
+diff --git a/miles/backends/training_utils/loss/hub/score_centering/__init__.py b/miles/backends/training_utils/loss/hub/score_centering/__init__.py
+new file mode 100644
+index 0000000000..cb3ad4d508
+--- /dev/null
++++ b/miles/backends/training_utils/loss/hub/score_centering/__init__.py
+@@ -0,0 +1,21 @@
++"""Score centering from arXiv:2609.20807, Appendix A."""
++
++from miles.backends.training_utils.loss.hub.score_centering.estimator import (
++    ScoreCenteringInputs,
++    ScoreCenteringMetrics,
++    score_centering_loss,
++)
++from miles.backends.training_utils.loss.hub.score_centering.importance_sampling import importance_weights
++from miles.backends.training_utils.loss.hub.score_centering.selected_log_probs import (
++    selected_log_probs,
++    selected_log_probs_and_entropy,
++)
++
++__all__ = [
++    "ScoreCenteringInputs",
++    "ScoreCenteringMetrics",
++    "importance_weights",
++    "score_centering_loss",
++    "selected_log_probs",
++    "selected_log_probs_and_entropy",
++]
+diff --git a/miles/backends/training_utils/loss/hub/score_centering/estimator.py b/miles/backends/training_utils/loss/hub/score_centering/estimator.py
+new file mode 100644
+index 0000000000..061115d5be
+--- /dev/null
++++ b/miles/backends/training_utils/loss/hub/score_centering/estimator.py
+@@ -0,0 +1,95 @@
++"""Score centering from arXiv:2609.20807, Appendix A.
++
++The sampler distribution is fixed data. Both the importance weights and the
++head residual must be detached: differentiating either changes the estimator.
++"""
++
++from dataclasses import dataclass, fields
++
++import torch
++
++from miles.backends.training_utils.loss.hub.score_centering.importance_sampling import importance_sampling
++from miles.backends.training_utils.loss.hub.score_centering.masks import (
++    drop_inactive_nan,
++    head_probs,
++    sanitize_head_log_probs,
++    scored_log_probs,
++)
++
++
++@dataclass(frozen=True)
++class ScoreCenteringInputs:
++    """Sample tensors are [tokens]; head tensors and mask are [tokens, candidates]."""
++
++    train_log_probs: torch.Tensor
++    train_head_log_probs: torch.Tensor
++    rollout_log_probs: torch.Tensor
++    rollout_head_log_probs: torch.Tensor
++    head_mask: torch.Tensor
++    advantages: torch.Tensor
++    mode: str = "none"
++    tis_clip: float = 2.0
++    mis_low: float = 0.5
++    mis_high: float = 5.0
++    eps: float = 1e-6
++
++    def __post_init__(self) -> None:
++        if (
++            self.train_log_probs.ndim != 1
++            or self.rollout_log_probs.shape != self.train_log_probs.shape
++            or self.advantages.shape != self.train_log_probs.shape
++            or self.train_head_log_probs.ndim != 2
++            or self.train_head_log_probs.shape[0] != self.train_log_probs.shape[0]
++            or self.rollout_head_log_probs.shape != self.train_head_log_probs.shape
++            or self.head_mask.shape != self.train_head_log_probs.shape
++        ):
++            raise ValueError("Score-centering sample tensors must be [tokens] and head tensors [tokens, candidates]")
++
++
++@dataclass(frozen=True)
++class ScoreCenteringMetrics:
++    """Detached per-token diagnostics before the training loss reducer."""
++
++    correction: torch.Tensor
++    train_head_mass: torch.Tensor
++    rollout_head_mass: torch.Tensor
++    tail_ratio: torch.Tensor
++    importance_weight: torch.Tensor
++
++    def as_log_dict(self) -> dict[str, torch.Tensor]:
++        """Map existing log names to the tensors without copying their storage."""
++        return {f"sc_{field.name}": getattr(self, field.name) for field in fields(self)}
++
++
++def score_centering_loss(inputs: ScoreCenteringInputs) -> tuple[torch.Tensor, ScoreCenteringMetrics]:
++    """Return unreduced token losses and detached token metrics.
++
++    Inputs have shape [tokens], except head tensors/mask [tokens, candidates].
++    Missing head slots have a false mask. Tail masses use the appendix's floor;
++    cancellation is exact for a full distribution, approximate for a true tail
++    that differs from the modeled, rescaled trainer tail.
++    """
++    sampling = importance_sampling(
++        inputs.mode, tis_clip=inputs.tis_clip, mis_low=inputs.mis_low, mis_high=inputs.mis_high
++    )
++    active = inputs.advantages.detach() != 0
++    train_head = sanitize_head_log_probs(inputs.train_head_log_probs, inputs.head_mask, active)
++    rollout_head = sanitize_head_log_probs(inputs.rollout_head_log_probs, inputs.head_mask, active)
++    with torch.no_grad():
++        p, q = head_probs(train_head, inputs.head_mask), head_probs(rollout_head, inputs.head_mask)
++        p_mass, q_mass = p.sum(-1), q.sum(-1)
++        rho = (1 - q_mass).clamp_min(inputs.eps) / (1 - p_mass).clamp_min(inputs.eps)
++        alpha = sampling.tail_scale(rho, p.dtype)
++        residual = sampling.head_mass(p, q, train_head - rollout_head) - alpha.unsqueeze(-1) * p
++        weight = sampling.sample_weight(
++            drop_inactive_nan(inputs.train_log_probs - inputs.rollout_log_probs, active, 0.0)
++        )
++    correction = (residual * scored_log_probs(train_head, residual)).sum(-1)
++    loss = -inputs.advantages.detach() * (weight * scored_log_probs(inputs.train_log_probs, weight) - correction)
++    return loss, ScoreCenteringMetrics(
++        correction=correction.detach(),
++        train_head_mass=p_mass,
++        rollout_head_mass=q_mass,
++        tail_ratio=rho,
++        importance_weight=weight,
++    )
+diff --git a/miles/backends/training_utils/loss/hub/score_centering/importance_sampling.py b/miles/backends/training_utils/loss/hub/score_centering/importance_sampling.py
+new file mode 100644
+index 0000000000..8d795ef055
+--- /dev/null
++++ b/miles/backends/training_utils/loss/hub/score_centering/importance_sampling.py
+@@ -0,0 +1,105 @@
++"""Importance sampling for score centering (arXiv:2609.20807, Appendix A.2/A.3).
++
++Each scheme applies an importance-sampling weight function f to the ratio
++r = p / q. It supplies the terms of Eq. 12, whose head coefficient is
++q * f(p / q) - alpha * p with tail scale alpha = rho * f(1 / rho), and the
++sampled-token weight of the loss:
++
++- ``head_mass(p, q, log_ratio)``: q * f(p / q) on the head candidates;
++- ``tail_scale(rho, dtype)``: alpha = rho * f(1 / rho), where rho is the
++  sampler-to-trainer tail-mass ratio;
++- ``sample_weight(log_ratio)``: f(r) for the sampled token.
++
++No term exponentiates an unbounded ratio.
++"""
++
++import math
++from dataclasses import dataclass
++
++import torch
++
++
++@dataclass(frozen=True)
++class NoImportanceSampling:
++    """Vanilla score centering: f(r) = 1."""
++
++    def head_mass(self, p: torch.Tensor, q: torch.Tensor, log_ratio: torch.Tensor) -> torch.Tensor:
++        return q
++
++    def tail_scale(self, rho: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
++        return rho
++
++    def sample_weight(self, log_ratio: torch.Tensor) -> torch.Tensor:
++        return torch.ones_like(log_ratio)
++
++
++@dataclass(frozen=True)
++class TruncatedImportanceSampling:
++    """Truncated importance sampling (TIS): f(r) = min(r, clip)."""
++
++    clip: float
++
++    def head_mass(self, p: torch.Tensor, q: torch.Tensor, log_ratio: torch.Tensor) -> torch.Tensor:
++        # q * min(p/q, c), including q=0, without 0 * inf.
++        return torch.minimum(p, self.clip * q)
++
++    def tail_scale(self, rho: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
++        return (self.clip * rho).clamp_max(1)
++
++    def sample_weight(self, log_ratio: torch.Tensor) -> torch.Tensor:
++        if torch.isnan(log_ratio).any():
++            raise ValueError("Score-centering importance log-ratio contains NaN")
++        return log_ratio.clamp(max=math.log(self.clip)).exp()
++
++
++@dataclass(frozen=True)
++class MaskedImportanceSampling:
++    """Masked importance sampling (MIS): f(r) = r for low <= r <= high, else 0."""
++
++    low: float
++    high: float
++
++    def _inside(self, log_ratio: torch.Tensor) -> torch.Tensor:
++        """Whether low <= r <= high, tested on log(r)."""
++        return (log_ratio >= math.log(self.low)) & (log_ratio <= math.log(self.high))
++
++    def head_mass(self, p: torch.Tensor, q: torch.Tensor, log_ratio: torch.Tensor) -> torch.Tensor:
++        return torch.where(self._inside(log_ratio), p, 0.0)
++
++    def tail_scale(self, rho: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
++        return ((rho >= 1 / self.high) & (rho <= 1 / self.low)).to(dtype)
++
++    def sample_weight(self, log_ratio: torch.Tensor) -> torch.Tensor:
++        if torch.isnan(log_ratio).any():
++            raise ValueError("Score-centering importance log-ratio contains NaN")
++        return torch.where(self._inside(log_ratio), log_ratio.clamp(max=math.log(self.high)).exp(), 0.0)
++
++
++def importance_sampling(
++    mode: str, *, tis_clip: float, mis_low: float, mis_high: float
++) -> NoImportanceSampling | TruncatedImportanceSampling | MaskedImportanceSampling:
++    """Validate the parameters of ``mode`` and return its importance sampling."""
++    if mode == "tis" and (not math.isfinite(tis_clip) or tis_clip <= 0):
++        raise ValueError("Score-centering TIS clip must be positive and finite")
++    if mode == "mis" and (not math.isfinite(mis_low) or not math.isfinite(mis_high) or not 0 < mis_low <= mis_high):
++        raise ValueError("Score-centering MIS bounds must be finite with 0 < low <= high")
++    if mode == "none":
++        return NoImportanceSampling()
++    if mode == "tis":
++        return TruncatedImportanceSampling(clip=tis_clip)
++    if mode == "mis":
++        return MaskedImportanceSampling(low=mis_low, high=mis_high)
++    raise ValueError(f"Unknown score-centering importance weighting: {mode}")
++
++
++def importance_weights(
++    log_ratio: torch.Tensor,
++    mode: str,
++    *,
++    tis_clip: float = 2.0,
++    mis_low: float = 0.5,
++    mis_high: float = 5.0,
++) -> torch.Tensor:
++    """Evaluate token-level weights without exponentiating unbounded ratios."""
++    sampling = importance_sampling(mode, tis_clip=tis_clip, mis_low=mis_low, mis_high=mis_high)
++    return sampling.sample_weight(log_ratio)
+diff --git a/miles/backends/training_utils/loss/hub/score_centering/masks.py b/miles/backends/training_utils/loss/hub/score_centering/masks.py
+new file mode 100644
+index 0000000000..466710b560
+--- /dev/null
++++ b/miles/backends/training_utils/loss/hub/score_centering/masks.py
+@@ -0,0 +1,40 @@
++"""Masking rules for score-centering log-probabilities.
++
++Candidate slots outside ``head_mask`` are padding: their log-probability is a
++finite placeholder and their probability is zero, so padding never contributes
++to the loss. NaN on inactive (zero-advantage) tokens becomes zero mass.
++``-inf`` represents zero probability; scored terms mask non-finite values
++before multiplication.
++"""
++
++import torch
++
++
++def _token_mask(active: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
++    """Broadcast a per-token mask [tokens] over values [tokens, ...]."""
++    return active.reshape(active.shape + (1,) * (values.ndim - active.ndim))
++
++
++def drop_inactive_nan(values: torch.Tensor, active: torch.Tensor, fill: float) -> torch.Tensor:
++    """Replace NaN on inactive tokens with ``fill``; preserve values on active tokens."""
++    return torch.where(~_token_mask(active, values) & torch.isnan(values), fill, values)
++
++
++def sanitize_head_log_probs(log_probs: torch.Tensor, head_mask: torch.Tensor, active: torch.Tensor) -> torch.Tensor:
++    """Head log-probabilities with inactive NaN mapped to ``-inf`` and padding to the placeholder 0."""
++    return torch.where(head_mask, drop_inactive_nan(log_probs, active, -torch.inf), 0.0)
++
++
++def head_probs(log_probs: torch.Tensor, head_mask: torch.Tensor) -> torch.Tensor:
++    """Probabilities of the head candidates, zero at padding."""
++    return log_probs.exp().masked_fill(~head_mask, 0.0)
++
++
++def scored_log_probs(log_probs: torch.Tensor, coefficient: torch.Tensor) -> torch.Tensor:
++    """Log-probabilities that enter the loss, zeroed wherever the coefficient is zero.
++
++    Masking before the multiply keeps ``0 * -inf`` from turning the loss into NaN.
++    """
++    finite = torch.isfinite(log_probs)
++    scored = coefficient != 0
++    return torch.where(scored & finite, log_probs, 0.0)
+diff --git a/miles/backends/training_utils/loss/hub/score_centering/selected_log_probs.py b/miles/backends/training_utils/loss/hub/score_centering/selected_log_probs.py
+new file mode 100644
+index 0000000000..b1b0d81a21
+--- /dev/null
++++ b/miles/backends/training_utils/loss/hub/score_centering/selected_log_probs.py
+@@ -0,0 +1,177 @@
++"""Selected-token log-probabilities from vocabulary-sharded logits."""
++
++from typing import Any
++
++import torch
++import torch.distributed as dist
++
++
++class _SelectedLogProbs(torch.autograd.Function):
++    """Vocabulary-sharded log-softmax gather with a replicated loss on TP ranks.
++
++    Only selected logits and normalization scalars are communicated. Backward
++    computes each rank's vocabulary slice directly; reducing identical output
++    gradients across TP ranks would incorrectly multiply the gradient by TP.
++    """
++
++    @staticmethod
++    def forward(
++        ctx: Any,
++        logits: torch.Tensor,
++        token_ids: torch.Tensor,
++        group: dist.ProcessGroup | None,
++        vocab_size: int,
++        with_entropy: bool,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        rank = dist.get_rank(group) if group is not None else 0
++        width = logits.shape[-1]
++        valid = token_ids >= 0
++        local_ids = token_ids - rank * width
++        local = valid & (local_ids >= 0) & (local_ids < width)
++        local_ids = local_ids.clamp(0, width - 1)
++        padded = torch.arange(width, device=logits.device) + rank * width >= vocab_size
++        work = logits.masked_fill(padded, -torch.inf)
++        maximum = work.amax(-1, keepdim=True)
++        if group is not None:
++            dist.all_reduce(maximum, op=dist.ReduceOp.MAX, group=group)
++        probabilities = (work - maximum).exp()
++        denominator = probabilities.sum(-1, keepdim=True)
++        selected = torch.where(local, work.gather(-1, local_ids), 0.0)
++        if group is not None:
++            dist.all_reduce(denominator, group=group)
++            dist.all_reduce(selected, group=group)
++        probabilities.div_(denominator)
++        entropy = probabilities.new_zeros(probabilities.size(0))
++        if with_entropy:
++            entropy = -(probabilities * torch.where(probabilities > 0, probabilities.log(), 0.0)).sum(-1)
++            if group is not None:
++                dist.all_reduce(entropy, group=group)
++        ctx.with_entropy = with_entropy
++        ctx.save_for_backward(probabilities, local_ids, local, valid, entropy)
++        return torch.where(valid, selected - maximum - denominator.log(), 0.0), entropy
++
++    @staticmethod
++    def backward(
++        ctx: Any, grad_output: torch.Tensor, grad_entropy: torch.Tensor
++    ) -> tuple[torch.Tensor, None, None, None, None]:
++        probabilities, local_ids, local, valid, entropy = ctx.saved_tensors
++        grad = grad_output.masked_fill(~valid, 0.0)
++        grad_logits = probabilities * (-grad.sum(-1, keepdim=True))
++        grad_logits.scatter_add_(-1, local_ids, grad.masked_fill(~local, 0.0))
++        if ctx.with_entropy:
++            logp = torch.where(probabilities > 0, probabilities.log(), 0.0)
++            grad_logits -= grad_entropy.unsqueeze(-1) * probabilities * (logp + entropy.unsqueeze(-1))
++        return grad_logits, None, None, None, None
++
++
++class _SupportLogProbs(torch.autograd.Function):
++    """Score the sampled token and complete support without saving vocabulary-sized probabilities."""
++
++    @staticmethod
++    def forward(
++        ctx: Any,
++        logits: torch.Tensor,
++        token_ids: torch.Tensor,
++        group: dist.ProcessGroup | None,
++        temperature: float,
++        with_entropy: bool,
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        rank = dist.get_rank(group) if group is not None else 0
++        width = logits.size(-1)
++        valid = token_ids >= 0
++        local_ids = token_ids - rank * width
++        local = valid & (local_ids >= 0) & (local_ids < width)
++        local_ids = local_ids.clamp(0, width - 1)
++        dtype = torch.float64 if logits.dtype == torch.float64 else torch.float32
++        selected = torch.where(local, logits.gather(-1, local_ids).to(dtype), 0.0) / temperature
++        if group is not None:
++            dist.all_reduce(selected, group=group)
++        head_valid = valid[:, 1:]
++        has_support = head_valid.any(-1, keepdim=True)
++        head = selected[:, 1:].masked_fill(~head_valid, -torch.inf)
++        head = torch.where(has_support, head, 0.0)
++        logp = selected - torch.logsumexp(head, dim=-1, keepdim=True)
++        logp = torch.where(valid & has_support, logp, 0.0)
++        probabilities = torch.where(head_valid, logp[:, 1:].exp(), 0.0)
++        entropy = logits.new_zeros(logits.size(0), dtype=dtype)
++        if with_entropy:
++            entropy = -(probabilities * torch.where(probabilities > 0, logp[:, 1:], 0.0)).sum(-1)
++        ctx.logits_shape = logits.shape
++        ctx.temperature = temperature
++        ctx.with_entropy = with_entropy
++        ctx.save_for_backward(probabilities, local_ids, local, valid & has_support, entropy)
++        return logp, entropy
++
++    @staticmethod
++    def backward(
++        ctx: Any,
++        grad_output: torch.Tensor,
++        grad_entropy: torch.Tensor,
++    ) -> tuple[torch.Tensor, None, None, None, None]:
++        probabilities, local_ids, local, valid, entropy = ctx.saved_tensors
++        grad = grad_output.masked_fill(~valid, 0.0)
++        head_grad = probabilities * (-grad.sum(-1, keepdim=True))
++        if ctx.with_entropy:
++            logp = torch.where(probabilities > 0, probabilities.log(), 0.0)
++            head_grad -= grad_entropy.unsqueeze(-1) * probabilities * (logp + entropy.unsqueeze(-1))
++        grad_logits = grad.new_zeros(ctx.logits_shape)
++        grad_logits.scatter_add_(-1, local_ids, grad.masked_fill(~local, 0.0))
++        grad_logits.scatter_add_(-1, local_ids[:, 1:], head_grad.masked_fill(~local[:, 1:], 0.0))
++        grad_logits.div_(ctx.temperature)
++        return grad_logits, None, None, None, None
++
++
++def selected_log_probs(
++    logits: torch.Tensor,
++    token_ids: torch.Tensor,
++    *,
++    group: dist.ProcessGroup | None = None,
++    vocab_size: int | None = None,
++    temperature: float = 1.0,
++    chunk_size: int = -1,
++) -> torch.Tensor:
++    """Log-probabilities at global IDs [T, K] from local logits [T, V/TP].
++
++    -1 is a padding ID and produces zero with zero gradient. The true vocabulary
++    size excludes Megatron's padded vocabulary entries from normalization.
++    """
++    return selected_log_probs_and_entropy(
++        logits, token_ids, group=group, vocab_size=vocab_size, temperature=temperature, chunk_size=chunk_size
++    )[0]
++
++
++def selected_log_probs_and_entropy(
++    logits: torch.Tensor,
++    token_ids: torch.Tensor,
++    *,
++    group: dist.ProcessGroup | None = None,
++    vocab_size: int | None = None,
++    temperature: float = 1.0,
++    chunk_size: int = -1,
++    with_entropy: bool = False,
++    sampling_support: bool = False,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Selected logprobs and optional entropy of the same unpadded distribution.
++
++    With sampling_support, column zero is the sampled token and remaining
++    columns are the complete support. Rows without candidates contribute zero.
++    """
++    size = dist.get_world_size(group) if group is not None else 1
++    vocab_size = vocab_size if vocab_size is not None else logits.size(-1) * size
++    if temperature <= 0 or not 0 < vocab_size <= logits.size(-1) * size:
++        raise ValueError("Score centering needs a positive temperature and valid vocabulary size")
++    if token_ids.ndim != 2 or logits.ndim != 2 or logits.size(0) != token_ids.size(0):
++        raise ValueError("Expected logits [T, V/TP] and selected token IDs [T, K]")
++    if ((token_ids < -1) | (token_ids >= vocab_size)).any():
++        raise ValueError("Score-centering token ID is outside the model vocabulary")
++    if logits.size(0) == 0:
++        return logits.sum(-1, keepdim=True).expand_as(token_ids), logits.sum(-1)
++    chunk_size = chunk_size if chunk_size > 0 else logits.size(0)
++    dtype = torch.float64 if logits.dtype == torch.float64 else torch.float32
++    chunks = []
++    for chunk, ids in zip(logits.split(chunk_size), token_ids.split(chunk_size), strict=True):
++        if sampling_support:
++            chunks.append(_SupportLogProbs.apply(chunk, ids, group, temperature, with_entropy))
++        else:
++            chunks.append(_SelectedLogProbs.apply(chunk.to(dtype) / temperature, ids, group, vocab_size, with_entropy))
++    return torch.cat([chunk[0] for chunk in chunks]), torch.cat([chunk[1] for chunk in chunks])
+diff --git a/miles/backends/training_utils/loss/hub/score_centering_loss.py b/miles/backends/training_utils/loss/hub/score_centering_loss.py
+new file mode 100644
+index 0000000000..942205b249
+--- /dev/null
++++ b/miles/backends/training_utils/loss/hub/score_centering_loss.py
+@@ -0,0 +1,211 @@
++"""Integrate score centering with response alignment and Miles loss reduction."""
++
++from argparse import Namespace
++from collections.abc import Callable
++
++import torch
++
++from miles.backends.training_utils.data.context_parallel import (
++    allgather_cp_redistribute,
++    get_local_response_loss_masks,
++    slice_log_prob_with_cp,
++)
++from miles.backends.training_utils.loss.hub.logit_processors import _iter_response_chunks
++from miles.backends.training_utils.loss.hub.math_utils import compute_approx_kl
++from miles.backends.training_utils.loss.hub.score_centering import (
++    ScoreCenteringInputs,
++    score_centering_loss,
++    selected_log_probs_and_entropy,
++)
++from miles.backends.training_utils.parallel import get_parallel_state
++from miles.utils.types import RolloutBatch
++
++
++def _candidate_ids(batch: RolloutBatch, sample: int, indices: torch.Tensor) -> torch.Tensor:
++    if batch.get("rollout_topk_token_ids") is not None:
++        return torch.as_tensor(batch["rollout_topk_token_ids"][sample])[indices].long()
++    lengths = torch.as_tensor(batch["rollout_topk_lengths"][sample])[indices]
++    offsets = torch.as_tensor(batch["rollout_sampling_mask_offsets"][sample])[indices]
++    support = torch.as_tensor(batch["rollout_sampling_mask_ids"][sample])
++    width = batch["rollout_topk_log_probs"][sample].shape[-1]
++    columns = torch.arange(width)
++    valid = columns < lengths[:, None]
++    ids = torch.full((len(indices), width), -1, dtype=torch.long)
++    ids[valid] = support[(offsets[:, None] + columns)[valid]].long()
++    return ids
++
++
++def _candidate_log_probs(args: Namespace, batch: RolloutBatch, logits: torch.Tensor) -> dict[str, list[torch.Tensor]]:
++    parallel = get_parallel_state()
++    result = {"selected": []}
++    if args.use_kl_loss:
++        result["kl_log_probs"] = []
++    with_entropy = args.entropy_coef != 0 or args.observe_training_entropy
++    replay = getattr(args, "use_sampling_support_replay", False)
++    support_only = replay and not args.use_kl_loss
++    if with_entropy:
++        result["entropy"] = []
++    chunks = _iter_response_chunks(
++        logits,
++        args=args,
++        unconcat_tokens=batch["unconcat_tokens"],
++        total_lengths=batch["total_lengths"],
++        response_lengths=batch["response_lengths"],
++        max_seq_lens=batch.get("max_seq_lens"),
++        include_response_indices=True,
++    )
++    for i, (chunk, tokens, indices) in enumerate(chunks):
++        indices = torch.as_tensor(list(indices), dtype=torch.long)
++        ids = _candidate_ids(batch, i, indices).to(logits.device)
++        ids = torch.cat((tokens.unsqueeze(-1), ids), dim=-1)
++        selected, entropy = selected_log_probs_and_entropy(
++            chunk,
++            ids,
++            group=parallel.tp.group if parallel.tp.size > 1 else None,
++            vocab_size=getattr(args, "vocab_size", None),
++            temperature=args.rollout_temperature,
++            chunk_size=args.log_probs_chunk_size,
++            with_entropy=with_entropy and (not replay or support_only),
++            sampling_support=support_only,
++        )
++        if args.use_kl_loss:
++            # The reference forward scores the full vocabulary, not the replayed support.
++            result["kl_log_probs"].append(selected[:, 0])
++        if replay and not support_only:
++            # The saved candidates cover the entire realized support. Their
++            # full-vocabulary logprobs share a normalizer, which cancels here.
++            head_valid = ids[:, 1:] >= 0
++            head = selected[:, 1:].masked_fill(~head_valid, -torch.inf)
++            normalizer = torch.logsumexp(head, dim=-1, keepdim=True)
++            normalizer = torch.where(head_valid.any(-1, keepdim=True), normalizer, 0.0)
++            selected = selected - normalizer
++            if with_entropy:
++                head = selected[:, 1:].masked_fill(~head_valid, -torch.inf)
++                entropy = -(head.exp() * torch.where(torch.isfinite(head), head, 0.0)).sum(-1)
++        result["selected"].append(selected)
++        if with_entropy:
++            result["entropy"].append(entropy)
++    if args.allgather_cp and parallel.cp.size > 1:
++        allgather_cp_redistribute(
++            result,
++            logits=logits,
++            args=args,
++            total_lengths=batch["total_lengths"],
++            response_lengths=batch["response_lengths"],
++            max_seq_lens=batch.get("max_seq_lens"),
++        )
++    return result
++
++
++def _local_candidates(args: Namespace, batch: RolloutBatch, key: str, device: torch.device) -> torch.Tensor:
++    values = []
++    for i, (total, response) in enumerate(zip(batch["total_lengths"], batch["response_lengths"], strict=True)):
++        maximum = batch["max_seq_lens"][i] if batch.get("max_seq_lens") is not None else None
++        # Slice on CPU before copying to the device; each CP rank needs only its rows.
++        if key == "rollout_topk_token_ids":
++            indices = slice_log_prob_with_cp(torch.arange(response), total, response, args.qkv_format, maximum)
++            value = _candidate_ids(batch, i, indices)
++        else:
++            value = slice_log_prob_with_cp(torch.as_tensor(batch[key][i]), total, response, args.qkv_format, maximum)
++        values.append(value.to(device))
++    return torch.cat(values)
++
++
++def _regularization(
++    args: Namespace,
++    batch: RolloutBatch,
++    entropy: torch.Tensor | None,
++    log_probs: torch.Tensor,
++    rollout_log_probs: torch.Tensor,
++    active: torch.Tensor,
++    reduce: Callable[[torch.Tensor], torch.Tensor],
++    kl_log_probs: torch.Tensor | None = None,
++) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
++    loss = log_probs.new_zeros(())
++    metrics = {}
++    if entropy is not None:
++        entropy = reduce(entropy)
++        loss = loss - args.entropy_coef * entropy
++        metrics["entropy_loss"] = entropy.detach()
++    if args.use_kl_loss:
++        reference = torch.cat(batch["ref_log_probs"]).detach()
++        actor = log_probs if kl_log_probs is None else kl_log_probs
++        # Mask before exponentiation: replacing infinity afterward can still give
++        # NaN gradients through exp. Two bounded exponentials can multiply safely
++        # in float32 (exp(40) * exp(40) < float32's maximum).
++        valid = active & torch.isfinite(actor) & torch.isfinite(reference)
++        difference = actor - reference
++        valid = valid & (difference.abs() <= 40)
++        ratio_log = log_probs - rollout_log_probs
++        if args.use_unbiased_kl:
++            valid = valid & torch.isfinite(ratio_log) & (ratio_log.abs() <= 40)
++        actor = torch.where(valid, actor, 0.0)
++        reference = torch.where(valid, reference, 0.0)
++        # Keep the existing Miles KL estimator's gradient through the ratio.
++        # This ratio uses the actual replayed sampling distribution even though
++        # the reference penalty compares full-vocabulary probabilities.
++        ratio = torch.where(valid, ratio_log, 0.0).exp() if args.use_unbiased_kl else None
++        kl = compute_approx_kl(actor, reference, args.kl_loss_type, importance_ratio=ratio)
++        kl = reduce(torch.where(valid, torch.nan_to_num(kl, nan=0.0, posinf=0.0, neginf=0.0), 0.0))
++        if args.kl_loss_coef != 0:
++            loss = loss + args.kl_loss_coef * kl
++        metrics["kl_loss"] = kl.detach()
++        metrics["kl_invalid_fraction"] = reduce((active & ~valid).float()).detach()
++    return loss, metrics
++
++
++def score_centering_loss_function(
++    args: Namespace,
++    batch: RolloutBatch,
++    logits: torch.Tensor,
++    sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
++) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
++    probabilities = _candidate_log_probs(args, batch, logits)
++    selected = torch.cat(probabilities["selected"])
++    active = torch.cat(
++        get_local_response_loss_masks(
++            batch["total_lengths"],
++            batch["response_lengths"],
++            batch["loss_masks"],
++            args.qkv_format,
++            batch.get("max_seq_lens"),
++        )
++    ).bool()
++    rollout = torch.where(active, torch.cat(batch["rollout_log_probs"]).detach(), 0.0)
++    advantages = torch.where(active, torch.cat(batch["advantages"]).detach(), 0.0)
++    ids = _local_candidates(args, batch, "rollout_topk_token_ids", logits.device)
++    head = _local_candidates(args, batch, "rollout_topk_log_probs", logits.device)
++    token_loss, metrics = score_centering_loss(
++        ScoreCenteringInputs(
++            train_log_probs=selected[:, 0],
++            train_head_log_probs=selected[:, 1:],
++            rollout_log_probs=rollout,
++            rollout_head_log_probs=head,
++            head_mask=(ids >= 0) & active.unsqueeze(-1),
++            advantages=advantages,
++            mode=args.score_centering_is,
++            tis_clip=args.score_centering_tis_clip,
++            mis_low=args.score_centering_mis_low,
++            mis_high=args.score_centering_mis_high,
++        ),
++    )
++    pg_loss = sum_of_sample_mean(token_loss)
++    entropy = torch.cat(probabilities["entropy"]) if "entropy" in probabilities else None
++    kl_log_probs = torch.cat(probabilities["kl_log_probs"]) if args.use_kl_loss else None
++    loss, log = _regularization(
++        args, batch, entropy, selected[:, 0], rollout, active, sum_of_sample_mean, kl_log_probs
++    )
++    loss = loss + pg_loss
++    log.update({key: sum_of_sample_mean(value).detach() for key, value in metrics.as_log_dict().items()})
++    log.update(loss=loss.detach(), pg_loss=pg_loss.detach())
++    train_log_probs = torch.where(active, selected[:, 0].detach(), 0.0)
++    log["train_rollout_logprob_abs_diff"] = sum_of_sample_mean((train_log_probs - rollout).abs()).detach()
++    # Match the policy-loss diagnostic: sampled-token k3 estimate of KL(rollout || train).
++    rollout_train_kl = compute_approx_kl(rollout, train_log_probs, kl_loss_type="low_var_kl")
++    rollout_train_kl = torch.where(
++        active,
++        torch.nan_to_num(rollout_train_kl, nan=0.0, posinf=0.0, neginf=0.0),
++        0.0,
++    )
++    log["train_rollout_kl"] = sum_of_sample_mean(rollout_train_kl).detach()
++    return loss, log
+diff --git a/miles/backends/training_utils/loss/objective.py b/miles/backends/training_utils/loss/objective.py
+index 95cbe8d0a4..e5b2ae8d9e 100644
+--- a/miles/backends/training_utils/loss/objective.py
++++ b/miles/backends/training_utils/loss/objective.py
+@@ -135,7 +135,7 @@ def loss_function(
+ ) -> tuple[torch.Tensor, int | torch.Tensor, dict]:
+     """Dispatch to the configured loss and rescale for Megatron integration.
+ 
+-    Selects one of "policy_loss", "value_loss", "sft_loss", or a custom loss
++    Selects "policy_loss", "score_centering", "value_loss", "sft_loss", or a custom loss
+     function based on `args.loss_type`, or the Tinker loss specified by
+     `batch["loss_fn"]`. Computes the loss and metrics, then
+     rescales the loss by micro-batch and parallelism factors to integrate with
+diff --git a/miles/backends/training_utils/metrics/log_utils.py b/miles/backends/training_utils/metrics/log_utils.py
+index 300fc85c2b..21df7d1ccd 100644
+--- a/miles/backends/training_utils/metrics/log_utils.py
++++ b/miles/backends/training_utils/metrics/log_utils.py
+@@ -201,6 +201,7 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
+                 "rollout_indexer_topk",
+                 "rollout_sampling_mask_ids",
+                 "rollout_sampling_mask_offsets",
++                "rollout_topk_lengths",
+                 "max_seq_lens",
+                 "dynamic_global_batch_size",
+                 "witness_ids",
+diff --git a/miles/backends/training_utils/torch_native/actor.py b/miles/backends/training_utils/torch_native/actor.py
+index 729c9169d5..cd49cb57af 100644
+--- a/miles/backends/training_utils/torch_native/actor.py
++++ b/miles/backends/training_utils/torch_native/actor.py
+@@ -57,6 +57,9 @@ TRAIN_KEYS = FORWARD_ONLY_KEYS + [
+     "returns",
+     "ref_log_probs",
+     "rollout_log_probs",
++    "rollout_topk_token_ids",
++    "rollout_topk_lengths",
++    "rollout_topk_log_probs",
+ ]
+ SAMPLING_MASK_KEYS = ["rollout_sampling_mask_ids", "rollout_sampling_mask_offsets"]
+ 
+diff --git a/miles/ray/rollout/train_data_conversion.py b/miles/ray/rollout/train_data_conversion.py
+index 822140b1ff..bfc62c4cb1 100644
+--- a/miles/ray/rollout/train_data_conversion.py
++++ b/miles/ray/rollout/train_data_conversion.py
+@@ -3,6 +3,7 @@ from typing import Any
+ 
+ import torch
+ 
++from miles.rollout.generate_utils.rollout_topk_logprobs import validate_rollout_topk_logprobs_sample
+ from miles.utils import object_store
+ from miles.utils.dp_schedule import build_dp_schedule, has_full_schedule_config
+ from miles.utils.lora.utils import is_multi_lora_enabled
+@@ -18,6 +19,9 @@ ROLLOUT_DATA_TENSOR_DTYPES = {
+     "target_tokens": "int32",
+     "loss_masks": "int32",
+     "rollout_log_probs": "float32",
++    "rollout_topk_token_ids": "int32",
++    "rollout_topk_lengths": "int32",
++    "rollout_topk_log_probs": "float32",
+     "rollout_sampling_mask_ids": "int32",
+     "rollout_sampling_mask_offsets": "int64",
+     "teacher_log_probs": "float32",
+@@ -115,6 +119,20 @@ def convert_samples_to_train_data(
+     if samples[0].rollout_log_probs is not None:
+         train_data["rollout_log_probs"] = [sample.rollout_log_probs for sample in samples]
+ 
++    if k := args.rollout_top_logprobs_num:
++        for sample in samples:
++            for field in ("rollout_topk_token_ids", "rollout_topk_log_probs", "rollout_log_probs"):
++                if getattr(sample, field) is None:
++                    raise ValueError(
++                        f"Rollout top-k logprobs collection requires {field}; "
++                        f"sample_index={sample.index}. Custom rollout producers must record probabilities during generation."
++                    )
++        if args.ci_test:
++            for sample in samples:
++                validate_rollout_topk_logprobs_sample(sample, k)
++        train_data["rollout_topk_token_ids"] = [sample.rollout_topk_token_ids for sample in samples]
++        train_data["rollout_topk_log_probs"] = [sample.rollout_topk_log_probs for sample in samples]
++
+     has_sampling_mask = any(sample.rollout_sampling_mask is not None for sample in samples)
+     if has_sampling_mask:
+         sampling_mask_ids = []
+@@ -133,6 +151,8 @@ def convert_samples_to_train_data(
+ 
+         train_data["rollout_sampling_mask_ids"] = sampling_mask_ids
+         train_data["rollout_sampling_mask_offsets"] = sampling_mask_offsets
++        if k and args.loss_type == "score_centering" and args.rollout_sampling_logprobs_mode == "support":
++            _compact_candidate_ids(train_data)
+ 
+     if samples[0].rollout_routed_experts is not None:
+         train_data["rollout_routed_experts"] = [sample.rollout_routed_experts for sample in samples]
+@@ -176,6 +196,37 @@ def convert_samples_to_train_data(
+     return train_data
+ 
+ 
++def _compact_candidate_ids(data: dict) -> None:
++    """Share ordered support IDs in training batches; preserve other producer layouts."""
++    lengths = []
++    for dense, logps, support, offsets in zip(
++        data["rollout_topk_token_ids"],
++        data["rollout_topk_log_probs"],
++        data["rollout_sampling_mask_ids"],
++        data["rollout_sampling_mask_offsets"],
++        strict=True,
++    ):
++        dense, logps = torch.as_tensor(dense), torch.as_tensor(logps)
++        if dense.ndim != 2 or dense.shape != logps.shape or dense.size(0) != offsets.numel() - 1:
++            return
++        valid = dense >= 0
++        count = valid.sum(-1, dtype=torch.int32)
++        columns = torch.arange(dense.size(1))
++        prefix = columns < count[:, None]
++        if not torch.equal(valid, prefix) or not (dense[~prefix] == -1).all():
++            return
++        if not (count[count > 0] == offsets.diff()[count > 0]).all():
++            return
++        positions = offsets[:-1, None] + columns
++        if not torch.equal(dense[prefix], support[positions[prefix]]):
++            return
++        if not torch.isneginf(logps[count == 0]).all():
++            return
++        lengths.append(count)
++    data["rollout_topk_lengths"] = lengths
++    del data["rollout_topk_token_ids"]
++
++
+ def _compute_rollout_mask_sums(rollout_ids: list[int], loss_masks: list[list[int]]) -> list[int]:
+     """Whole-rollout loss-mask total per sample: every sibling of one rollout carries
+     the sum over all of that rollout's samples, so the loss reducer reconstructs one
+@@ -383,6 +434,9 @@ def _package_shards(args, data: dict[str, Any], partitions) -> list[dict[str, An
+             "rollout_ids",
+             "rollout_mask_sums",
+             "rollout_log_probs",
++            "rollout_topk_token_ids",
++            "rollout_topk_lengths",
++            "rollout_topk_log_probs",
+             "rollout_sampling_mask_ids",
+             "rollout_sampling_mask_offsets",
+             "rollout_routed_experts",
+diff --git a/miles/ray/specs/inference.py b/miles/ray/specs/inference.py
+index 7576ff206d..332451c599 100644
+--- a/miles/ray/specs/inference.py
++++ b/miles/ray/specs/inference.py
+@@ -414,4 +414,7 @@ def compute_inference_engine_env_vars(args) -> dict[str, str]:
+         from miles.utils import dumper_utils
+ 
+         env_vars.update(dumper_utils.get_sglang_env(args))
++    # Match the trainer's temperature-scaled logprobs on every worker,
++    # overriding inherited environment and dumper settings.
++    env_vars["SGLANG_RETURN_ORIGINAL_LOGPROB"] = "0"
+     return env_vars
+diff --git a/miles/rollout/generate_utils/generate_endpoint_utils.py b/miles/rollout/generate_utils/generate_endpoint_utils.py
+index 5031f2d2da..994d87bd62 100644
+--- a/miles/rollout/generate_utils/generate_endpoint_utils.py
++++ b/miles/rollout/generate_utils/generate_endpoint_utils.py
+@@ -8,6 +8,10 @@ from typing import Any
+ import numpy as np
+ import pybase64
+ 
++from miles.rollout.generate_utils.rollout_topk_logprobs import (
++    append_rollout_topk_logprobs,
++    configure_rollout_topk_logprobs_request,
++)
+ from miles.rollout.generate_utils.sampling_mask import append_sampling_metadata, should_return_sampling_mask
+ from miles.utils.lora.utils import LORA_ADAPTER_NAME, lora_rollout_enabled
+ from miles.utils.processing_utils import encode_image_for_rollout_engine, extract_multimodal_train_inputs
+@@ -81,6 +85,8 @@ def compute_request_payload(
+     if image_data := (multimodal_inputs or {}).get("images"):
+         payload["image_data"] = [encode_image_for_rollout_engine(image) for image in image_data]
+ 
++    if not evaluation:
++        configure_rollout_topk_logprobs_request(args, payload)
+     return payload, None
+ 
+ 
+@@ -98,7 +104,12 @@ async def update_sample_from_response(
+         new_response_tokens, new_response_log_probs = [], []
+ 
+     if payload.get("return_sampling_mask", False):
+-        new_response_log_probs = append_sampling_metadata(sample, new_response_tokens, output["meta_info"])
++        new_response_log_probs = append_sampling_metadata(
++            sample,
++            new_response_tokens,
++            output["meta_info"],
++            sampling_logprobs_mode=payload.get("sampling_logprobs_mode", "selected"),
++        )
+ 
+     # Update sample with tokens directly - avoiding re-tokenization
+     sample.tokens = sample.tokens + new_response_tokens
+@@ -108,6 +119,13 @@ async def update_sample_from_response(
+     if sample.rollout_log_probs is None:
+         sample.rollout_log_probs = []
+     sample.rollout_log_probs += new_response_log_probs
++    if payload.get("top_logprobs_num") or payload.get("sampling_logprobs_mode") == "support":
++        append_rollout_topk_logprobs(
++            sample,
++            output["meta_info"],
++            args.rollout_top_logprobs_num,
++            sampling_logprobs_mode=payload.get("sampling_logprobs_mode", "selected"),
++        )
+ 
+     if update_loss_mask:
+         if sample.loss_mask is None:
+diff --git a/miles/rollout/generate_utils/rollout_topk_logprobs.py b/miles/rollout/generate_utils/rollout_topk_logprobs.py
+new file mode 100644
+index 0000000000..5ab44b7c60
+--- /dev/null
++++ b/miles/rollout/generate_utils/rollout_topk_logprobs.py
+@@ -0,0 +1,144 @@
++"""Record the sampler's top-k candidate log-probs at generation time."""
++
++from argparse import Namespace
++from collections.abc import Mapping
++from typing import Any
++
++import numpy as np
++
++from miles.utils.rollout_topk_logprobs import validate_rollout_topk_logprobs_sampling
++from miles.utils.sampling_mask import RolloutSamplingMask
++from miles.utils.types import Sample
++
++
++def configure_rollout_topk_logprobs_request(args: Namespace, request: dict[str, Any], *, openai: bool = False) -> None:
++    """Request candidate probabilities, validating the actual per-call settings.
++
++    The rollout args own ``top_logprobs_num`` / ``top_logprobs`` and ``sampling_logprobs_mode``
++    on training requests and silently override client-supplied values.
++    """
++    k = args.rollout_top_logprobs_num
++    if not k:
++        return
++    sampling = request if openai else request["sampling_params"]
++    # Explicit defaults avoid model generation_config changing the distribution.
++    for key, default in (("temperature", args.rollout_temperature), ("top_p", 1.0), ("top_k", -1), ("min_p", 0.0)):
++        if sampling.get(key) is None:
++            sampling[key] = default
++    validate_rollout_topk_logprobs_sampling(sampling, temperature=args.rollout_temperature, candidate_count=k)
++    if args.rollout_sampling_logprobs_mode == "support":
++        # SGLang's support mode returns the actual post-filter behavior distribution.
++        request.pop("top_logprobs", None)
++        request.pop("top_logprobs_num", None)
++        request["sampling_logprobs_mode"] = "support"
++    elif openai:
++        request.pop("sampling_logprobs_mode", None)
++        request["top_logprobs"] = k
++    else:
++        request.pop("sampling_logprobs_mode", None)
++        request["top_logprobs_num"] = k
++
++
++def append_rollout_topk_logprobs(
++    sample: Sample, meta: Mapping[str, Any], k: int, *, sampling_logprobs_mode: str = "selected"
++) -> None:
++    """Append compact [response, k] arrays after appending generated tokens.
++
++    No rescoring is allowed: with stale rollouts it would replace the behavior
++    policy. Slots unavailable from the server are represented by ID -1/logp -inf.
++    append_sampling_metadata validates the sampling support on the same response,
++    and CI checks the whole sample with validate_rollout_topk_logprobs_sample.
++    """
++    if not k:
++        return
++    n = len(meta.get("output_token_logprobs") or [])
++    support_mode = sampling_logprobs_mode == "support"
++    field = "output_token_sampling_logprobs" if support_mode else "output_top_logprobs"
++    rows = meta.get(field)
++    if n and (rows is None or len(rows) != n):
++        raise ValueError(f"Rollout top-k logprobs collection requires SGLang {field} for every generated token")
++    ids = np.full((n, k), -1, dtype=np.int32)
++    logps = np.full((n, k), -np.inf, dtype=np.float32)
++    for i, entries in enumerate(rows or []):
++        if support_mode:
++            if len(entries) > k:
++                raise ValueError("Rollout top-k logprobs sampling support exceeds --rollout-top-logprobs-num")
++            token_ids, probabilities = meta["output_token_sampling_mask"][i], entries
++        else:
++            token_ids = [entry[1] for entry in entries[:k]]
++            probabilities = [entry[0] for entry in entries[:k]]
++        ids[i, : len(token_ids)] = token_ids
++        logps[i, : len(token_ids)] = probabilities
++    for name, values in (("rollout_topk_token_ids", ids), ("rollout_topk_log_probs", logps)):
++        previous = getattr(sample, name)
++        setattr(sample, name, values if previous is None else np.concatenate((previous, values)))
++
++
++def _support_membership(ids: np.ndarray, support: RolloutSamplingMask) -> tuple[np.ndarray, np.ndarray]:
++    """Match candidate IDs to ragged support IDs without a per-token Python loop."""
++    n = len(ids)
++    if not n:
++        return np.zeros_like(ids, dtype=bool), np.empty(0, dtype=np.int64)
++    flat_ids, offsets = support._as_tensors()
++    flat_ids = flat_ids.numpy()
++    offsets = offsets.numpy()
++    lengths = np.diff(offsets[: n + 1])
++    support_ids = flat_ids[: offsets[n]]
++    stride = 1 << 32  # Token IDs are nonnegative int32; rows remain distinct.
++    support_rows = np.repeat(np.arange(n, dtype=np.int64), lengths)
++    support_keys = np.sort(support_rows * stride + support_ids.astype(np.int64))
++    candidate_keys = np.arange(n, dtype=np.int64)[:, None] * stride + ids.astype(np.int64)
++    positions = np.searchsorted(support_keys, candidate_keys)
++    membership = (ids >= 0) & (support_keys[np.minimum(positions, len(support_keys) - 1)] == candidate_keys)
++    return membership, lengths
++
++
++def pad_rollout_topk_logprobs(sample: Sample, count: int) -> None:
++    """Pad non-trained tool/observation positions before extending the response."""
++    for field, fill in (("rollout_topk_token_ids", -1), ("rollout_topk_log_probs", -np.inf)):
++        values = getattr(sample, field)
++        if values is not None:
++            padding = np.full((count, values.shape[1]), fill, dtype=values.dtype)
++            setattr(sample, field, np.concatenate((values, padding)))
++
++
++def validate_rollout_topk_logprobs_sample(sample: Sample, k: int) -> None:
++    """Validate candidate distributions, including custom producers and restored rollouts.
++
++    Full-sample sorting and support matching have significant CPU and memory costs;
++    training callers must enable this validation only under --ci-test.
++    """
++    sample.validate()
++    ids, logps = sample.rollout_topk_token_ids, sample.rollout_topk_log_probs
++    if ids is None or logps is None or sample.rollout_log_probs is None:
++        raise ValueError(
++            "Rollout top-k logprobs collection requires candidate and sampled-token logprobs on every rollout"
++        )
++    if ids.shape[1] != k:
++        raise ValueError("Rollout top-k logprobs candidates must have --rollout-top-logprobs-num columns")
++    valid = ids >= 0
++    sorted_ids = np.sort(ids, axis=-1)
++    if ((sorted_ids[:, 1:] >= 0) & (sorted_ids[:, 1:] == sorted_ids[:, :-1])).any():
++        raise ValueError("Duplicate rollout top-k logprobs candidate token IDs")
++    active = np.asarray(sample.loss_mask if sample.loss_mask is not None else [1] * sample.response_length, dtype=bool)
++    if (active & ~valid.any(-1)).any():
++        raise ValueError("Every trained token needs rollout top-k logprobs candidates")
++    if sample.rollout_sampling_mask is not None:
++        in_support, lengths = _support_membership(ids, sample.rollout_sampling_mask)
++        if ((valid != in_support) & active[:, None]).any() or ((valid.sum(-1) != lengths) & active).any():
++            raise ValueError("Rollout top-k logprobs candidates must equal the sampling support")
++    sampled = np.asarray(sample.rollout_log_probs)
++    tokens = np.asarray(sample.tokens[-sample.response_length :] if sample.response_length else [], dtype=np.int64)
++    matches = (ids == tokens[:, None]) & valid & active[:, None]
++    if not np.allclose(np.broadcast_to(sampled[:, None], logps.shape)[matches], logps[matches], atol=1e-5, rtol=1e-5):
++        raise ValueError("Sampled and candidate probabilities must come from the same sampler distribution")
++
++
++def merge_rollout_topk_logprobs_field(first: Sample, second: Sample, field: str, gap: int) -> np.ndarray | None:
++    a, b = getattr(first, field), getattr(second, field)
++    if a is None and b is None:
++        return None
++    if a is None or b is None or a.shape[1] != b.shape[1]:
++        raise ValueError(f"Both turns must carry matching {field} for rollout top-k logprobs collection")
++    fill = -1 if field == "rollout_topk_token_ids" else -np.inf
++    return np.concatenate((a, np.full((gap, a.shape[1]), fill, dtype=a.dtype), b))
+diff --git a/miles/rollout/generate_utils/sample_utils.py b/miles/rollout/generate_utils/sample_utils.py
+index 9fcd906807..3c81cf8391 100644
+--- a/miles/rollout/generate_utils/sample_utils.py
++++ b/miles/rollout/generate_utils/sample_utils.py
+@@ -2,6 +2,7 @@ from copy import deepcopy
+ from dataclasses import fields
+ from typing import Any
+ 
++from miles.rollout.generate_utils.rollout_topk_logprobs import merge_rollout_topk_logprobs_field
+ from miles.rollout.generate_utils.sampling_mask import merge_sampling_masks
+ from miles.utils.types import Sample
+ 
+@@ -162,6 +163,8 @@ def _merge_sample_pair(a: Sample, b: Sample, tokenizer) -> Sample:
+             loss_mask=a.loss_mask + [0] * obs_len + b.loss_mask,
+             weight_versions=a.weight_versions + b.weight_versions,
+             rollout_log_probs=a.rollout_log_probs + [0.0] * obs_len + b.rollout_log_probs,
++            rollout_topk_token_ids=merge_rollout_topk_logprobs_field(a, b, "rollout_topk_token_ids", obs_len),
++            rollout_topk_log_probs=merge_rollout_topk_logprobs_field(a, b, "rollout_topk_log_probs", obs_len),
+             rollout_sampling_mask=sampling_mask,
+             teacher_log_probs=_merge_optional_per_token("teacher_log_probs"),
+             opd_reverse_kl=_merge_optional_per_token("opd_reverse_kl"),
+diff --git a/miles/rollout/generate_utils/sampling_mask.py b/miles/rollout/generate_utils/sampling_mask.py
+index 9cf5af5db0..6d47564d7c 100644
+--- a/miles/rollout/generate_utils/sampling_mask.py
++++ b/miles/rollout/generate_utils/sampling_mask.py
+@@ -95,8 +95,9 @@ def append_sampling_metadata(
+     meta_info: dict,
+     *,
+     aborted: bool = False,
++    sampling_logprobs_mode: str = "selected",
+ ) -> list[float]:
+-    """Append SGLang's realized support and return its normalized log-probs."""
++    """Append SGLang's realized support and return sampled-token log-probs."""
+     supports = meta_info.get("output_token_sampling_mask")
+     log_probs = meta_info.get("output_token_sampling_logprobs")
+     if supports is None or log_probs is None:
+@@ -112,8 +113,24 @@ def append_sampling_metadata(
+     if len(log_probs) != len(output_token_ids):
+         raise ValueError(f"sampling log-prob length {len(log_probs)} != output token length {len(output_token_ids)}")
+ 
+-    _append_sampling_mask(sample, _sampling_mask_from_supports(output_token_ids, supports))
+-    return [float(value) for value in log_probs]
++    sampling_mask = _sampling_mask_from_supports(output_token_ids, supports)
++    if sampling_logprobs_mode == "support":
++        selected = []
++        for token_id, support, row in zip(output_token_ids, supports, log_probs, strict=True):
++            if not isinstance(row, (list, tuple)) or len(row) != len(support):
++                raise ValueError("SGLang support log-probs must align with the sampling support IDs")
++            matches = [i for i, candidate in enumerate(support) if candidate == token_id]
++            if len(matches) != 1:
++                raise ValueError("Sampled token must occur exactly once in its sampling support")
++            selected.append(float(row[matches[0]]))
++    elif sampling_logprobs_mode == "selected":
++        if any(isinstance(row, (list, tuple)) for row in log_probs):
++            raise ValueError("SGLang selected sampling log-probs must be scalar")
++        selected = [float(value) for value in log_probs]
++    else:
++        raise ValueError(f"Unsupported sampling logprobs mode: {sampling_logprobs_mode}")
++    _append_sampling_mask(sample, sampling_mask)
++    return selected
+ 
+ 
+ def append_forced_sampling_tokens(sample: Sample, token_ids: Sequence[int]) -> None:
+diff --git a/miles/rollout/generate_utils/tool_call_utils.py b/miles/rollout/generate_utils/tool_call_utils.py
+index 2501b9994a..c7345a24fa 100644
+--- a/miles/rollout/generate_utils/tool_call_utils.py
++++ b/miles/rollout/generate_utils/tool_call_utils.py
+@@ -13,6 +13,7 @@ from sglang.srt.entrypoints.openai.protocol import Tool
+ from sglang.srt.function_call.core_types import ToolCallItem
+ from sglang.srt.function_call.function_call_parser import FunctionCallParser
+ 
++from miles.rollout.generate_utils.rollout_topk_logprobs import pad_rollout_topk_logprobs
+ from miles.rollout.generate_utils.sampling_mask import append_forced_sampling_tokens
+ from miles.utils.types import Sample
+ 
+@@ -60,6 +61,7 @@ def update_sample_with_tool_responses(sample: Sample, tool_messages: list[dict[s
+     next_obs_tokens_ids: list[int] = tokenize_tool_responses(tool_messages, tokenizer=tokenizer)
+     if sample.rollout_sampling_mask is not None:
+         append_forced_sampling_tokens(sample, next_obs_tokens_ids)
++    pad_rollout_topk_logprobs(sample, len(next_obs_tokens_ids))
+     sample.response += tokenizer.decode(next_obs_tokens_ids)
+     sample.response_length += len(next_obs_tokens_ids)
+     sample.tokens += next_obs_tokens_ids
+diff --git a/miles/rollout/session/config.py b/miles/rollout/session/config.py
+index 228955ee65..138616d68a 100644
+--- a/miles/rollout/session/config.py
++++ b/miles/rollout/session/config.py
+@@ -28,6 +28,9 @@ class SessionServerConfig(FrozenStrictBaseModel):
+     pause_generation_mode: str | None
+     session_sample_picker_path: str | None
+     session_sample_postprocessor_path: str | None
++    rollout_top_logprobs_num: int
++    rollout_sampling_logprobs_mode: str
++    rollout_temperature: float
+ 
+ 
+ def compute_session_server_config(
+@@ -58,4 +61,7 @@ def compute_session_server_config(
+         pause_generation_mode=getattr(args, "pause_generation_mode", None),
+         session_sample_picker_path=getattr(args, "session_sample_picker_path", None),
+         session_sample_postprocessor_path=getattr(args, "session_sample_postprocessor_path", None),
++        rollout_top_logprobs_num=args.rollout_top_logprobs_num,
++        rollout_sampling_logprobs_mode=args.rollout_sampling_logprobs_mode,
++        rollout_temperature=getattr(args, "rollout_temperature", 1.0),
+     )
+diff --git a/miles/rollout/session/core.py b/miles/rollout/session/core.py
+index 6e343b874f..c7c19325c8 100644
+--- a/miles/rollout/session/core.py
++++ b/miles/rollout/session/core.py
+@@ -285,6 +285,7 @@ class SessionCore:
+                 accumulated_token_ids=metadata.get("accumulated_token_ids"),
+                 max_trim_tokens=metadata.get("max_trim_tokens", 0),
+                 use_addition_r3=self.use_addition_r3,
++                evaluation=session.evaluation,
+             )
+             if max_seq_len is not None:
+                 samples = truncate_samples_by_total_tokens(samples, max_seq_len, tokenizer)
+diff --git a/miles/rollout/session/request_args.py b/miles/rollout/session/request_args.py
+index 1dfcbc0a6c..97556ba3e4 100644
+--- a/miles/rollout/session/request_args.py
++++ b/miles/rollout/session/request_args.py
+@@ -15,6 +15,7 @@ from copy import deepcopy
+ from dataclasses import dataclass
+ from typing import Any
+ 
++from miles.rollout.generate_utils.rollout_topk_logprobs import configure_rollout_topk_logprobs_request
+ from miles.rollout.generate_utils.sampling_mask import validate_sampling_support_request
+ from miles.rollout.session.config import SessionServerConfig
+ from miles.rollout.session.errors import MessageValidationError
+@@ -71,12 +72,15 @@ def prepare_chat_request(
+         request_args = tito_tokenizer.resolve_request_args(request_args, turn_args=turn_args)
+     except ValueError as e:
+         raise MessageValidationError(str(e)) from e
++    # The rollout args own the sampling log-prob mode; training requests get it from them below.
++    request_args.pop("sampling_logprobs_mode", None)
+     if evaluation:
+         # Model rules must not re-enable training replay outputs for evaluation.
+         request_args.update(return_sampling_mask=False, return_routed_experts=False, return_indexer_topk=False)
+         request_args.pop("routed_experts_start_len", None)
+     else:
+         try:
++            configure_rollout_topk_logprobs_request(config, request_args, openai=True)
+             return_sampling_mask = validate_sampling_support_request(
+                 request_args,
+                 replay_enabled=sampling_support_replay,
+diff --git a/miles/rollout/session/samples/codec.py b/miles/rollout/session/samples/codec.py
+index fa06884f15..604baedf3b 100644
+--- a/miles/rollout/session/samples/codec.py
++++ b/miles/rollout/session/samples/codec.py
+@@ -37,6 +37,8 @@ SAMPLES_VALUE_SPEC: dict[str, ValueSpec] = {
+     "response_length": ValueSpec("json"),
+     "loss_mask": ValueSpec("tensor_list", np.dtype(np.uint8)),
+     "rollout_log_probs": ValueSpec("tensor_list", np.dtype(np.float64)),
++    "rollout_topk_token_ids": ValueSpec("tensor", np.dtype(np.int32), strict=True),
++    "rollout_topk_log_probs": ValueSpec("tensor", np.dtype(np.float32), strict=True),
+     "rollout_sampling_mask": ValueSpec("sampling_mask"),
+     "rollout_routed_experts": ValueSpec("tensor", np.dtype(np.int32), strict=True),
+     "rollout_indexer_topk": ValueSpec("tensor", np.dtype(np.int32), strict=True),
+@@ -68,6 +70,7 @@ assert _TENSOR_FIELDS <= set(COMPUTED_FIELDS + ROLLOUT_SAMPLING_MASK_FIELDS)
+ 
+ _SAMPLES_META_KEY = "_samples_meta"
+ _OPD_STUDENT_TOP_LOGPROBS_KEY = "opd_student_top_logprobs"
++_ROLLOUT_TOPK_LOGPROBS_FIELDS = ("rollout_topk_token_ids", "rollout_topk_log_probs")
+ 
+ 
+ @dataclasses.dataclass
+@@ -124,6 +127,9 @@ def encode_samples(
+                 sample_meta[field] = value
+                 continue
+             if value is None:
++                # Preserve the existing wire format when rollout top-k logprobs collection is disabled.
++                if field in _ROLLOUT_TOPK_LOGPROBS_FIELDS:
++                    continue
+                 nulls.append(field)
+                 continue
+             if spec.codec == "sampling_mask":
+@@ -202,6 +208,11 @@ def decode_samples_and_merge_input_sample(
+             if field in nulls:
+                 setattr(sample, field, copy(spec.null))
+                 continue
++            if field in _ROLLOUT_TOPK_LOGPROBS_FIELDS and f"{field}.{sample_index}" not in tensors:
++                # Older producers have no candidate fields; training validates
++                # their presence when the new loss is actually selected.
++                setattr(sample, field, None)
++                continue
+             if spec.codec == "sampling_mask":
+                 ids = tensors.pop(f"{field}.ids.{sample_index}")
+                 offsets = tensors.pop(f"{field}.offsets.{sample_index}")
+diff --git a/miles/rollout/session/samples/merge.py b/miles/rollout/session/samples/merge.py
+index e993302cf8..595436c95d 100644
+--- a/miles/rollout/session/samples/merge.py
++++ b/miles/rollout/session/samples/merge.py
+@@ -15,6 +15,7 @@ from miles.rollout.generate_utils.generate_endpoint_utils import (
+     get_indexer_topk_from_response,
+     get_routed_experts_from_response,
+ )
++from miles.rollout.generate_utils.rollout_topk_logprobs import append_rollout_topk_logprobs
+ from miles.rollout.generate_utils.sample_utils import merge_samples
+ from miles.rollout.generate_utils.sampling_mask import append_sampling_metadata
+ from miles.rollout.session.types import SessionRecord
+@@ -30,6 +31,7 @@ def compute_samples_from_openai_records(
+     max_trim_tokens: int = 0,
+     *,
+     use_addition_r3: bool = False,
++    evaluation: bool = False,
+ ) -> list[Sample]:
+     """Convert per-turn session records into training Samples, aligning each
+     turn's output tokens against the TITO accumulated token sequence.
+@@ -82,7 +84,7 @@ def compute_samples_from_openai_records(
+             cursor += matched
+ 
+         sample = _compute_sample_from_openai_record(
+-            args, record, tokenizer, trim_count, use_addition_r3=use_addition_r3
++            args, record, tokenizer, trim_count, use_addition_r3=use_addition_r3, evaluation=evaluation
+         )
+         attach_lifecycle_metadata(sample, record, records[i - 1] if i else None, turn=i + 1)
+         if is_last and args.save_debug_trajectory_data is not None:
+@@ -100,7 +102,13 @@ def compute_samples_from_openai_records(
+ 
+ 
+ def _compute_sample_from_openai_record(
+-    args: Namespace, record: SessionRecord, tokenizer, trim_count: int = 0, *, use_addition_r3: bool = False
++    args: Namespace,
++    record: SessionRecord,
++    tokenizer,
++    trim_count: int = 0,
++    *,
++    use_addition_r3: bool = False,
++    evaluation: bool = False,
+ ) -> Sample:
+     choice = record.response["choices"][0]
+     finish_reason = choice.get("finish_reason")
+@@ -119,12 +127,22 @@ def _compute_sample_from_openai_record(
+             output_token_ids,
+             choice["meta_info"],
+             aborted=finish_reason == "abort",
++            sampling_logprobs_mode=record.request.get("sampling_logprobs_mode", "selected"),
+         )
+     sample.tokens = prompt_token_ids + output_token_ids
+     sample.rollout_log_probs = output_log_probs
+     sample.response = tokenizer.decode(output_token_ids)
+     sample.response_length = len(output_token_ids)
+     sample.loss_mask = [1] * len(output_token_ids)
++    if not evaluation and (
++        record.request.get("top_logprobs") or record.request.get("sampling_logprobs_mode") == "support"
++    ):
++        append_rollout_topk_logprobs(
++            sample,
++            choice["meta_info"],
++            args.rollout_top_logprobs_num,
++            sampling_logprobs_mode=record.request.get("sampling_logprobs_mode", "selected"),
++        )
+     sample.rollout_routed_experts = (
+         None if use_addition_r3 else get_routed_experts_from_response(args, choice, len(sample.tokens) - 1)
+     )
+diff --git a/miles/rollout/session/v2/utils.py b/miles/rollout/session/v2/utils.py
+index 871e7dbdd9..e9b9e22b11 100644
+--- a/miles/rollout/session/v2/utils.py
++++ b/miles/rollout/session/v2/utils.py
+@@ -73,6 +73,7 @@ def build_leaf_material(
+             accumulated_token_ids=leaf.token_ids,
+             max_trim_tokens=registry.tito_tokenizer.max_trim_tokens,
+             use_addition_r3=use_addition_r3,
++            evaluation=state.evaluation,
+         )
+         if max_seq_len is not None:
+             turns = truncate_samples_by_total_tokens(turns, max_seq_len, registry.tokenizer)
+diff --git a/miles/rollout/sglang_rollout.py b/miles/rollout/sglang_rollout.py
+index 2387f77000..cd859361e4 100644
+--- a/miles/rollout/sglang_rollout.py
++++ b/miles/rollout/sglang_rollout.py
+@@ -16,6 +16,10 @@ from tqdm import tqdm
+ from miles.rollout.base_types import GenerateFnInput, RolloutFnEvalOutput, RolloutFnTrainOutput
+ from miles.rollout.filter_hub.base_types import MetricGatherer
+ from miles.rollout.filter_hub.common_filters import apply_preput_filters
++from miles.rollout.generate_utils.rollout_topk_logprobs import (
++    append_rollout_topk_logprobs,
++    configure_rollout_topk_logprobs_request,
++)
+ from miles.rollout.inference_rollout.compatibility import load_generate_function
+ from miles.utils import dumper_utils
+ from miles.utils.async_utils import run
+@@ -192,6 +196,8 @@ async def generate(
+     opd_top_k_strategy = getattr(args, "opd_top_k_strategy", "only-student")
+     if getattr(args, "use_opd", False) and opd_top_k > 0 and opd_top_k_strategy != "only-teacher":
+         payload["top_logprobs_num"] = opd_top_k
++    if not evaluation:
++        configure_rollout_topk_logprobs_request(args, payload)
+ 
+     if lora_rollout_enabled(args):
+         payload["lora_path"] = LORA_ADAPTER_NAME
+@@ -236,12 +242,24 @@ async def generate(
+         new_response_tokens, new_response_log_probs = [], []
+ 
+     if payload.get("return_sampling_mask", False):
+-        new_response_log_probs = append_sampling_metadata(sample, new_response_tokens, output["meta_info"])
++        new_response_log_probs = append_sampling_metadata(
++            sample,
++            new_response_tokens,
++            output["meta_info"],
++            sampling_logprobs_mode=payload.get("sampling_logprobs_mode", "selected"),
++        )
+ 
+     # Update sample with tokens directly - avoiding re-tokenization
+     sample.tokens = sample.tokens + new_response_tokens
+     sample.response_length += len(new_response_tokens)
+     sample.response += output["text"]
++    if not evaluation:
++        append_rollout_topk_logprobs(
++            sample,
++            output["meta_info"],
++            args.rollout_top_logprobs_num,
++            sampling_logprobs_mode=payload.get("sampling_logprobs_mode", "selected"),
++        )
+ 
+     # When partial rollout and masking off policy is enabled, update the loss mask
+     if sample.loss_mask is not None:
+diff --git a/miles/utils/arguments.py b/miles/utils/arguments.py
+index 48d75c89f9..cfe8926536 100644
+--- a/miles/utils/arguments.py
++++ b/miles/utils/arguments.py
+@@ -39,7 +39,9 @@ from miles.utils.object_store_config import (
+     compute_mooncake_init_kwargs_from_env,
+     compute_mooncake_init_kwargs_vanilla,
+ )
++from miles.utils.rollout_topk_logprobs import validate_rollout_topk_logprobs_args
+ from miles.utils.run_uuid import RUN_UUID_LENGTH, generate_run_uuid, validate_run_uuid
++from miles.utils.score_centering import validate_score_centering_args
+ from miles.utils.tracking_utils.ci_history import RECORD_DIR_ENV
+ from miles.utils.workers.argv_utils import with_relax_parser_required_args, with_suppressed_parser_help
+ from miles.utils.workers.naming import DEPLOY_INSTANCE_ID_MAX_LENGTH, DNS_LABEL_PATTERN
+@@ -684,6 +686,16 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
+                     "returned-support limit because cutoff ties can retain more than top-k tokens."
+                 ),
+             )
++            parser.add_argument(
++                "--rollout-top-logprobs-num",
++                type=int,
++                default=0,
++                help=(
++                    "Number of sampler candidate log-probs recorded per generated token in "
++                    "Sample.rollout_topk_token_ids / rollout_topk_log_probs; 0 disables recording. "
++                    "Training requests ask SGLang for them and override any client-supplied value."
++                ),
++            )
+             parser.add_argument(
+                 "--rollout-max-context-len",
+                 type=int,
+@@ -1595,10 +1607,10 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
+             parser.add_argument(
+                 "--loss-type",
+                 type=str,
+-                choices=["policy_loss", "sft_loss", "custom_loss"],
++                choices=["policy_loss", "sft_loss", "custom_loss", "score_centering"],
+                 default="policy_loss",
+                 help=(
+-                    "Choose loss type, currently support ppo policy_loss or sft_loss, "
++                    "Choose PPO policy_loss, REINFORCE score_centering, or sft_loss; "
+                     "if custom_loss is set, we will use the function path from `--custom-loss-function-path`."
+                 ),
+             )
+@@ -1611,6 +1623,15 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
+                     "we will use this function to calculate the loss. "
+                 ),
+             )
++            parser.add_argument(
++                "--score-centering-is",
++                choices=["none", "tis", "mis"],
++                default="none",
++                help="Importance weights to center together with the policy score.",
++            )
++            parser.add_argument("--score-centering-tis-clip", type=float, default=2.0)
++            parser.add_argument("--score-centering-mis-low", type=float, default=0.5)
++            parser.add_argument("--score-centering-mis-high", type=float, default=5.0)
+             parser.add_argument(
+                 "--kl-loss-type",
+                 type=str,
+@@ -3277,6 +3298,7 @@ def miles_validate_args(args):
+     if args.rollout_top_k != -1 and args.rollout_top_k < 1:
+         raise ValueError(f"--rollout-top-k must be -1 or at least 1, got {args.rollout_top_k}")
+     args.use_sampling_support_replay = args.rollout_top_p < 1.0 or args.rollout_top_k > 0
++    args.rollout_sampling_logprobs_mode = "support" if args.use_sampling_support_replay else "selected"
+     if args.use_sampling_support_replay:
+         if args.rollout_top_k == -1:
+             raise ValueError(
+@@ -3296,6 +3318,7 @@ def miles_validate_args(args):
+                 "sampling-support replay cannot currently be combined with reference KL or teacher distillation; "
+                 "those objectives require a separate full-policy actor score"
+             )
++    validate_rollout_topk_logprobs_args(args)
+ 
+     if not args.use_session_server and args.tito_model != TITOTokenizerType.DEFAULT.value:
+         raise ValueError(
+@@ -3897,6 +3920,8 @@ def miles_validate_args(args):
+     if args.skip_actor_forward_only:
+         validate_skip_actor_forward_only(args)
+ 
++    validate_score_centering_args(args)
++
+     _maybe_apply_dumper_overrides(args)
+ 
+     args.api_server_port = _resolve_api_server_port(args)
+diff --git a/miles/utils/rollout_topk_logprobs.py b/miles/utils/rollout_topk_logprobs.py
+new file mode 100644
+index 0000000000..9dd79f662f
+--- /dev/null
++++ b/miles/utils/rollout_topk_logprobs.py
+@@ -0,0 +1,61 @@
++"""Rollout top-k logprobs: the sampler's candidate log-probs recorded for each generated token.
++
++``--rollout-top-logprobs-num`` sets the width of ``Sample.rollout_topk_token_ids`` /
++``rollout_topk_log_probs``; it records the sampling distribution and does not change it.
++``arguments.py`` derives ``rollout_sampling_logprobs_mode`` from the rollout filters: ``selected`` reads
++``output_top_logprobs``, the top-K of the full-vocabulary distribution (unfiltered sampling);
++``support`` reads ``output_token_sampling_logprobs`` over the whole realized support (filtered
++sampling). ``Sample.rollout_sampling_mask`` is the separate support record of sampling-support replay.
++"""
++
++import math
++from collections.abc import Mapping
++from typing import Any
++
++
++def validate_rollout_topk_logprobs_args(args: Any) -> None:
++    """Reject rollout top-k logprobs settings whose recorded candidates cannot match the sampler."""
++    k = args.rollout_top_logprobs_num
++    if k < 0:
++        raise ValueError(f"--rollout-top-logprobs-num must be non-negative, got {k}")
++    if not k:
++        return
++    if args.rollout_sampling_logprobs_mode == "support" and k < args.rollout_top_k:
++        raise ValueError(
++            "Filtered rollout sampling requires --rollout-top-logprobs-num >= --rollout-top-k "
++            "so the recorded candidates can hold the whole sampling support"
++        )
++    opd_student_top_k = args.use_opd and args.opd_log_prob_top_k > 0 and args.opd_top_k_strategy != "only-teacher"
++    if opd_student_top_k:
++        raise ValueError("--rollout-top-logprobs-num cannot be combined with OPD student top-k log-probs")
++
++
++def validate_rollout_topk_logprobs_sampling(
++    sampling: Mapping[str, Any], *, temperature: float, candidate_count: int
++) -> None:
++    """Require per-call sampling whose distribution the recorded candidates describe.
++
++    Top-p/top-k bounds are checked by the rollout args and sampling-support replay;
++    this adds what recorded candidates need on top of them.
++    """
++    if sampling.get("temperature", temperature) != temperature or not math.isfinite(temperature) or temperature <= 0:
++        raise ValueError(
++            "Rollout top-k logprobs collection requires the same positive rollout temperature on every generation call"
++        )
++    if sampling.get("top_k", -1) > candidate_count:
++        raise ValueError(
++            "Rollout top-k logprobs collection requires top_k <= --rollout-top-logprobs-num to hold the whole support"
++        )
++    if sampling.get("min_p", 0.0) != 0.0:
++        raise ValueError("Rollout top-k logprobs collection requires min_p=0.0")
++    for key in ("json_schema", "regex", "ebnf", "structural_tag", "custom_logit_processor", "logit_bias"):
++        if sampling.get(key):
++            raise ValueError(f"Rollout top-k logprobs collection does not support constrained/custom sampling ({key})")
++    response_format = sampling.get("response_format")
++    if response_format and (not isinstance(response_format, Mapping) or response_format.get("type", "text") != "text"):
++        raise ValueError("Rollout top-k logprobs collection does not support constrained response_format")
++    tool_choice = sampling.get("tool_choice", "auto")
++    if tool_choice not in (None, "auto", "none"):
++        raise ValueError("Rollout top-k logprobs collection does not support constrained tool_choice")
++    if tool_choice != "none" and any(tool.get("function", {}).get("strict") for tool in sampling.get("tools") or []):
++        raise ValueError("Rollout top-k logprobs collection does not support strict tool schemas")
+diff --git a/miles/utils/score_centering.py b/miles/utils/score_centering.py
+new file mode 100644
+index 0000000000..eaebb7e06c
+--- /dev/null
++++ b/miles/utils/score_centering.py
+@@ -0,0 +1,43 @@
++"""Configuration contracts for score centering (arXiv:2609.20807)."""
++
++import math
++import os
++from argparse import Namespace
++
++from miles.utils.rollout_topk_logprobs import validate_rollout_topk_logprobs_sampling
++
++
++def validate_score_centering_args(args: Namespace) -> None:
++    if getattr(args, "loss_type", None) != "score_centering":
++        return
++    if args.rollout_top_logprobs_num <= 0:
++        raise ValueError("Score centering requires a positive --rollout-top-logprobs-num")
++    if not math.isfinite(args.score_centering_tis_clip) or args.score_centering_tis_clip <= 0:
++        raise ValueError("--score-centering-tis-clip must be finite and positive")
++    low, high = args.score_centering_mis_low, args.score_centering_mis_high
++    if not (math.isfinite(low) and math.isfinite(high) and 0 < low <= high):
++        raise ValueError("Score-centering MIS bounds must be finite with 0 < low <= high")
++    validate_rollout_topk_logprobs_sampling(
++        {"top_k": args.rollout_top_k},
++        temperature=args.rollout_temperature,
++        candidate_count=args.rollout_top_logprobs_num,
++    )
++    if args.advantage_estimator != "grpo":
++        raise ValueError("Score centering currently supports --advantage-estimator grpo (group-centered rewards)")
++    incompatible = {
++        "use_tis": "use --score-centering-is instead",
++        "custom_tis_function_path": "only the built-in score-centering TIS/MIS weights are supported",
++        "use_opsm": "sequence masking changes the score-centering estimator",
++        "true_on_policy_mode": "score centering uses float32 probability arithmetic",
++        "recompute_logprobs_via_prefill": "sampler probabilities must be recorded at generation time",
++        "sglang_speculative_algorithm": "speculative candidate-logprob semantics are not verified",
++        "custom_pg_loss_reducer_function_path": "use the standard token/sample reducer",
++        "multi_lora": "per-sample Tinker losses bypass the score-centering loss",
++        "use_opd": "distillation composition is not supported",
++        "custom_convert_samples_to_train_data_path": "custom converters skip rollout top-k logprobs validation",
++    }
++    for option, reason in incompatible.items():
++        if getattr(args, option, None):
++            raise ValueError(f"Score centering is incompatible with --{option.replace('_', '-')}: {reason}")
++    if os.environ.get("SGLANG_RETURN_ORIGINAL_LOGPROB", "").lower() in ("1", "true"):
++        raise ValueError("Score centering requires SGLANG_RETURN_ORIGINAL_LOGPROB=0 on rollout servers")
+diff --git a/miles/utils/types.py b/miles/utils/types.py
+index fbdb1668f3..0f406bdd92 100644
+--- a/miles/utils/types.py
++++ b/miles/utils/types.py
+@@ -7,7 +7,6 @@ import torch
+ 
+ from miles.utils.sampling_mask import RolloutSamplingMask
+ 
+-
+ LEGACY_WEIGHT_VERSIONS_KEY = "legacy_weight_versions"
+ 
+ 
+@@ -87,6 +86,8 @@ class Sample:
+     loss_mask: list[int] | None = None
+     weight_versions: list[WeightVersionsPerCall] = field(default_factory=list)
+     rollout_log_probs: list[float] | None = None  # Log probabilities from rollout engine
++    rollout_topk_token_ids: numpy.ndarray | None = None  # [response_length, k], int32; -1 pads unused slots
++    rollout_topk_log_probs: numpy.ndarray | None = None  # [response_length, k], float32; -inf pads unused slots
+     rollout_sampling_mask: RolloutSamplingMask | None = None
+     rollout_routed_experts: numpy.ndarray | None = (
+         None  # Routed experts from rollout engine. shape: (num_tokens-1, num_layers, moe_router_topk), dtype=int32
+@@ -252,6 +253,15 @@ class Sample:
+             assert (
+                 len(self.rollout_log_probs) == self.response_length
+             ), f"rollout_log_probs length ({len(self.rollout_log_probs)}) != response_length ({self.response_length})"
++        if self.rollout_topk_token_ids is not None or self.rollout_topk_log_probs is not None:
++            ids, logps = self.rollout_topk_token_ids, self.rollout_topk_log_probs
++            assert (
++                ids is not None and logps is not None
++            ), "Rollout top-k logprobs IDs and probabilities must both be present"
++            assert ids.ndim == 2 and ids.shape == logps.shape, "Rollout top-k logprobs candidate shapes do not match"
++            assert (
++                ids.shape[0] == self.response_length
++            ), "Rollout top-k logprobs candidates do not match response length"
+         if self.rollout_sampling_mask is not None:
+             assert len(self.rollout_sampling_mask) == self.response_length, (
+                 f"rollout_sampling_mask length ({len(self.rollout_sampling_mask)}) "
+@@ -297,6 +307,9 @@ class Sample:
+         ), f"cannot strip {n} tokens: only {self.response_length} output tokens available"
+         self.tokens = self.tokens[:-n]
+         self.response_length -= n
++        if self.rollout_topk_token_ids is not None:
++            self.rollout_topk_token_ids = self.rollout_topk_token_ids[:-n]
++            self.rollout_topk_log_probs = self.rollout_topk_log_probs[:-n]
+         if self.rollout_log_probs is not None:
+             self.rollout_log_probs = self.rollout_log_probs[:-n]
+         if self.rollout_sampling_mask is not None:
+@@ -336,6 +349,8 @@ class Sample:
+         self.loss_mask = None
+         self.weight_versions = []
+         self.rollout_log_probs = None
++        self.rollout_topk_token_ids = None
++        self.rollout_topk_log_probs = None
+         self.rollout_sampling_mask = None
+         self.rollout_routed_experts = None
+         self.rollout_indexer_topk = None
+@@ -393,7 +408,7 @@ class ParamInfo:
+ # A dict-based batch produced along the rollout -> training path
+ # In Megatron backend, several fields are converted to torch.Tensor lists on GPU
+ # before being consumed by data iterators (see megatron_utils.actor._get_rollout_data).
+-RolloutBatch = dict[str, list[torch.Tensor] | list[int] | list[float] | list[str]]
++RolloutBatch = dict[str, list[torch.Tensor] | list[numpy.ndarray] | list[int] | list[float] | list[str]]
+ 
+ 
+ @dataclass

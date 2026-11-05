@@ -1,0 +1,1438 @@
+total 72
+drwxr-xr-x 1 root root   113 Oct 24 19:30 .
+drwxr-xr-x 1 root root 12288 Oct 24 19:30 ..
+-rw-r--r-- 1 root root  1063 Oct 24 19:30 __init__.py
+-rw-r--r-- 1 root root 12857 Oct 24 19:30 cli.py
+-rw-r--r-- 1 root root 19182 Oct 24 19:30 client.py
+-rw-r--r-- 1 root root  7632 Oct 24 19:30 harbor_env.py
+-rw-r--r-- 1 root root 14710 Oct 24 19:30 policy.py
+-rw-r--r-- 1 root root  4064 Oct 24 19:30 protocol.py
+===== /usr/local/lib/python3.12/site-packages/sandbox_broker/__init__.py
+     1	"""Sandbox gate: a platform-neutral local service for short-lived task sandboxes.
+     2	
+     3	A root daemon holds the platform credentials and creates sandboxes (no network unless the
+     4	operator's policy says otherwise) on request over a Unix socket. Workloads use the
+     5	``sandbox`` command (``sandbox_broker.cli``), the clients in ``sandbox_broker.client`` or the
+     6	Harbor environment ``sandbox_broker.harbor_env:BrokerEnvironment``; none of them expose the
+     7	platform or its credentials. The package keeps its historical name ``sandbox_broker``.
+     8	"""
+     9	__version__ = "0.2.0"
+    10	
+    11	from .client import AsyncBrokerClient, AsyncSandbox, BrokerClient, ExecResult, Sandbox  # noqa: E402
+    12	from .protocol import (BackendFailure, BadRequest, BrokerError, BrokerUnavailable, PolicyDenied,  # noqa: E402
+    13	                       QuotaExceeded, SandboxNotFound)
+    14	
+    15	__all__ = [
+    16	    "AsyncBrokerClient", "AsyncSandbox", "BrokerClient", "ExecResult", "Sandbox",
+    17	    "BackendFailure", "BadRequest", "BrokerError", "BrokerUnavailable", "PolicyDenied", "QuotaExceeded",
+    18	    "SandboxNotFound", "__version__",
+    19	]
+===== /usr/local/lib/python3.12/site-packages/sandbox_broker/cli.py
+     1	"""``sandbox``: the workload-facing command of the sandbox gate (standard library only).
+     2	
+     3	Every command talks to the local gate daemon over its Unix socket. The output is the same
+     4	whatever platform runs the sandboxes; the platform is never named.
+     5	
+     6	    sandbox status                      is the service up; live sandboxes and budget
+     7	    sandbox limits                      effective policy: resource ranges, images, network
+     8	    sandbox list [--all]                your sandboxes
+     9	    sandbox create IMAGE-OPTS [RES-OPTS] [--workdir P] [--env K=V]... [--label K=V]...
+    10	    sandbox exec ID [--timeout S] [--workdir P] [--env K=V]... [--stdin] -- CMD [ARG]...
+    11	    sandbox run IMAGE-OPTS [RES-OPTS] [--exec-timeout S] [--keep] -- CMD [ARG]...
+    12	    sandbox put ID LOCAL REMOTE [--mode OCTAL]
+    13	    sandbox get ID REMOTE LOCAL [-r]
+    14	    sandbox poll ID
+    15	    sandbox terminate ID [ID]...
+    16	
+    17	Exit status: 0 on success; for exec/run the command's own status (124 when it hit its
+    18	timeout); 125 when the gate refused or failed the request (the message says why); 2 for
+    19	usage errors.
+    20	"""
+    21	from __future__ import annotations
+    22	
+    23	import argparse
+    24	import json
+    25	import os
+    26	import sys
+    27	from pathlib import Path
+    28	from typing import Any
+    29	
+    30	EXIT_TIMEOUT = 124
+    31	EXIT_GATE = 125
+    32	#: reply fields that describe the platform rather than the sandbox; never printed
+    33	_HIDDEN_KEYS = {"backend", "backend_error", "pid", "euid"}
+    34	
+    35	
+    36	def _policy_hints() -> dict[str, Any]:
+    37	    """Limits from the public policy file, for --help (best effort; `sandbox limits` is authoritative)."""
+    38	    try:
+    39	        from .policy import load_policy
+    40	
+    41	        p = load_policy(strict=False)
+    42	    except Exception:  # noqa: BLE001 - no readable policy: generic help text
+    43	        return {}
+    44	    L = p.limits
+    45	    return {"cpu": f"default {L.default_cpu:g}, allowed {L.min_cpu:g}-{L.max_cpu:g}",
+    46	            "memory": f"default {L.default_memory_mb}, allowed {L.min_memory_mb}-{L.max_memory_mb}",
+    47	            "timeout": f"default {L.default_timeout_s}, max {L.max_timeout_s}",
+    48	            "idle": f"default {L.idle_timeout_s or 'none'}, max {L.max_idle_timeout_s}",
+    49	            "exec": f"default {L.default_exec_timeout_s}, max {L.max_exec_timeout_s}",
+    50	            "file": f"max {L.max_file_bytes} bytes",
+    51	            "images": ", ".join(p.images.allow) or "none (build contexts only)",
+    52	            "contexts": ("any" if p.images.allow_any_build_context else
+    53	                         f"{len(p.images.build_contexts)} registered context hash(es)"),
+    54	            "network": "none" if p.sandbox.network == "none" else "outbound allowed",
+    55	            "concurrent": str(L.max_concurrent)}
+    56	
+    57	
+    58	def _kv(items: list[str] | None, what: str) -> dict[str, str] | None:
+    59	    if not items:
+    60	        return None
+    61	    out = {}
+    62	    for item in items:
+    63	        key, sep, value = item.partition("=")
+    64	        if not sep or not key:
+    65	            raise SystemExit(f"sandbox: {what} must be KEY=VALUE, got {item!r}")
+    66	        out[key] = value
+    67	    return out
+    68	
+    69	
+    70	def _clean(obj: Any) -> Any:
+    71	    if isinstance(obj, dict):
+    72	        return {k: _clean(v) for k, v in obj.items() if k not in _HIDDEN_KEYS}
+    73	    if isinstance(obj, list):
+    74	        return [_clean(v) for v in obj]
+    75	    return obj
+    76	
+    77	
+    78	def _print(obj: Any) -> None:
+    79	    print(json.dumps(_clean(obj), indent=2, sort_keys=True, default=str))
+    80	
+    81	
+    82	def _command(argv: list[str]) -> list[str]:
+    83	    if not argv:
+    84	        raise SystemExit("sandbox: missing command (put it after --)")
+    85	    return argv
+    86	
+    87	
+    88	def build_parser() -> argparse.ArgumentParser:
+    89	    h = _policy_hints()
+    90	
+    91	    def hint(key: str, fallback: str = "see `sandbox limits`") -> str:
+    92	        return h.get(key, fallback)
+    93	
+    94	    p = argparse.ArgumentParser(
+    95	        prog="sandbox",
+    96	        description="Create and drive isolated task sandboxes through the local sandbox service.",
+    97	        epilog=((f"Sandbox network: {h['network']}. Images: {h['images']}; build contexts: {h['contexts']}. "
+    98	                 f"At most {h['concurrent']} sandboxes at once. " if h else
+    99	                 "Run `sandbox limits` for the effective limits, images and network policy. ") +
+   100	                "Run `sandbox <command> --help` for details."),
+   101	        formatter_class=argparse.RawDescriptionHelpFormatter)
+   102	    p.add_argument("--socket", help="service socket (default: $SANDBOX_GATE_SOCKET or /run/sandbox-broker.sock)")
+   103	    p.add_argument("--json", action="store_true", help="machine-readable output")
+   104	    sub = p.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
+   105	
+   106	    sub.add_parser("status", help="service readiness, live sandboxes and remaining budget")
+   107	    sub.add_parser("limits", help="effective limits, allowed images and network policy")
+   108	    s = sub.add_parser("list", help="list your sandboxes")
+   109	    s.add_argument("--all", action="store_true", help="every user's sandboxes (administrators only)")
+   110	
+   111	    def image_opts(s: argparse.ArgumentParser) -> None:
+   112	        g = s.add_mutually_exclusive_group(required=True)
+   113	        g.add_argument("--image", metavar="REF", help=f"registry image; allowed: {hint('images')}")
+   114	        g.add_argument("--context", metavar="DIR",
+   115	                       help=f"Docker build context (Dockerfile at its root); allowed: {hint('contexts')}")
+   116	        s.add_argument("--cpu", type=float, metavar="CORES", help=f"CPU cores ({hint('cpu')})")
+   117	        s.add_argument("--memory-mb", type=int, metavar="MIB", help=f"memory in MiB ({hint('memory')})")
+   118	        s.add_argument("--timeout", type=int, metavar="SECONDS", help=f"sandbox lifetime ({hint('timeout')})")
+   119	        s.add_argument("--idle-timeout", type=int, metavar="SECONDS",
+   120	                       help=f"stop after this long without activity ({hint('idle')})")
+   121	        s.add_argument("--workdir", metavar="PATH", help="default working directory (absolute)")
+   122	        s.add_argument("--env", action="append", metavar="KEY=VALUE", help="environment variable (repeatable)")
+   123	        s.add_argument("--label", action="append", metavar="KEY=VALUE",
+   124	                       help="label shown by `sandbox list` (repeatable, at most 16)")
+   125	
+   126	    s = sub.add_parser("create", help="create a sandbox and print its id")
+   127	    image_opts(s)
+   128	
+   129	    s = sub.add_parser("exec", help="run a command in a sandbox, streaming its output",
+   130	                       description="Run CMD (no shell; use `-- sh -c '...'` for one) and exit with its status.")
+   131	    s.add_argument("id")
+   132	    s.add_argument("--timeout", type=int, metavar="SECONDS", help=f"command timeout ({hint('exec')})")
+   133	    s.add_argument("--workdir", metavar="PATH", help="working directory (absolute)")
+   134	    s.add_argument("--env", action="append", metavar="KEY=VALUE", help="environment variable (repeatable)")
+   135	    s.add_argument("--stdin", action="store_true", help="send this command's standard input to CMD")
+   136	    s.add_argument("argv", nargs="*", metavar="CMD", help="command and its arguments, after --")
+   137	
+   138	    s = sub.add_parser("run", help="create a sandbox, run one command, terminate it",
+   139	                       description="Create a sandbox, run CMD in it, terminate it (unless --keep) and exit "
+   140	                                   "with CMD's status.")
+   141	    image_opts(s)
+   142	    s.add_argument("--exec-timeout", type=int, metavar="SECONDS", help=f"command timeout ({hint('exec')})")
+   143	    s.add_argument("--stdin", action="store_true", help="send this command's standard input to CMD")
+   144	    s.add_argument("--keep", action="store_true", help="keep the sandbox and print its id on stderr")
+   145	    s.add_argument("argv", nargs="*", metavar="CMD", help="command and its arguments, after --")
+   146	
+   147	    s = sub.add_parser("put", help="copy a local file or directory into a sandbox")
+   148	    s.add_argument("id")
+   149	    s.add_argument("local")
+   150	    s.add_argument("remote", help="absolute path in the sandbox")
+   151	    s.add_argument("--mode", metavar="OCTAL", help="file mode, e.g. 0755 (files only)")
+   152	
+   153	    s = sub.add_parser("get", help=f"copy a file (or with -r a directory) out of a sandbox ({hint('file')})")
+   154	    s.add_argument("id")
+   155	    s.add_argument("remote", help="absolute path in the sandbox")
+   156	    s.add_argument("local")
+   157	    s.add_argument("-r", "--recursive", action="store_true", help="REMOTE is a directory")
+   158	
+   159	    s = sub.add_parser("poll", help="is the sandbox still running (else its exit code)")
+   160	    s.add_argument("id")
+   161	
+   162	    s = sub.add_parser("terminate", help="stop sandboxes and release their resources")
+   163	    s.add_argument("ids", nargs="+", metavar="id")
+   164	    return p
+   165	
+   166	
+   167	def _create_kwargs(a: argparse.Namespace) -> dict[str, Any]:
+   168	    kw: dict[str, Any] = {"cpu": a.cpu, "memory_mb": a.memory_mb, "timeout_s": a.timeout,
+   169	                          "idle_timeout_s": a.idle_timeout, "workdir": a.workdir,
+   170	                          "env": _kv(a.env, "--env"), "labels": _kv(a.label, "--label")}
+   171	    if a.image:
+   172	        kw["image"] = a.image
+   173	    else:
+   174	        kw["build_context"] = a.context
+   175	    return kw
+   176	
+   177	
+   178	def _exec(sb, argv: list[str], timeout: int | None, workdir: str | None, env: dict | None, use_stdin: bool) -> int:
+   179	    def out(fd: str, data: bytes) -> None:
+   180	        stream = sys.stdout.buffer if fd == "stdout" else sys.stderr.buffer
+   181	        stream.write(data)
+   182	        stream.flush()
+   183	
+   184	    stdin = sys.stdin.buffer.read() if use_stdin else None
+   185	    r = sb.exec(*argv, timeout=timeout, workdir=workdir, env=env, stdin=stdin, binary=True, on_output=out)
+   186	    if r.stdout_truncated or r.stderr_truncated:
+   187	        print("sandbox: output was truncated at the size limit", file=sys.stderr)
+   188	    if r.timed_out:
+   189	        print("sandbox: command timed out", file=sys.stderr)
+   190	        return EXIT_TIMEOUT
+   191	    return r.returncode if 0 <= r.returncode <= 255 else 1
+   192	
+   193	
+   194	def main(argv: list[str] | None = None) -> int:
+   195	    from .client import BrokerClient
+   196	    from .protocol import BrokerError
+   197	
+   198	    argv = list(sys.argv[1:] if argv is None else argv)
+   199	    tail: list[str] | None = None
+   200	    if "--" in argv:  # everything after the first -- is the sandbox command, never gate options
+   201	        i = argv.index("--")
+   202	        argv, tail = argv[:i], argv[i + 1:]
+   203	    a = build_parser().parse_args(argv)
+   204	    if tail is not None and hasattr(a, "argv"):
+   205	        a.argv = list(a.argv) + tail
+   206	    c = BrokerClient(a.socket)
+   207	    try:
+   208	        if a.cmd == "status":
+   209	            ping = c.ping()
+   210	            out = {"ready": bool(ping.get("ready")), "version": ping.get("version"), "usage": c.usage()}
+   211	            if ping.get("backend_error"):
+   212	                out["state"] = "unavailable"
+   213	            _print(out)
+   214	        elif a.cmd == "limits":
+   215	            _print(c.policy())
+   216	        elif a.cmd == "list":
+   217	            rows = c.list(all=a.all)
+   218	            if a.json:
+   219	                _print(rows)
+   220	            else:
+   221	                for r in rows:
+   222	                    state = "running" if r.get("running") else f"ended ({r.get('end_reason')})"
+   223	                    print(f"{r['id']}  {state:<20} {r.get('image', '?')}  cpu={r.get('cpu')} "
+   224	                          f"mem={r.get('memory_mb')}MiB  {json.dumps(r.get('labels') or {})}")
+   225	        elif a.cmd == "create":
+   226	            sb = c.create(**_create_kwargs(a))
+   227	            _print({"id": sb.id, **sb.info}) if a.json else print(sb.id)
+   228	        elif a.cmd == "exec":
+   229	            return _exec(c.sandbox(a.id), _command(a.argv), a.timeout, a.workdir, _kv(a.env, "--env"), a.stdin)
+   230	        elif a.cmd == "run":
+   231	            cmd = _command(a.argv)
+   232	            sb = c.create(**_create_kwargs(a))
+   233	            try:
+   234	                return _exec(sb, cmd, a.exec_timeout, None, None, a.stdin)
+   235	            finally:
+   236	                if a.keep:
+   237	                    print(f"sandbox: kept {sb.id}", file=sys.stderr)
+   238	                else:
+   239	                    sb.terminate()
+   240	        elif a.cmd == "put":
+   241	            sb = c.sandbox(a.id)
+   242	            if os.path.isdir(a.local):
+   243	                sb.upload_dir(a.local, a.remote)
+   244	            else:
+   245	                sb.put_file(a.remote, Path(a.local), mode=int(a.mode, 8) if a.mode else None)
+   246	        elif a.cmd == "get":
+   247	            sb = c.sandbox(a.id)
+   248	            if a.recursive:
+   249	                sb.download_dir(a.remote, a.local)
+   250	            else:
+   251	                target = Path(a.local)
+   252	                if target.is_dir():
+   253	                    target = target / os.path.basename(a.remote)
+   254	                target.write_bytes(sb.get_file(a.remote))
+   255	        elif a.cmd == "poll":
+   256	            rc = c.sandbox(a.id).poll()
+   257	            _print({"id": a.id, "running": rc is None, "exit_code": rc}) if a.json else \
+   258	                print("running" if rc is None else f"exited {rc}")
+   259	        elif a.cmd == "terminate":
+   260	            for sid in a.ids:
+   261	                c.sandbox(sid).terminate()
+   262	        return 0
+   263	    except BrokerError as exc:
+   264	        print(f"sandbox: error [{exc.kind}]: {exc}", file=sys.stderr)
+   265	        return EXIT_GATE
+   266	    except (TimeoutError, RuntimeError, OSError, ValueError) as exc:
+   267	        print(f"sandbox: {exc}", file=sys.stderr)
+   268	        return EXIT_GATE
+   269	
+   270	
+   271	if __name__ == "__main__":
+   272	    sys.exit(main())
+===== /usr/local/lib/python3.12/site-packages/sandbox_broker/client.py
+     1	"""Clients for the sandbox gate (standard library only, platform-neutral).
+     2	
+     3	Sync::
+     4	
+     5	    from sandbox_broker import BrokerClient
+     6	    client = BrokerClient()
+     7	    sb = client.create("python:3.12-slim-bookworm", cpu=1, memory_mb=2048, timeout_s=1800)
+     8	    r = sb.exec("bash", "-c", "ls /app", timeout=60)
+     9	    print(r.returncode, r.stdout)
+    10	    sb.put_file("/tmp/x.txt", b"hello")
+    11	    sb.terminate()
+    12	
+    13	Async: the same names on ``AsyncBrokerClient`` / ``AsyncSandbox``, awaited.
+    14	"""
+    15	from __future__ import annotations
+    16	
+    17	import asyncio
+    18	import base64
+    19	import dataclasses
+    20	import io
+    21	import json
+    22	import os
+    23	import socket
+    24	import tarfile
+    25	import uuid
+    26	from pathlib import Path
+    27	from typing import Any, Awaitable, Callable
+    28	
+    29	from .policy import DEFAULT_SOCKET_PATH
+    30	from .protocol import BrokerUnavailable, encode, error_from_reply
+    31	
+    32	OutputHandler = Callable[[str, "str | bytes"], Any]
+    33	
+    34	CREATE_REPLY_TIMEOUT = 1800.0
+    35	EXEC_GRACE = 120.0
+    36	FILE_REPLY_TIMEOUT = 600.0
+    37	
+    38	
+    39	def default_socket_path() -> str:
+    40	    return os.environ.get("SANDBOX_GATE_SOCKET") or os.environ.get("SANDBOX_BROKER_SOCKET") or DEFAULT_SOCKET_PATH
+    41	
+    42	
+    43	@dataclasses.dataclass
+    44	class ExecResult:
+    45	    returncode: int
+    46	    stdout: str | bytes
+    47	    stderr: str | bytes
+    48	    timed_out: bool = False
+    49	    stdout_truncated: bool = False
+    50	    stderr_truncated: bool = False
+    51	    duration_s: float = 0.0
+    52	
+    53	    @property
+    54	    def exit_code(self) -> int:
+    55	        return self.returncode
+    56	
+    57	    @property
+    58	    def ok(self) -> bool:
+    59	        return self.returncode == 0
+    60	
+    61	
+    62	def _create_msg(image, build_context, cpu, memory_mb, timeout_s, idle_timeout_s, workdir, env, labels):
+    63	    msg: dict[str, Any] = {"op": "create"}
+    64	    if (image is None) == (build_context is None):
+    65	        raise ValueError("give exactly one of image or build_context")
+    66	    if image is not None:
+    67	        msg["image"] = image
+    68	    else:
+    69	        msg["build_context_b64"] = base64.b64encode(pack_build_context(build_context)).decode()
+    70	    for key, val in (("cpu", cpu), ("memory_mb", memory_mb), ("timeout_s", timeout_s),
+    71	                     ("idle_timeout_s", idle_timeout_s), ("workdir", workdir), ("env", env), ("labels", labels)):
+    72	        if val is not None:
+    73	            msg[key] = val
+    74	    return msg
+    75	
+    76	
+    77	def _exec_reply_timeout(timeout):
+    78	    # No timeout given: the daemon applies the policy default/max, so wait for its reply without a client-side cap.
+    79	    return None if timeout is None else timeout + EXEC_GRACE
+    80	
+    81	
+    82	def _exec_msg(sid, argv, timeout, workdir, env, stdin, binary, stream):
+    83	    if len(argv) == 1 and isinstance(argv[0], (list, tuple)):
+    84	        argv = tuple(argv[0])
+    85	    msg: dict[str, Any] = {"op": "exec", "id": sid, "argv": [str(a) for a in argv]}
+    86	    if timeout is not None:
+    87	        msg["timeout_s"] = int(timeout)
+    88	    if workdir is not None:
+    89	        msg["workdir"] = workdir
+    90	    if env:
+    91	        msg["env"] = {k: str(v) for k, v in env.items() if v is not None}
+    92	    if stdin is not None:
+    93	        data = stdin.encode() if isinstance(stdin, str) else bytes(stdin)
+    94	        msg["stdin_b64"] = base64.b64encode(data).decode()
+    95	    if binary:
+    96	        msg["binary"] = True
+    97	    if stream:
+    98	        msg["stream"] = True
+    99	    return msg
+   100	
+   101	
+   102	def _exec_result(reply: dict, binary: bool, streamed: dict[str, list] | None) -> ExecResult:
+   103	    if streamed is not None:
+   104	        if binary:
+   105	            out, err = b"".join(streamed["stdout"]), b"".join(streamed["stderr"])
+   106	        else:
+   107	            out, err = "".join(streamed["stdout"]), "".join(streamed["stderr"])
+   108	    elif binary:
+   109	        out = base64.b64decode(reply.get("stdout_b64", ""))
+   110	        err = base64.b64decode(reply.get("stderr_b64", ""))
+   111	    else:
+   112	        out, err = reply.get("stdout", ""), reply.get("stderr", "")
+   113	    return ExecResult(returncode=int(reply.get("rc", -1)), stdout=out, stderr=err,
+   114	                      timed_out=bool(reply.get("timed_out")), stdout_truncated=bool(reply.get("stdout_truncated")),
+   115	                      stderr_truncated=bool(reply.get("stderr_truncated")),
+   116	                      duration_s=float(reply.get("duration_s", 0.0)))
+   117	
+   118	
+   119	def _event_data(ev: dict, binary: bool):
+   120	    return base64.b64decode(ev.get("data_b64", "")) if binary else ev.get("data", "")
+   121	
+   122	
+   123	def pack_build_context(path: str | os.PathLike | bytes) -> bytes:
+   124	    """tar.gz of a Docker build context directory (the Dockerfile must be at its root)."""
+   125	    if isinstance(path, (bytes, bytearray)):
+   126	        return bytes(path)
+   127	    root = Path(path)
+   128	    if not (root / "Dockerfile").is_file():
+   129	        raise ValueError(f"{root} has no Dockerfile")
+   130	    buf = io.BytesIO()
+   131	    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+   132	        for p in sorted(root.rglob("*")):
+   133	            if p.is_symlink():
+   134	                raise ValueError(f"symlinks are not supported in build contexts: {p}")
+   135	            rel = p.relative_to(root).as_posix()
+   136	            info = tf.gettarinfo(str(p), arcname=rel)
+   137	            info.uid = info.gid = 0
+   138	            info.uname = info.gname = ""
+   139	            info.mtime = 0
+   140	            if p.is_file():
+   141	                with open(p, "rb") as f:
+   142	                    tf.addfile(info, f)
+   143	            elif p.is_dir():
+   144	                tf.addfile(info)
+   145	    return buf.getvalue()
+   146	
+   147	
+   148	def _tar_dir(local_dir: str | os.PathLike) -> bytes:
+   149	    buf = io.BytesIO()
+   150	    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+   151	        tf.add(str(local_dir), arcname=".")
+   152	    return buf.getvalue()
+   153	
+   154	
+   155	def _untar(data: bytes, dest: str | os.PathLike) -> None:
+   156	    dest = Path(dest)
+   157	    dest.mkdir(parents=True, exist_ok=True)
+   158	    with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tf:
+   159	        try:
+   160	            tf.extractall(dest, filter="data")
+   161	        except TypeError:  # Python < 3.12 without extraction filters
+   162	            for m in tf.getmembers():
+   163	                target = (dest / m.name).resolve()
+   164	                if not str(target).startswith(str(dest.resolve())) or m.issym() or m.islnk() or m.isdev():
+   165	                    continue
+   166	                tf.extract(m, dest)
+   167	
+   168	
+   169	# ============================================================================ sync
+   170	
+   171	
+   172	class BrokerClient:
+   173	    def __init__(self, socket_path: str | None = None, connect_timeout: float = 30.0):
+   174	        self.socket_path = socket_path or default_socket_path()
+   175	        self.connect_timeout = connect_timeout
+   176	
+   177	    def _connect(self) -> socket.socket:
+   178	        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+   179	        s.settimeout(self.connect_timeout)
+   180	        try:
+   181	            s.connect(self.socket_path)
+   182	        except (FileNotFoundError, ConnectionRefusedError) as exc:
+   183	            s.close()
+   184	            raise BrokerUnavailable(f"sandbox broker is not running at {self.socket_path}") from exc
+   185	        return s
+   186	
+   187	    def call(self, msg: dict, timeout: float | None = 300.0,
+   188	             on_event: Callable[[dict], None] | None = None) -> dict:
+   189	        s = self._connect()
+   190	        try:
+   191	            s.settimeout(timeout)
+   192	            s.sendall(encode(msg))
+   193	            f = s.makefile("rb")
+   194	            while True:
+   195	                line = f.readline()
+   196	                if not line:
+   197	                    raise BrokerUnavailable(f"broker closed the connection during {msg.get('op')}")
+   198	                reply = json.loads(line)
+   199	                if "event" in reply:
+   200	                    if on_event:
+   201	                        on_event(reply)
+   202	                    continue
+   203	                if not reply.get("ok", "error" not in reply):
+   204	                    raise error_from_reply(reply)
+   205	                return reply
+   206	        except socket.timeout as exc:
+   207	            raise TimeoutError(f"no reply from broker for {msg.get('op')} within {timeout}s") from exc
+   208	        finally:
+   209	            s.close()
+   210	
+   211	    def ping(self, timeout: float = 10.0) -> dict:
+   212	        return self.call({"op": "ping"}, timeout=timeout)
+   213	
+   214	    def usage(self) -> dict:
+   215	        return self.call({"op": "usage"})
+   216	
+   217	    def policy(self) -> dict:
+   218	        return self.call({"op": "policy"})["policy"]
+   219	
+   220	    def list(self, all: bool = False) -> list[dict]:
+   221	        return self.call({"op": "list", **({"all": True} if all else {})})["sandboxes"]
+   222	
+   223	    def shutdown(self, exit: bool = True) -> dict:
+   224	        return self.call({"op": "shutdown", "exit": exit}, timeout=600)["summary"]
+   225	
+   226	    def create(self, image: str | None = None, *, build_context: str | os.PathLike | bytes | None = None,
+   227	               cpu: float | None = None, memory_mb: int | None = None, timeout_s: int | None = None,
+   228	               idle_timeout_s: int | None = None, workdir: str | None = None, env: dict | None = None,
+   229	               labels: dict | None = None) -> "Sandbox":
+   230	        msg = _create_msg(image, build_context, cpu, memory_mb, timeout_s, idle_timeout_s, workdir, env, labels)
+   231	        reply = self.call(msg, timeout=CREATE_REPLY_TIMEOUT)
+   232	        return Sandbox(self, reply["id"], reply.get("sandbox", {}))
+   233	
+   234	    def sandbox(self, sandbox_id: str) -> "Sandbox":
+   235	        return Sandbox(self, sandbox_id, {})
+   236	
+   237	
+   238	class Sandbox:
+   239	    def __init__(self, client: BrokerClient, sandbox_id: str, info: dict):
+   240	        self.client = client
+   241	        self.id = sandbox_id
+   242	        self.info = info
+   243	
+   244	    @property
+   245	    def object_id(self) -> str:
+   246	        return self.id
+   247	
+   248	    def exec(self, *argv: str, timeout: int | None = None, workdir: str | None = None, env: dict | None = None,
+   249	             stdin: str | bytes | None = None, binary: bool = False,
+   250	             on_output: OutputHandler | None = None) -> ExecResult:
+   251	        stream = on_output is not None
+   252	        msg = _exec_msg(self.id, argv, timeout, workdir, env, stdin, binary, stream)
+   253	        streamed: dict[str, list] | None = {"stdout": [], "stderr": []} if stream else None
+   254	
+   255	        def on_event(ev: dict) -> None:
+   256	            data = _event_data(ev, binary)
+   257	            streamed[ev["fd"]].append(data)
+   258	            on_output(ev["fd"], data)
+   259	
+   260	        reply = self.client.call(msg, timeout=_exec_reply_timeout(timeout), on_event=on_event if stream else None)
+   261	        return _exec_result(reply, binary, streamed)
+   262	
+   263	    run = exec
+   264	
+   265	    def put_file(self, path: str, data: str | bytes | os.PathLike, mode: int | None = None) -> None:
+   266	        if isinstance(data, os.PathLike):
+   267	            data = Path(data).read_bytes()
+   268	        elif isinstance(data, str):
+   269	            data = data.encode()
+   270	        msg = {"op": "put_file", "id": self.id, "path": path, "data_b64": base64.b64encode(data).decode()}
+   271	        if mode is not None:
+   272	            msg["mode"] = mode
+   273	        self.client.call(msg, timeout=FILE_REPLY_TIMEOUT)
+   274	
+   275	    def get_file(self, path: str) -> bytes:
+   276	        reply = self.client.call({"op": "get_file", "id": self.id, "path": path}, timeout=FILE_REPLY_TIMEOUT)
+   277	        return base64.b64decode(reply["data_b64"])
+   278	
+   279	    def upload_dir(self, local_dir: str | os.PathLike, remote_dir: str) -> None:
+   280	        tmp = f"/tmp/.sandbox-broker-{uuid.uuid4().hex}.tar.gz"
+   281	        self.put_file(tmp, _tar_dir(local_dir))
+   282	        r = self.exec("sh", "-c", 'mkdir -p "$1" && tar -xzf "$2" -C "$1"; rc=$?; rm -f "$2"; exit $rc',
+   283	                      "_", remote_dir, tmp, timeout=600)
+   284	        if r.returncode != 0:
+   285	            raise RuntimeError(f"upload_dir failed ({r.returncode}): {r.stderr}")
+   286	
+   287	    def download_dir(self, remote_dir: str, local_dir: str | os.PathLike) -> None:
+   288	        tmp = f"/tmp/.sandbox-broker-{uuid.uuid4().hex}.tar.gz"
+   289	        r = self.exec("tar", "-czf", tmp, "-C", remote_dir, ".", timeout=600)
+   290	        if r.returncode != 0:
+   291	            raise RuntimeError(f"download_dir failed ({r.returncode}): {r.stderr}")
+   292	        try:
+   293	            _untar(self.get_file(tmp), local_dir)
+   294	        finally:
+   295	            self.exec("rm", "-f", tmp, timeout=60)
+   296	
+   297	    def poll(self) -> int | None:
+   298	        reply = self.client.call({"op": "poll", "id": self.id})
+   299	        return None if reply["running"] else (reply.get("rc") if reply.get("rc") is not None else 0)
+   300	
+   301	    def terminate(self) -> None:
+   302	        self.client.call({"op": "terminate", "id": self.id}, timeout=180)
+   303	
+   304	    def __enter__(self) -> "Sandbox":
+   305	        return self
+   306	
+   307	    def __exit__(self, *exc) -> None:
+   308	        try:
+   309	            self.terminate()
+   310	        except Exception:  # noqa: BLE001
+   311	            pass
+   312	
+   313	
+   314	# ============================================================================ async
+   315	
+   316	
+   317	class AsyncBrokerClient:
+   318	    def __init__(self, socket_path: str | None = None, connect_timeout: float = 30.0):
+   319	        self.socket_path = socket_path or default_socket_path()
+   320	        self.connect_timeout = connect_timeout
+   321	
+   322	    async def call(self, msg: dict, timeout: float | None = 300.0,
+   323	                   on_event: Callable[[dict], Awaitable[None] | None] | None = None) -> dict:
+   324	        try:
+   325	            reader, writer = await asyncio.wait_for(
+   326	                asyncio.open_unix_connection(self.socket_path, limit=1 << 30), self.connect_timeout)
+   327	        except (FileNotFoundError, ConnectionRefusedError) as exc:
+   328	            raise BrokerUnavailable(f"sandbox broker is not running at {self.socket_path}") from exc
+   329	        try:
+   330	            writer.write(encode(msg))
+   331	            await writer.drain()
+   332	
+   333	            async def read_reply() -> dict:
+   334	                while True:
+   335	                    line = await reader.readline()
+   336	                    if not line:
+   337	                        raise BrokerUnavailable(f"broker closed the connection during {msg.get('op')}")
+   338	                    reply = json.loads(line)
+   339	                    if "event" in reply:
+   340	                        if on_event:
+   341	                            res = on_event(reply)
+   342	                            if asyncio.iscoroutine(res):
+   343	                                await res
+   344	                        continue
+   345	                    return reply
+   346	
+   347	            try:
+   348	                reply = await asyncio.wait_for(read_reply(), timeout)
+   349	            except asyncio.TimeoutError as exc:
+   350	                raise TimeoutError(f"no reply from broker for {msg.get('op')} within {timeout}s") from exc
+   351	        finally:
+   352	            writer.close()
+   353	        if not reply.get("ok", "error" not in reply):
+   354	            raise error_from_reply(reply)
+   355	        return reply
+   356	
+   357	    async def ping(self, timeout: float = 10.0) -> dict:
+   358	        return await self.call({"op": "ping"}, timeout=timeout)
+   359	
+   360	    async def usage(self) -> dict:
+   361	        return await self.call({"op": "usage"})
+   362	
+   363	    async def policy(self) -> dict:
+   364	        return (await self.call({"op": "policy"}))["policy"]
+   365	
+   366	    async def list(self, all: bool = False) -> list[dict]:
+   367	        return (await self.call({"op": "list", **({"all": True} if all else {})}))["sandboxes"]
+   368	
+   369	    async def shutdown(self, exit: bool = True) -> dict:
+   370	        return (await self.call({"op": "shutdown", "exit": exit}, timeout=600))["summary"]
+   371	
+   372	    async def create(self, image: str | None = None, *, build_context: str | os.PathLike | bytes | None = None,
+   373	                     cpu: float | None = None, memory_mb: int | None = None, timeout_s: int | None = None,
+   374	                     idle_timeout_s: int | None = None, workdir: str | None = None, env: dict | None = None,
+   375	                     labels: dict | None = None) -> "AsyncSandbox":
+   376	        if build_context is not None and not isinstance(build_context, (bytes, bytearray)):
+   377	            build_context = await asyncio.to_thread(pack_build_context, build_context)
+   378	        msg = _create_msg(image, build_context, cpu, memory_mb, timeout_s, idle_timeout_s, workdir, env, labels)
+   379	        reply = await self.call(msg, timeout=CREATE_REPLY_TIMEOUT)
+   380	        return AsyncSandbox(self, reply["id"], reply.get("sandbox", {}))
+   381	
+   382	    def sandbox(self, sandbox_id: str) -> "AsyncSandbox":
+   383	        return AsyncSandbox(self, sandbox_id, {})
+   384	
+   385	
+   386	class AsyncSandbox:
+   387	    def __init__(self, client: AsyncBrokerClient, sandbox_id: str, info: dict):
+   388	        self.client = client
+   389	        self.id = sandbox_id
+   390	        self.info = info
+   391	
+   392	    @property
+   393	    def object_id(self) -> str:
+   394	        return self.id
+   395	
+   396	    async def exec(self, *argv: str, timeout: int | None = None, workdir: str | None = None,
+   397	                   env: dict | None = None, stdin: str | bytes | None = None, binary: bool = False,
+   398	                   on_output: OutputHandler | None = None) -> ExecResult:
+   399	        stream = on_output is not None
+   400	        msg = _exec_msg(self.id, argv, timeout, workdir, env, stdin, binary, stream)
+   401	        streamed: dict[str, list] | None = {"stdout": [], "stderr": []} if stream else None
+   402	
+   403	        async def on_event(ev: dict) -> None:
+   404	            data = _event_data(ev, binary)
+   405	            streamed[ev["fd"]].append(data)
+   406	            res = on_output(ev["fd"], data)
+   407	            if asyncio.iscoroutine(res):
+   408	                await res
+   409	
+   410	        reply = await self.client.call(msg, timeout=_exec_reply_timeout(timeout),
+   411	                                       on_event=on_event if stream else None)
+   412	        return _exec_result(reply, binary, streamed)
+   413	
+   414	    run = exec
+   415	
+   416	    async def put_file(self, path: str, data: str | bytes | os.PathLike, mode: int | None = None) -> None:
+   417	        if isinstance(data, os.PathLike):
+   418	            data = await asyncio.to_thread(Path(data).read_bytes)
+   419	        elif isinstance(data, str):
+   420	            data = data.encode()
+   421	        msg = {"op": "put_file", "id": self.id, "path": path, "data_b64": base64.b64encode(data).decode()}
+   422	        if mode is not None:
+   423	            msg["mode"] = mode
+   424	        await self.client.call(msg, timeout=FILE_REPLY_TIMEOUT)
+   425	
+   426	    async def get_file(self, path: str) -> bytes:
+   427	        reply = await self.client.call({"op": "get_file", "id": self.id, "path": path}, timeout=FILE_REPLY_TIMEOUT)
+   428	        return base64.b64decode(reply["data_b64"])
+   429	
+   430	    async def upload_dir(self, local_dir: str | os.PathLike, remote_dir: str) -> None:
+   431	        tmp = f"/tmp/.sandbox-broker-{uuid.uuid4().hex}.tar.gz"
+   432	        await self.put_file(tmp, await asyncio.to_thread(_tar_dir, local_dir))
+   433	        r = await self.exec("sh", "-c", 'mkdir -p "$1" && tar -xzf "$2" -C "$1"; rc=$?; rm -f "$2"; exit $rc',
+   434	                            "_", remote_dir, tmp, timeout=600)
+   435	        if r.returncode != 0:
+   436	            raise RuntimeError(f"upload_dir failed ({r.returncode}): {r.stderr}")
+   437	
+   438	    async def download_dir(self, remote_dir: str, local_dir: str | os.PathLike) -> None:
+   439	        tmp = f"/tmp/.sandbox-broker-{uuid.uuid4().hex}.tar.gz"
+   440	        r = await self.exec("tar", "-czf", tmp, "-C", remote_dir, ".", timeout=600)
+   441	        if r.returncode != 0:
+   442	            raise RuntimeError(f"download_dir failed ({r.returncode}): {r.stderr}")
+   443	        try:
+   444	            await asyncio.to_thread(_untar, await self.get_file(tmp), local_dir)
+   445	        finally:
+   446	            await self.exec("rm", "-f", tmp, timeout=60)
+   447	
+   448	    async def poll(self) -> int | None:
+   449	        reply = await self.client.call({"op": "poll", "id": self.id})
+   450	        return None if reply["running"] else (reply.get("rc") if reply.get("rc") is not None else 0)
+   451	
+   452	    async def terminate(self) -> None:
+   453	        await self.client.call({"op": "terminate", "id": self.id}, timeout=180)
+   454	
+   455	    async def __aenter__(self) -> "AsyncSandbox":
+   456	        return self
+   457	
+   458	    async def __aexit__(self, *exc) -> None:
+   459	        try:
+   460	            await self.terminate()
+   461	        except Exception:  # noqa: BLE001
+   462	            pass
+   463	
+   464	
+   465	__all__ = ["AsyncBrokerClient", "AsyncSandbox", "BrokerClient", "ExecResult", "Sandbox",
+   466	                          "default_socket_path", "pack_build_context"]
+===== /usr/local/lib/python3.12/site-packages/sandbox_broker/harbor_env.py
+     1	"""Harbor environment backed by the sandbox gate.
+     2	
+     3	Use it wherever Harbor would otherwise create cloud sandboxes itself::
+     4	
+     5	    EnvironmentConfig(import_path="sandbox_broker.harbor_env:BrokerEnvironment", kwargs={...})
+     6	
+     7	or on the command line: ``harbor run -e sandbox_broker.harbor_env:BrokerEnvironment``
+     8	(``--environment-import-path`` in some Harbor versions).
+     9	
+    10	The task's image comes from ``[environment].docker_image`` when set, otherwise from its
+    11	``environment/`` build context (the gate only builds contexts on its allowlist). CPU and
+    12	memory follow the task config and Harbor's overrides. Network access is the gate's policy
+    13	(none unless the operator configured otherwise), whatever the task's ``network_mode`` says.
+    14	
+    15	For code that builds ``EnvironmentConfig(type=...)`` and cannot be changed, call
+    16	``route_environment_type("<type>")`` once in the process before trials start.
+    17	"""
+    18	from __future__ import annotations
+    19	
+    20	import asyncio
+    21	import inspect
+    22	import logging
+    23	import shlex
+    24	from pathlib import Path
+    25	
+    26	from harbor.environments.base import BaseEnvironment, ExecResult
+    27	from harbor.environments.capabilities import EnvironmentCapabilities
+    28	
+    29	from .client import AsyncBrokerClient, AsyncSandbox, pack_build_context
+    30	
+    31	log = logging.getLogger("sandbox_broker.harbor")
+    32	
+    33	try:  # present in current Harbor releases
+    34	    from harbor.environments.definition import parse_dockerfile_workdir
+    35	except ImportError:  # pragma: no cover
+    36	    def parse_dockerfile_workdir(path: Path) -> str | None:
+    37	        workdir = None
+    38	        try:
+    39	            for line in Path(path).read_text().splitlines():
+    40	                parts = line.strip().split(None, 1)
+    41	                if len(parts) == 2 and parts[0].upper() == "WORKDIR":
+    42	                    workdir = parts[1].strip()
+    43	        except OSError:
+    44	            return None
+    45	        return workdir
+    46	
+    47	
+    48	class BrokerEnvironment(BaseEnvironment):
+    49	    """Runs each trial's task container as a broker sandbox."""
+    50	
+    51	    def __init__(self, environment_dir: Path, environment_name: str, session_id: str, trial_paths,
+    52	                 task_env_config, *args, socket_path: str | None = None, sandbox_timeout_secs: int | None = None,
+    53	                 idle_timeout_secs: int | None = None, **kwargs):
+    54	        # options meant for other environment types (``--ek`` values) are dropped, not forwarded
+    55	        accepted = inspect.signature(BaseEnvironment.__init__).parameters
+    56	        if not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in accepted.values()):
+    57	            for key in [k for k in kwargs if k not in accepted]:
+    58	                kwargs.pop(key)
+    59	        else:
+    60	            for key in ("app_name", "secrets", "registry_secret", "volumes", "sandbox_idle_timeout_secs",
+    61	                        "auto_labels", "labels", "region", "keepalive"):
+    62	                kwargs.pop(key, None)
+    63	        self._client = AsyncBrokerClient(socket_path)
+    64	        self._sandbox: AsyncSandbox | None = None
+    65	        self._sandbox_timeout = sandbox_timeout_secs
+    66	        self._idle_timeout = idle_timeout_secs
+    67	        super().__init__(environment_dir=environment_dir, environment_name=environment_name, session_id=session_id,
+    68	                         trial_paths=trial_paths, task_env_config=task_env_config, *args, **kwargs)
+    69	        self._workdir = task_env_config.workdir or parse_dockerfile_workdir(self.environment_dir / "Dockerfile")
+    70	
+    71	    @staticmethod
+    72	    def type() -> str:
+    73	        return "sandbox-broker"
+    74	
+    75	    @property
+    76	    def capabilities(self) -> EnvironmentCapabilities:
+    77	        return EnvironmentCapabilities(disable_internet=True)
+    78	
+    79	    @classmethod
+    80	    def preflight(cls) -> None:
+    81	        return None
+    82	
+    83	    def _validate_definition(self) -> None:
+    84	        if self.task_env_config.docker_image:
+    85	            return
+    86	        if not (self.environment_dir / "Dockerfile").is_file():
+    87	            raise FileNotFoundError(f"{self.environment_dir / 'Dockerfile'} not found")
+    88	
+    89	    async def start(self, force_build: bool) -> None:
+    90	        cfg = self.task_env_config
+    91	        if getattr(self, "_network_is_public", False):
+    92	            log.info("%s: task asks for network access; the gate's policy decides", self.environment_name)
+    93	        source: dict = {}
+    94	        if cfg.docker_image:
+    95	            source["image"] = cfg.docker_image
+    96	        else:
+    97	            source["build_context"] = await asyncio.to_thread(pack_build_context, self.environment_dir)
+    98	        cpus = getattr(self, "_effective_cpus", cfg.cpus)
+    99	        memory = getattr(self, "_effective_memory_mb", cfg.memory_mb)
+   100	        labels = {"session": self.session_id[:128], "environment": self.environment_name[:128]}
+   101	        self._sandbox = await self._client.create(
+   102	            **source, cpu=cpus, memory_mb=memory, timeout_s=self._sandbox_timeout,
+   103	            idle_timeout_s=self._idle_timeout, labels=labels)
+   104	        if cfg.workdir:
+   105	            await self.exec(f"mkdir -p {shlex.quote(cfg.workdir)}", user="root")
+   106	        if hasattr(self, "ensure_dirs") and hasattr(self, "_mount_targets"):
+   107	            await self.ensure_dirs(self._mount_targets(writable_only=True))
+   108	        if hasattr(self, "_upload_environment_dir_after_start"):
+   109	            await self._upload_environment_dir_after_start()
+   110	
+   111	    async def stop(self, delete: bool) -> None:
+   112	        if self._sandbox is not None:
+   113	            try:
+   114	                await self._sandbox.terminate()
+   115	            except Exception as exc:  # noqa: BLE001
+   116	                log.warning("terminate failed: %s", exc)
+   117	            self._sandbox = None
+   118	
+   119	    def _require(self) -> AsyncSandbox:
+   120	        if self._sandbox is None:
+   121	            raise RuntimeError("Sandbox not found. Please start the environment first.")
+   122	        return self._sandbox
+   123	
+   124	    async def exec(self, command: str, cwd: str | None = None, env: dict[str, str] | None = None,
+   125	                   timeout_sec: int | None = None, user: str | int | None = None) -> ExecResult:
+   126	        sb = self._require()
+   127	        user = self._resolve_user(user)
+   128	        if user is not None:
+   129	            if isinstance(user, int):
+   130	                user_arg = f"$(getent passwd {user} | cut -d: -f1)"
+   131	            else:
+   132	                user_arg = shlex.quote(str(user))
+   133	            command = f"su {user_arg} -s /bin/bash -c {shlex.quote(command)}"
+   134	        r = await sb.exec("bash", "-c", command, timeout=timeout_sec, workdir=cwd or self._workdir,
+   135	                          env=self._merge_env(env))
+   136	        return ExecResult(stdout=r.stdout, stderr=r.stderr, return_code=r.returncode)
+   137	
+   138	    async def upload_file(self, source_path: Path | str, target_path: str) -> None:
+   139	        await self._require().put_file(target_path, Path(source_path))
+   140	
+   141	    async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
+   142	        await self._require().upload_dir(source_dir, target_dir)
+   143	
+   144	    async def download_file(self, source_path: str, target_path: Path | str) -> None:
+   145	        data = await self._require().get_file(source_path)
+   146	        target = Path(target_path)
+   147	        target.parent.mkdir(parents=True, exist_ok=True)
+   148	        await asyncio.to_thread(target.write_bytes, data)
+   149	
+   150	    async def download_dir(self, source_dir: str, target_dir: Path | str) -> None:
+   151	        await self._require().download_dir(source_dir, target_dir)
+   152	
+   153	
+   154	def route_environment_type(type_name: str) -> None:
+   155	    """Route one of Harbor's built-in environment types (by its value) to the gate in this process."""
+   156	    from harbor.environments import factory
+   157	    from harbor.models.environment_type import EnvironmentType
+   158	
+   159	    factory._ENVIRONMENT_REGISTRY[EnvironmentType(type_name)] = factory._EnvEntry(
+   160	        "sandbox_broker.harbor_env", "BrokerEnvironment", None)
+   161	
+   162	
+   163	__all__ = ["BrokerEnvironment", "route_environment_type"]
+===== /usr/local/lib/python3.12/site-packages/sandbox_broker/policy.py
+     1	"""Public gate policy: socket, resource limits, image rules, sandbox defaults, file locations.
+     2	
+     3	The policy file is owned by root, world-readable (0644) and read once when the daemon starts;
+     4	workloads may read it (``sandbox limits`` shows the effective values). It holds nothing
+     5	platform-specific: the platform, its account names and credentials live in the root-only
+     6	backend config (``config.py``). TOML is used when the interpreter has ``tomllib`` (3.11+) or
+     7	``tomli``; JSON works everywhere.
+     8	"""
+     9	from __future__ import annotations
+    10	
+    11	import dataclasses
+    12	import fnmatch
+    13	import hashlib
+    14	import json
+    15	import os
+    16	import re
+    17	import stat
+    18	from pathlib import Path
+    19	from typing import Any
+    20	
+    21	DEFAULT_POLICY_PATH = "/etc/sandbox-broker/policy.toml"
+    22	DEFAULT_SOCKET_PATH = "/run/sandbox-broker.sock"
+    23	
+    24	_MiB = 1024 * 1024
+    25	
+    26	
+    27	class PolicyError(ValueError):
+    28	    """The policy file is missing, malformed or unsafe to load."""
+    29	
+    30	
+    31	@dataclasses.dataclass
+    32	class Limits:
+    33	    max_concurrent: int = 32
+    34	    max_total_creates: int = 0  # 0 = unlimited
+    35	    default_cpu: float = 1.0
+    36	    min_cpu: float = 0.125
+    37	    max_cpu: float = 2.0
+    38	    default_memory_mb: int = 2048
+    39	    min_memory_mb: int = 128
+    40	    max_memory_mb: int = 8192
+    41	    default_timeout_s: int = 3600
+    42	    max_timeout_s: int = 3600
+    43	    idle_timeout_s: int = 900
+    44	    max_idle_timeout_s: int = 3600
+    45	    default_exec_timeout_s: int = 600
+    46	    max_exec_timeout_s: int = 1800
+    47	    budget_sandbox_seconds: float = 0.0  # 0 = unlimited
+    48	    min_create_budget_s: int = 60
+    49	    max_file_bytes: int = 64 * _MiB
+    50	    max_output_bytes: int = 8 * _MiB
+    51	    max_context_bytes: int = 64 * _MiB
+    52	    # some platforms upload large context files through extra storage hosts that a tight
+    53	    # network allowlist does not include; keep every context file below 4 MiB by default
+    54	    max_context_file_bytes: int = 4 * _MiB - 1
+    55	    max_inflight_execs: int = 512
+    56	    create_timeout_s: int = 1200
+    57	    reap_interval_s: float = 5.0
+    58	    poll_interval_s: float = 30.0
+    59	    usage_log_interval_s: float = 300.0
+    60	
+    61	
+    62	@dataclasses.dataclass
+    63	class ImageRules:
+    64	    allow: list[str] = dataclasses.field(default_factory=list)
+    65	    pins: dict[str, str] = dataclasses.field(default_factory=dict)
+    66	    pins_file: str | None = None
+    67	    require_pin: bool = False
+    68	    build_contexts: list[str] = dataclasses.field(default_factory=list)
+    69	    build_contexts_file: str | None = None
+    70	    setup_commands: list[str] = dataclasses.field(default_factory=list)
+    71	    # operator-only (e.g. a verifier that builds whatever task directories it is given): accept any
+    72	    # build context instead of the hash allow-list
+    73	    allow_any_build_context: bool = False
+    74	
+    75	
+    76	NETWORK_CHOICES = ("none", "egress")
+    77	
+    78	
+    79	@dataclasses.dataclass
+    80	class SandboxDefaults:
+    81	    """What every sandbox looks like to its workload, whatever the platform."""
+    82	
+    83	    network: str = "none"  # "none" (no outbound network) | "egress" (operator-only: verifier batteries)
+    84	    hostname: str = "sandbox"  # gethostname() / shell prompt inside sandboxes; "" keeps the platform's own
+    85	    # when the platform cannot set the hostname natively: set HOSTNAME and rewrite \h / \H in bash prompts
+    86	    normalize_prompt: bool = True
+    87	
+    88	
+    89	@dataclasses.dataclass
+    90	class Policy:
+    91	    socket_path: str = DEFAULT_SOCKET_PATH
+    92	    socket_mode: int = 0o666
+    93	    socket_group: str | None = None
+    94	    allowed_uids: list[int] = dataclasses.field(default_factory=list)  # empty = any local user
+    95	    admin_uids: list[int] = dataclasses.field(default_factory=lambda: [0])
+    96	    state_dir: str = "/var/lib/sandbox-broker"
+    97	    log_dir: str = "/var/log/sandbox-broker"
+    98	    audit_log_mode: int = 0o644
+    99	    log_resolved_hosts: bool = False
+   100	    limits: Limits = dataclasses.field(default_factory=Limits)
+   101	    images: ImageRules = dataclasses.field(default_factory=ImageRules)
+   102	    sandbox: SandboxDefaults = dataclasses.field(default_factory=SandboxDefaults)
+   103	    source_path: str | None = None
+   104	    source_sha256: str | None = None
+   105	    # pre-split policy files carried platform keys (app_name, <platform>_environment, [network]); they are
+   106	    # moved here on load, used only when no backend config exists, and never reported
+   107	    legacy_backend: dict[str, Any] = dataclasses.field(default_factory=dict, repr=False)
+   108	
+   109	    @property
+   110	    def audit_log(self) -> str:
+   111	        return os.path.join(self.log_dir, "audit.jsonl")
+   112	
+   113	    @property
+   114	    def daemon_log(self) -> str:
+   115	        return os.path.join(self.log_dir, "daemon.log")
+   116	
+   117	    @property
+   118	    def credentials_path(self) -> str:
+   119	        return os.path.join(self.state_dir, "credentials.json")
+   120	
+   121	    @property
+   122	    def state_path(self) -> str:
+   123	        return os.path.join(self.state_dir, "state.json")
+   124	
+   125	    @property
+   126	    def contexts_dir(self) -> str:
+   127	        return os.path.join(self.state_dir, "contexts")
+   128	
+   129	    def summary(self) -> dict[str, Any]:
+   130	        """The effective policy as clients see it (``policy`` op, ``sandbox limits``)."""
+   131	        return {
+   132	            "network": "blocked" if self.sandbox.network == "none" else "egress",
+   133	            "hostname": self.sandbox.hostname or None,
+   134	            "limits": dataclasses.asdict(self.limits),
+   135	            "images": {
+   136	                "allow": list(self.images.allow),
+   137	                "pinned_refs": len(self.images.pins),
+   138	                "require_pin": self.images.require_pin,
+   139	                "build_contexts": "any" if self.images.allow_any_build_context else len(self.images.build_contexts),
+   140	                "setup_commands": len(self.images.setup_commands),
+   141	            },
+   142	            "policy_sha256": self.source_sha256,
+   143	        }
+   144	
+   145	
+   146	# ---------------------------------------------------------------------------
+   147	# Loading
+   148	
+   149	
+   150	def _parse_mode(value: Any) -> int:
+   151	    if isinstance(value, int):
+   152	        return value
+   153	    if isinstance(value, str):
+   154	        return int(value, 8)
+   155	    raise PolicyError(f"invalid file mode: {value!r}")
+   156	
+   157	
+   158	def _fill(cls, data: dict[str, Any], where: str):
+   159	    fields = {f.name for f in dataclasses.fields(cls)}
+   160	    unknown = set(data) - fields
+   161	    if unknown:
+   162	        raise PolicyError(f"unknown key(s) in {where}: {', '.join(sorted(unknown))}")
+   163	    return cls(**data)
+   164	
+   165	
+   166	def _read_text_list(path: str) -> list[str]:
+   167	    out = []
+   168	    for line in Path(path).read_text().splitlines():
+   169	        line = line.split("#", 1)[0].strip()
+   170	        if line:
+   171	            out.append(line.split()[0])
+   172	    return out
+   173	
+   174	
+   175	def check_root_owned(path: str) -> None:
+   176	    """Refuse files that a non-root user could have written."""
+   177	    st = os.stat(path)
+   178	    if st.st_uid != 0 or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+   179	        raise PolicyError(f"{path} must be owned by root and not writable by group/others")
+   180	
+   181	
+   182	LEGACY_BACKEND_KEYS = ("app_name", "network")  # plus "<platform>_environment"
+   183	
+   184	
+   185	def parse_policy(data: dict[str, Any]) -> Policy:
+   186	    data = dict(data)
+   187	    legacy = {k: data.pop(k) for k in list(data) if k in LEGACY_BACKEND_KEYS or k.endswith("_environment")}
+   188	    limits = _fill(Limits, dict(data.pop("limits", {}) or {}), "[limits]")
+   189	    images = _fill(ImageRules, dict(data.pop("images", {}) or {}), "[images]")
+   190	    sandbox = _fill(SandboxDefaults, dict(data.pop("sandbox", {}) or {}), "[sandbox]")
+   191	    if sandbox.network not in NETWORK_CHOICES:
+   192	        raise PolicyError(f"[sandbox] network must be one of {', '.join(NETWORK_CHOICES)}")
+   193	    if sandbox.hostname and not re.fullmatch(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?", sandbox.hostname):
+   194	        raise PolicyError(f"[sandbox] hostname is not a valid host name: {sandbox.hostname!r}")
+   195	    for key in ("socket_mode", "audit_log_mode"):
+   196	        if key in data:
+   197	            data[key] = _parse_mode(data[key])
+   198	    policy = _fill(Policy, data, "policy")
+   199	    policy.limits = limits
+   200	    policy.images = images
+   201	    policy.sandbox = sandbox
+   202	    policy.legacy_backend = legacy
+   203	    return policy
+   204	
+   205	
+   206	def load_policy(path: str | None = None, *, strict: bool = False) -> Policy:
+   207	    path = path or os.environ.get("SANDBOX_GATE_POLICY") or os.environ.get("SANDBOX_BROKER_POLICY") or DEFAULT_POLICY_PATH
+   208	    if not os.path.exists(path):
+   209	        raise PolicyError(f"policy file not found: {path}")
+   210	    if strict:
+   211	        check_root_owned(path)
+   212	    raw = Path(path).read_bytes()
+   213	    if path.endswith(".json"):
+   214	        data = json.loads(raw)
+   215	    else:
+   216	        try:
+   217	            import tomllib  # type: ignore[import-not-found]
+   218	        except ModuleNotFoundError:  # pragma: no cover - py<3.11
+   219	            try:
+   220	                import tomli as tomllib  # type: ignore[no-redef]
+   221	            except ModuleNotFoundError as exc:
+   222	                raise PolicyError("TOML policy needs Python 3.11+ or tomli; use a .json policy") from exc
+   223	        data = tomllib.loads(raw.decode())
+   224	    policy = parse_policy(data)
+   225	    policy.source_path = path
+   226	    policy.source_sha256 = hashlib.sha256(raw).hexdigest()
+   227	    base = os.path.dirname(os.path.abspath(path))
+   228	    rules = policy.images
+   229	    if rules.pins_file:
+   230	        pins_path = os.path.join(base, rules.pins_file)
+   231	        if strict:
+   232	            check_root_owned(pins_path)
+   233	        rules.pins.update(json.loads(Path(pins_path).read_text()))
+   234	    if rules.build_contexts_file:
+   235	        ctx_path = os.path.join(base, rules.build_contexts_file)
+   236	        if strict:
+   237	            check_root_owned(ctx_path)
+   238	        rules.build_contexts.extend(_read_text_list(ctx_path))
+   239	    rules.pins = {normalize_ref(k).name_tag: _check_digest(v) for k, v in rules.pins.items()}
+   240	    rules.build_contexts = sorted({c.lower() for c in rules.build_contexts})
+   241	    for c in rules.build_contexts:
+   242	        if not re.fullmatch(r"[0-9a-f]{64}", c):
+   243	            raise PolicyError(f"build context hash must be 64 hex chars: {c!r}")
+   244	    return policy
+   245	
+   246	
+   247	# ---------------------------------------------------------------------------
+   248	# Image references
+   249	
+   250	_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-/:@]{0,511}$")
+   251	_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+   252	
+   253	
+   254	def _check_digest(d: str) -> str:
+   255	    if not _DIGEST_RE.match(d):
+   256	        raise PolicyError(f"invalid image digest: {d!r}")
+   257	    return d
+   258	
+   259	
+   260	@dataclasses.dataclass(frozen=True)
+   261	class ImageRef:
+   262	    registry: str
+   263	    repository: str
+   264	    tag: str | None
+   265	    digest: str | None
+   266	
+   267	    @property
+   268	    def name(self) -> str:
+   269	        return f"{self.registry}/{self.repository}"
+   270	
+   271	    @property
+   272	    def name_tag(self) -> str:
+   273	        return f"{self.name}:{self.tag}" if self.tag else self.name
+   274	
+   275	    @property
+   276	    def match_key(self) -> str:
+   277	        return self.name_tag if self.tag else f"{self.name}@{self.digest}"
+   278	
+   279	    def pull_ref(self, digest: str | None = None) -> str:
+   280	        """Reference string handed to the image puller (short form for Docker Hub)."""
+   281	        name = self.name
+   282	        if self.registry == "docker.io":
+   283	            name = self.repository[len("library/"):] if self.repository.startswith("library/") else self.repository
+   284	        digest = digest or self.digest
+   285	        if digest:
+   286	            return f"{name}@{digest}"
+   287	        return f"{name}:{self.tag}"
+   288	
+   289	
+   290	def normalize_ref(ref: str) -> ImageRef:
+   291	    ref = ref.strip()
+   292	    if not _REF_RE.match(ref) or ".." in ref or "//" in ref:
+   293	        raise ValueError(f"malformed image reference: {ref!r}")
+   294	    digest = None
+   295	    if "@" in ref:
+   296	        ref, digest = ref.split("@", 1)
+   297	        _check_digest(digest)
+   298	    tag = None
+   299	    slash = ref.rfind("/")
+   300	    colon = ref.rfind(":")
+   301	    if colon > slash:
+   302	        ref, tag = ref[:colon], ref[colon + 1:]
+   303	        if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.\-]{0,127}", tag):
+   304	            raise ValueError(f"malformed image tag: {tag!r}")
+   305	    parts = ref.split("/")
+   306	    if len(parts) > 1 and ("." in parts[0] or ":" in parts[0] or parts[0] == "localhost"):
+   307	        registry, repo = parts[0], "/".join(parts[1:])
+   308	    else:
+   309	        registry, repo = "docker.io", ref
+   310	    if registry in ("index.docker.io", "registry-1.docker.io"):
+   311	        registry = "docker.io"
+   312	    if registry == "docker.io" and "/" not in repo:
+   313	        repo = f"library/{repo}"
+   314	    if repo != repo.lower():
+   315	        raise ValueError(f"repository names must be lowercase: {repo!r}")
+   316	    if tag is None and digest is None:
+   317	        tag = "latest"
+   318	    return ImageRef(registry, repo, tag, digest)
+   319	
+   320	
+   321	def normalize_pattern(pattern: str) -> str:
+   322	    pattern = pattern.strip()
+   323	    first = pattern.split("/", 1)[0]
+   324	    if "/" in pattern and ("." in first or ":" in first or first == "localhost"):
+   325	        return pattern
+   326	    if "/" not in pattern.split(":", 1)[0].split("@", 1)[0]:
+   327	        pattern = f"library/{pattern}"
+   328	    return f"docker.io/{pattern}"
+   329	
+   330	
+   331	@dataclasses.dataclass(frozen=True)
+   332	class ResolvedImage:
+   333	    kind: str  # "registry" | "context"
+   334	    display: str
+   335	    pull_ref: str | None = None
+   336	    context_sha256: str | None = None
+   337	
+   338	
+   339	def resolve_registry_image(rules: ImageRules, ref: str) -> ResolvedImage:
+   340	    """Map a requested image to the exact reference to pull, or raise PermissionError."""
+   341	    try:
+   342	        parsed = normalize_ref(ref)
+   343	    except ValueError as exc:
+   344	        raise PermissionError(str(exc)) from exc
+   345	    patterns = [normalize_pattern(p) for p in rules.allow]
+   346	    if not any(fnmatch.fnmatchcase(parsed.match_key, p) for p in patterns):
+   347	        raise PermissionError(f"image {ref!r} is not in the allowed image list")
+   348	    pin = rules.pins.get(parsed.name_tag) if parsed.tag else None
+   349	    if pin and parsed.digest and parsed.digest != pin:
+   350	        raise PermissionError(f"image {ref!r} does not match its pinned digest")
+   351	    digest = parsed.digest or pin
+   352	    if rules.require_pin and not digest:
+   353	        raise PermissionError(f"image {ref!r} has no pinned digest")
+   354	    return ResolvedImage("registry", parsed.match_key, pull_ref=parsed.pull_ref(digest))
+   355	
+   356	
+   357	# ---------------------------------------------------------------------------
+   358	# Build contexts
+   359	
+   360	
+   361	def hash_context_dir(root: str | os.PathLike) -> str:
+   362	    """Content hash of a Docker build context (paths, exec bits and file contents)."""
+   363	    root = os.fspath(root)
+   364	    h = hashlib.sha256(b"sandbox-broker-context-v1\n")
+   365	    entries = []
+   366	    for dirpath, dirnames, filenames in os.walk(root):
+   367	        dirnames.sort()
+   368	        for name in filenames + [d for d in dirnames if os.path.islink(os.path.join(dirpath, d))]:
+   369	            full = os.path.join(dirpath, name)
+   370	            rel = os.path.relpath(full, root).replace(os.sep, "/")
+   371	            entries.append((rel, full))
+   372	    for rel, full in sorted(entries):
+   373	        st = os.lstat(full)
+   374	        if stat.S_ISLNK(st.st_mode):
+   375	            h.update(f"L {rel} {os.readlink(full)}\n".encode())
+   376	        elif stat.S_ISREG(st.st_mode):
+   377	            fh = hashlib.sha256()
+   378	            with open(full, "rb") as f:
+   379	                for chunk in iter(lambda: f.read(1 << 20), b""):
+   380	                    fh.update(chunk)
+   381	            x = "x" if st.st_mode & 0o111 else "-"
+   382	            h.update(f"F {rel} {x} {fh.hexdigest()}\n".encode())
+   383	    return h.hexdigest()
+===== /usr/local/lib/python3.12/site-packages/sandbox_broker/protocol.py
+     1	"""Wire format between clients and the gate daemon (platform-neutral).
+     2	
+     3	One JSON object per line over a Unix stream socket. A request is a single line with an
+     4	``op`` field; the reply is a single line, preceded by ``{"event": ...}`` lines when the
+     5	client asked an ``exec`` to stream its output. Binary data travels base64-encoded.
+     6	
+     7	Requests (optional fields in brackets):
+     8	  ping
+     9	  create     image | build_context_b64, [cpu, memory_mb, timeout_s, idle_timeout_s,
+    10	             workdir, env, labels]                                     -> id, ...
+    11	  exec       id, argv, [timeout_s, workdir, env, stdin_b64, stream, binary]
+    12	                                                                       -> rc, stdout, stderr, timed_out
+    13	  put_file   id, path, data_b64, [mode]                               (alias: put)
+    14	  get_file   id, path                                                  -> data_b64 (alias: get)
+    15	  terminate  id
+    16	  poll       id                                                        -> running, rc
+    17	  list       [all]                                                     -> sandboxes
+    18	  usage                                                                -> budget and counters
+    19	  policy                                                               -> effective limits
+    20	  shutdown   [exit]                                                    (admin only)
+    21	
+    22	Successful replies carry ``"ok": true``. Errors are ``{"ok": false, "error": <message>,
+    23	"error_type": <kind>}``.
+    24	"""
+    25	from __future__ import annotations
+    26	
+    27	import json
+    28	from typing import Any
+    29	
+    30	PROTOCOL_VERSION = 1
+    31	
+    32	COMMON_FIELDS = {"op", "request_id"}
+    33	
+    34	REQUEST_FIELDS: dict[str, set[str]] = {
+    35	    "ping": set(),
+    36	    "create": {"image", "build_context_b64", "cpu", "memory_mb", "timeout_s", "idle_timeout_s",
+    37	               "workdir", "env", "labels"},
+    38	    "exec": {"id", "argv", "timeout_s", "workdir", "env", "stdin_b64", "stream", "binary"},
+    39	    "put_file": {"id", "path", "data_b64", "mode"},
+    40	    "get_file": {"id", "path"},
+    41	    "terminate": {"id"},
+    42	    "poll": {"id"},
+    43	    "list": {"all"},
+    44	    "usage": set(),
+    45	    "policy": set(),
+    46	    "shutdown": {"exit"},
+    47	}
+    48	
+    49	ALIASES = {"put": "put_file", "get": "get_file", "status": "usage"}
+    50	
+    51	ADMIN_OPS = {"shutdown"}
+    52	
+    53	
+    54	class BrokerError(Exception):
+    55	    """An error reported to the client. ``kind`` is a stable machine-readable category."""
+    56	
+    57	    kind = "error"
+    58	    detail = ""  # platform details; only admins see them (server.process)
+    59	
+    60	    def __init__(self, message: str, kind: str | None = None):
+    61	        super().__init__(message)
+    62	        if kind:
+    63	            self.kind = kind
+    64	
+    65	
+    66	class BadRequest(BrokerError):
+    67	    kind = "bad_request"
+    68	
+    69	
+    70	class PolicyDenied(BrokerError):
+    71	    kind = "denied"
+    72	
+    73	
+    74	class QuotaExceeded(BrokerError):
+    75	    kind = "quota"
+    76	
+    77	
+    78	class SandboxNotFound(BrokerError):
+    79	    kind = "not_found"
+    80	
+    81	
+    82	class BackendFailure(BrokerError):
+    83	    kind = "backend"
+    84	
+    85	
+    86	class BrokerUnavailable(BrokerError):
+    87	    kind = "unavailable"
+    88	
+    89	
+    90	ERROR_TYPES = {cls.kind: cls for cls in (BadRequest, PolicyDenied, QuotaExceeded, SandboxNotFound,
+    91	                                         BackendFailure, BrokerUnavailable)}
+    92	
+    93	
+    94	def error_from_reply(reply: dict[str, Any]) -> BrokerError:
+    95	    cls = ERROR_TYPES.get(reply.get("error_type", ""), BrokerError)
+    96	    return cls(str(reply.get("error", "unknown error")), reply.get("error_type"))
+    97	
+    98	
+    99	def encode(obj: dict[str, Any]) -> bytes:
+   100	    return (json.dumps(obj, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
+   101	
+   102	
+   103	def decode(line: bytes) -> dict[str, Any]:
+   104	    obj = json.loads(line)
+   105	    if not isinstance(obj, dict):
+   106	        raise BadRequest("request must be a JSON object")
+   107	    return obj
+   108	
+   109	
+   110	def validate_request(req: dict[str, Any]) -> str:
+   111	    op = req.get("op")
+   112	    if not isinstance(op, str):
+   113	        raise BadRequest("missing 'op'")
+   114	    op = ALIASES.get(op, op)
+   115	    if op not in REQUEST_FIELDS:
+   116	        raise BadRequest(f"unknown op {op!r}")
+   117	    unknown = set(req) - COMMON_FIELDS - REQUEST_FIELDS[op]
+   118	    if unknown:
+   119	        raise BadRequest(f"unsupported field(s) for {op}: {', '.join(sorted(unknown))}")
+   120	    return op

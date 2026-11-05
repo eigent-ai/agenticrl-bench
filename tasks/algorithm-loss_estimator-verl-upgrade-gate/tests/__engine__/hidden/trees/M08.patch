@@ -1,0 +1,20 @@
+diff -ruN '--exclude=__pycache__' base/verl/workers/engine/fsdp/transformer_impl.py M08/verl/workers/engine/fsdp/transformer_impl.py
+--- base/verl/workers/engine/fsdp/transformer_impl.py	2026-10-12 11:39:31.000000000 +0000
++++ M08/verl/workers/engine/fsdp/transformer_impl.py	2026-10-12 12:10:25.301066253 +0000
+@@ -758,9 +758,16 @@
+             # distinguishable "micro_batch<i>" row -- nested under the update loop's "mini_batch<i>"
+             # when training, or directly under the stage for log-prob.
+             with ctx, sync_ctx, torch.profiler.record_function(f"micro_batch{micro_batch_idx}"):
++                if not forward_only:
++                    micro_num_tokens = micro_batch["loss_mask"].sum().to(get_device_id())
++                    torch.distributed.all_reduce(
++                        micro_num_tokens, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
++                    )
++                    tu.assign_non_tensor(micro_batch, batch_num_tokens=micro_num_tokens.item())
+                 loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
+ 
+                 if not forward_only:
++                    loss = loss / len(micro_batches)
+                     if scaler is not None:
+                         scaler.scale(loss).backward()
+                     else:

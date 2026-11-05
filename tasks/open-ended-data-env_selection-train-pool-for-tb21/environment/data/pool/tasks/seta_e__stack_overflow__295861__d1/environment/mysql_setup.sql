@@ -1,0 +1,4 @@
+CREATE DATABASE IF NOT EXISTS taskboard_db;
+CREATE USER IF NOT EXISTS 'taskboard'@'127.0.0.1' IDENTIFIED BY 'tb_secret_123';
+GRANT ALL PRIVILEGES ON taskboard_db.* TO 'taskboard'@'127.0.0.1';
+FLUSH PRIVILEGES;

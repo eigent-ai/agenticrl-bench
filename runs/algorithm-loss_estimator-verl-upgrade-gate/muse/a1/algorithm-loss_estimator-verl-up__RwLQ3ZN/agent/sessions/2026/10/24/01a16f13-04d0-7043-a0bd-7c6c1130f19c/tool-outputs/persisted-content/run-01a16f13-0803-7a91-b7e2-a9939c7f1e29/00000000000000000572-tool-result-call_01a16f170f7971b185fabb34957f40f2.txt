@@ -1,0 +1,153 @@
+Read text file `/opt/verl/verl/experimental/agent_loop/agent_loop.py`.
+(959 line(s) above)
+960|        valid_mask = attention_mask[0].bool()
+961|        text_position_ids = torch.ones((1, len(input_ids[0])), dtype=torch.long)
+962|        text_position_ids[0, valid_mask] = torch.arange(valid_mask.sum().item())
+963|        text_position_ids = text_position_ids.unsqueeze(0)
+964|        position_ids = torch.cat((text_position_ids, vision_position_ids), dim=1)  # (1, 4, seq_length)
+965|        return position_ids
+966|
+967|    async def _compute_score(self, outputs: list[AgentLoopOutput], kwargs: dict) -> None:
+968|        """Compute reward score for all outputs in a trajectory; assigns result to outputs[-1]."""
+969|        enable_async_reward = self.reward_loop_worker_handles is not None
+970|
+971|        final_output = outputs[-1]
+972|        if final_output.reward_score is None and enable_async_reward:
+973|            timing = {}
+974|            with simple_timer("compute_score", timing):
+975|                all_prompts, all_responses, all_input_ids, all_attention_mask, all_position_ids = [], [], [], [], []
+976|                for output in outputs:
+977|                    prompts = torch.tensor(output.prompt_ids, dtype=torch.int64)
+978|                    responses = torch.tensor(output.response_ids, dtype=torch.int64)
+979|                    input_ids = torch.cat([prompts, responses], dim=0)
+980|                    attention_mask = torch.ones_like(input_ids, dtype=torch.int64)
+981|                    multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
+982|                    position_ids = self._compute_position_ids(
+983|                        input_ids.unsqueeze(0),
+984|                        attention_mask.unsqueeze(0),
+985|                        multi_modal_inputs,
+986|                        output.mm_processor_kwargs
+987|                        if output.mm_processor_kwargs is not None
+988|                        else self._get_mm_processor_kwargs(
+989|                            output.multi_modal_data.get("audios") if output.multi_modal_data else None
+990|                        ),
+991|                    ).squeeze(0)
+992|                    all_prompts.append(prompts)
+993|                    all_responses.append(responses)
+994|                    all_input_ids.append(input_ids)
+995|                    all_attention_mask.append(attention_mask)
+996|                    all_position_ids.append(position_ids)
+997|
+998|                n = len(outputs)
+999|                batch = TensorDict(
+1000|                    {
+1001|                        "prompts": torch.nn.utils.rnn.pad_sequence(all_prompts, batch_first=True, padding_value=0),
+1002|                        "responses": torch.nn.utils.rnn.pad_sequence(all_responses, batch_first=True, padding_value=0),
+1003|                        "attention_mask": torch.nn.utils.rnn.pad_sequence(
+1004|                            all_attention_mask, batch_first=True, padding_value=0
+1005|                        ),
+1006|                        "input_ids": torch.nn.utils.rnn.pad_sequence(all_input_ids, batch_first=True, padding_value=0),
+1007|                        "position_ids": torch.nn.utils.rnn.pad_sequence(
+1008|                            all_position_ids, batch_first=True, padding_value=0
+1009|                        ),
+1010|                    },
+1011|                    batch_size=n,
+1012|                )
+1013|                non_tensor_batch = {
+1014|                    **{k: np.array([v] * n) for k, v in kwargs.items()},
+1015|                    "__num_turns__": np.array([o.num_turns for o in outputs]),
+1016|                    "tool_extra_fields": np.array([o.extra_fields for o in outputs], dtype=object),
+1017|                    "prompt_len": np.array([len(o.prompt_ids) for o in outputs]),
+1018|                    "response_len": np.array([len(o.response_ids) for o in outputs]),
+1019|                }
+1020|
+1021|                data = DataProto(
+1022|                    batch=batch,
+1023|                    non_tensor_batch=non_tensor_batch,
+1024|                )
+1025|                selected_reward_loop_worker_handle = random.choice(self.reward_loop_worker_handles)
+1026|                result = await selected_reward_loop_worker_handle.compute_score.remote(data)
+1027|                final_output.reward_score = result["reward_score"]
+1028|                final_output.extra_fields["reward_extra_info"] = result["reward_extra_info"]
+1029|            final_output.metrics.compute_score = timing["compute_score"]
+1030|
+1031|    async def _compute_teacher_logprobs(
+1032|        self,
+1033|        output: AgentLoopOutput,
+1034|        prompt_ids: list[int],
+1035|        response_ids: list[int],
+1036|        validate: bool,
+1037|        sample_kwargs: Optional[dict[str, Any]] = None,
+1038|    ) -> None:
+1039|        """Compute teacher logprobs for single sample."""
+1040|        if self.distillation_enabled and not validate:
+1041|            routing_key = None
+1042|            if sample_kwargs is not None:
+1043|                routing_value = sample_kwargs.get(self.teacher_key)
+1044|                if routing_value is not None:
+1045|                    # Non-tensor batch values arrive as 0-d numpy objects / arrays; normalize to Python.
+1046|                    routing_key = routing_value.item() if hasattr(routing_value, "item") else routing_value
+1047|            teacher_ids, teacher_logprobs = await self.teacher_server_manager.compute_teacher_logprobs_single(
+1048|                sequence_ids=prompt_ids + response_ids,
+1049|                multi_modal_data=output.multi_modal_data,
+1050|                mm_processor_kwargs=output.mm_processor_kwargs,
+1051|                mm_processor_output=getattr(output, "mm_processor_output", None),
+1052|                routing_key=routing_key,
+1053|            )
+1054|            output.extra_fields["teacher_ids"] = teacher_ids
+1055|            output.extra_fields["teacher_logprobs"] = teacher_logprobs
+1056|
+1057|    def _postprocess(
+1058|        self,
+1059|        inputs: list[_InternalAgentLoopOutput],
+1060|        input_non_tensor_batch: dict | None = None,
+1061|        validate: bool = False,
+1062|    ) -> DataProto:
+1063|        """Process the padded outputs from _run_agent_loop and combine them into a batch."""
+1064|        # Convert lists back to tensors and stack them to create a batch.
+1065|        prompt_ids = torch.cat([input.prompt_ids for input in inputs], dim=0)
+1066|        response_ids = torch.cat([input.response_ids for input in inputs], dim=0)
+1067|        response_mask = torch.cat([input.response_mask for input in inputs], dim=0)
+1068|        attention_mask = torch.cat([input.attention_mask for input in inputs], dim=0)
+1069|        input_ids = torch.cat([input.input_ids for input in inputs], dim=0)
+1070|        position_ids = torch.cat([input.position_ids for input in inputs], dim=0)
+1071|        optional_outputs = {}
+1072|        if inputs[0].response_logprobs is not None:
+1073|            optional_outputs["rollout_log_probs"] = torch.cat([input.response_logprobs for input in inputs], dim=0)
+1074|        if inputs[0].routed_experts is not None:
+1075|            optional_outputs["routed_experts"] = torch.cat([input.routed_experts for input in inputs], dim=0)
+1076|        if inputs[0].teacher_logprobs is not None and inputs[0].teacher_ids is not None:
+1077|            optional_outputs["teacher_logprobs"] = torch.cat([input.teacher_logprobs for input in inputs], dim=0)
+1078|            optional_outputs["teacher_ids"] = torch.cat([input.teacher_ids for input in inputs], dim=0)
+1079|        batch = TensorDict(
+1080|            {
+1081|                "prompts": prompt_ids,  # [bsz, prompt_length]
+1082|                "responses": response_ids,  # [bsz, response_length]
+1083|                "response_mask": response_mask,  # [bsz, response_length]
+1084|                "input_ids": input_ids,  # [bsz, prompt_length + response_length]
+1085|                "attention_mask": attention_mask,  # [bsz, prompt_length + response_length]
+1086|                # position_ids: [bsz, 3, prompt_length + response_length] or [bsz, prompt_length + response_length]
+1087|                "position_ids": position_ids,
+1088|                **optional_outputs,
+1089|            },
+1090|            batch_size=len(inputs),
+1091|        )
+1092|
+1093|        scores = [input.reward_score for input in inputs]
+1094|        if all(score is not None for score in scores):
+1095|            prompt_length = prompt_ids.size(1)
+1096|            response_length = attention_mask[:, prompt_length:].sum(dim=1) - 1
+1097|            rm_scores = torch.zeros_like(response_mask, dtype=torch.float32)
+1098|            rm_scores[torch.arange(response_mask.size(0)), response_length] = torch.tensor(scores, dtype=torch.float32)
+1099|            batch["rm_scores"] = rm_scores
+1100|
+1101|        non_tensor_batch = {
+1102|            "__num_turns__": np.array([input.num_turns for input in inputs], dtype=np.int32),
+1103|        }
+1104|        if self.reward_loop_worker_handles is None and input_non_tensor_batch:
+1105|            non_tensor_batch.update(input_non_tensor_batch)
+1106|
+1107|        # add reward_extra_info to non_tensor_batch
+1108|        reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
+1109|        reward_extra_keys = list(reward_extra_infos[0].keys())
+(more lines below)

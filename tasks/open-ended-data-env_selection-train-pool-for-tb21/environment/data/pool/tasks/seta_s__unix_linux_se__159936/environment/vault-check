@@ -1,0 +1,20 @@
+#!/bin/bash
+CONF="/etc/vault/volumes.conf"
+FAILURES=0
+while IFS= read -r vol; do
+    [[ -z "$vol" ]] && continue
+    VERSION=$(cryptsetup luksDump "$vol" 2>/dev/null | awk '/^Version:/{print $2; exit}')
+    if [[ "$VERSION" == "1" ]]; then
+        echo "Checking $vol... OK (LUKS1)"
+    else
+        echo "Checking $vol... FAIL (LUKS${VERSION} - requires LUKS1)"
+        ((FAILURES++))
+    fi
+done < "$CONF"
+if [[ $FAILURES -eq 0 ]]; then
+    echo "Exit status: 0 all checks passed"
+    exit 0
+else
+    echo "Exit status: $FAILURES checks failed"
+    exit 1
+fi

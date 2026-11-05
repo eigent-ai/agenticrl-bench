@@ -1,0 +1,79 @@
+Read text file `/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/agents/terminus_2/tmux_session.py`.
+(799 line(s) above)
+800|        prepared_keys, is_blocking = self._prepare_keys(
+801|            keys=keys,
+802|            block=block,
+803|        )
+804|
+805|        self._logger.debug(
+806|            f"Sending keys: {prepared_keys}"
+807|            f" min_timeout_sec: {min_timeout_sec}"
+808|            f" max_timeout_sec: {max_timeout_sec}"
+809|        )
+810|
+811|        if is_blocking:
+812|            await self._send_blocking_keys(
+813|                keys=prepared_keys,
+814|                max_timeout_sec=max_timeout_sec,
+815|            )
+816|        else:
+817|            await self._send_non_blocking_keys(
+818|                keys=prepared_keys,
+819|                min_timeout_sec=min_timeout_sec,
+820|            )
+821|
+822|    async def capture_pane(self, capture_entire: bool = False) -> str:
+823|        result = await self.environment.exec(
+824|            self._tmux_capture_pane(capture_entire=capture_entire), user=self._user
+825|        )
+826|        return result.stdout or ""
+827|
+828|    async def _get_visible_screen(self) -> str:
+829|        return await self.capture_pane(capture_entire=False)
+830|
+831|    async def _find_new_content(self, current_buffer: str) -> str | None:
+832|        pb = "" if self._previous_buffer is None else self._previous_buffer.strip()
+833|        if pb in current_buffer:
+834|            idx = current_buffer.index(pb)
+835|            # Find the end of the previous buffer content
+836|            if "\n" in pb:
+837|                idx = pb.rfind("\n")
+838|            return current_buffer[idx:]
+839|        return None
+840|
+841|    async def get_incremental_output(self) -> str:
+842|        """
+843|        Get either new terminal output since last call, or current screen if
+844|        unable to determine.
+845|
+846|        This method tracks the previous buffer state and attempts to find new content
+847|        by comparing against the current full buffer. This provides better handling for
+848|        commands with large output that would overflow the visible screen.
+849|
+850|        Returns:
+851|            str: Formatted output with either "New Terminal Output:" or
+852|                 "Current Terminal Screen:"
+853|        """
+854|        current_buffer = await self.capture_pane(capture_entire=True)
+855|
+856|        # First capture - no previous state
+857|        if self._previous_buffer is None:
+858|            self._previous_buffer = current_buffer
+859|            visible_screen = await self._get_visible_screen()
+860|            return f"Current Terminal Screen:\n{visible_screen}"
+861|
+862|        # Try to find new content
+863|        new_content = await self._find_new_content(current_buffer)
+864|
+865|        # Update state
+866|        self._previous_buffer = current_buffer
+867|
+868|        if new_content is not None:
+869|            if new_content.strip():
+870|                return f"New Terminal Output:\n{new_content}"
+871|            else:
+872|                # No new content, show current screen
+873|                return f"Current Terminal Screen:\n{await self._get_visible_screen()}"
+874|        else:
+875|            # Couldn't reliably determine new content, fall back to current screen
+876|            return f"Current Terminal Screen:\n{await self._get_visible_screen()}"

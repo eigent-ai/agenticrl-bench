@@ -1,0 +1,2 @@
+- [Fidelity gate status](fidelity-gate-status.md) — /app/fidelity check built 2026-10-25; verdicts; e4m3 is the open judgment call
+- [Miles runs outside the screen service](miles-runs-outside-screen-service.md) — HOME, Ray ports, SGLANG_DG_CACHE_DIR, 2 h task limit

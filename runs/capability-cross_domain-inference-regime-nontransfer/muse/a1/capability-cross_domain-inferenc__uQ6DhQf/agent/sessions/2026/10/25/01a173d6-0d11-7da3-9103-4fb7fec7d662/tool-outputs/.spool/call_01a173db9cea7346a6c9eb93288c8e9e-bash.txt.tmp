@@ -1,0 +1,52 @@
+1085:    allow_auto_truncate: A[
+        max_new_tokens = obj.sampling_params.get("max_new_tokens")
+        if (
+            self.validate_total_tokens
+            and max_new_tokens is not None
+            and (max_new_tokens + input_token_num) > _max_req_len
+        ):
+            if self.server_args.allow_auto_truncate:
+                logger.warning(
+                    f"Requested token count ({input_token_num} input + {max_new_tokens} new) "
+                    f"exceeds the model's context length ({self.context_len} tokens). "
+                    "Truncating max_new_tokens."
+                )
+                obj.sampling_params["max_new_tokens"] = max(
+                    0, _max_req_len - input_token_num
+                )
+            else:
+                total_tokens = max_new_tokens + input_token_num
+                error_msg = (
+                    f"Requested token count exceeds the model's maximum context length "
+                    f"of {self.context_len} tokens. You requested a total of {total_tokens} "
+                    f"tokens: {input_token_num} tokens from the input messages and "
+                    f"{max_new_tokens} tokens for the completion. Please reduce the number "
+                    f"of tokens in the input messages or the completion to fit within the limit."
+                )
+                raise ValueError(error_msg)
+
+        # Validate embedding requests
+        if isinstance(obj, EmbeddingReqInput) and self.is_generation:
+            raise ValueError(
+                "This model does not appear to be an embedding model by default. "
+                "Please add `--is-embedding` when launching the server or try another model."
+            )
+
+        # Validate Matryoshka embeddings
+        if isinstance(obj, EmbeddingReqInput):
+            self._validate_for_matryoshka_dim(obj)
+
+        # Validate generation-specific fields
+        if isinstance(obj, GenerateReqInput):
+            self._validate_token_ids_logprob(obj)
+            if (
+                obj.return_hidden_states
+                and not self.server_args.enable_return_hidden_states
+            ):
+                raise ValueError(
+                    "The server is not configured to return the hidden states. "
+                    "Please set `--enable-return-hidden-states` to enable this feature."
+                )
+            if (
+                obj.custom_logit_processor
+                and not self.server_args.enable_custom_logit_processor

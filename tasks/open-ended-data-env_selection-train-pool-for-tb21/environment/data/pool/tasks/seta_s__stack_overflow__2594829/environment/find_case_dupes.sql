@@ -1,0 +1,2 @@
+-- Find case-insensitive (name, email) duplicate groups
+-- These are rows where LOWER(name) and LOWER(email) match but the original values differ in case

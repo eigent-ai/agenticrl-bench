@@ -1,0 +1,216 @@
+Read text file `/opt/verl/verl/trainer/ppo/padding_utils.py`.
+1|# Copyright 2025 Bytedance Ltd. and/or its affiliates
+2|#
+3|# Licensed under the Apache License, Version 2.0 (the "License");
+4|# you may not use this file except in compliance with the License.
+5|# You may obtain a copy of the License at
+6|#
+7|#     http://www.apache.org/licenses/LICENSE-2.0
+8|#
+9|# Unless required by applicable law or agreed to in writing, software
+10|# distributed under the License is distributed on an "AS IS" BASIS,
+11|# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+12|# See the License for the specific language governing permissions and
+13|# limitations under the License.
+14|"""Batch padding utilities for multi-trajectory training with TransferQueue.
+15|
+16|When the number of trajectories per prompt varies, the global batch size may
+17|not be divisible by ``dp_size`` or ``mini_batch_size``.  The helpers here
+18|append minimal synthetic samples so that downstream training steps can
+19|partition the batch evenly.
+20|"""
+21|
+22|from __future__ import annotations
+23|
+24|import copy
+25|import logging
+26|import uuid
+27|from typing import Any
+28|
+29|import torch
+30|
+31|try:
+32|    import transfer_queue as tq
+33|    from transfer_queue import KVBatchMeta
+34|except ImportError:
+35|    from verl.utils.transferqueue_utils import KVBatchMeta, tq
+36|
+37|from verl.utils.model import compute_position_id_with_mask
+38|from verl.utils.tensordict_utils import list_of_dict_to_tensordict
+39|
+40|logger = logging.getLogger(__name__)
+41|
+42|SYNTHETIC_PADDING_SEQ_LEN = 128
+43|
+44|
+45|def build_padding_position_ids(source_position_ids: Any, attention_mask: torch.Tensor) -> torch.Tensor:
+46|    """Build padding position ids with the same rank/prefix shape as the source sample."""
+47|    position_ids = compute_position_id_with_mask(attention_mask.unsqueeze(0)).squeeze(0)
+48|    if not isinstance(source_position_ids, torch.Tensor):
+49|        return position_ids
+50|
+51|    position_ids = position_ids.to(device=source_position_ids.device, dtype=source_position_ids.dtype)
+52|    if source_position_ids.dim() <= 1:
+53|        return position_ids
+54|
+55|    view_shape = (1,) * (source_position_ids.dim() - 1) + (position_ids.size(-1),)
+56|    return position_ids.reshape(view_shape).expand(*source_position_ids.shape[:-1], -1).clone()
+57|
+58|
+59|def build_padding_routed_experts(source_routed_experts: Any, seq_len: int) -> torch.Tensor | None:
+60|    """Build a zero routed-experts tensor matching the source per-token expert shape."""
+61|    if not isinstance(source_routed_experts, torch.Tensor):
+62|        return None
+63|    if source_routed_experts.dim() == 0:
+64|        return torch.zeros_like(source_routed_experts)
+65|    return torch.zeros(
+66|        (seq_len, *source_routed_experts.shape[1:]),
+67|        dtype=source_routed_experts.dtype,
+68|        device=source_routed_experts.device,
+69|    )
+70|
+71|
+72|def construct_minimal_padding_template(
+73|    source_td: dict,
+74|    source_tag: dict,
+75|    eos_token_id: int,
+76|) -> tuple[dict, dict]:
+77|    """Construct a text-only padding template.
+78|
+79|    Args:
+80|        source_td: A single sample dict retrieved from TransferQueue.
+81|        source_tag: The corresponding tag dict for that sample.
+82|        eos_token_id: The EOS token id from the tokenizer.
+83|
+84|    Returns:
+85|        A tuple of (template_sample, template_tag) ready for padding.
+86|    """
+87|    # Copy the sample template from an existing sample.
+88|    template_sample = {}
+89|    for key in source_td.keys():
+90|        value = source_td[key]
+91|        template_sample[key] = value.clone() if isinstance(value, torch.Tensor) else copy.deepcopy(value)
+92|
+93|    # Deep copy the template tag from an existing sample.
+94|    template_tag = copy.deepcopy(source_tag)
+95|
+96|    # Build minimal sequence
+97|    responses = torch.full((1,), eos_token_id, dtype=torch.int64)
+98|    prompts = torch.full((SYNTHETIC_PADDING_SEQ_LEN - 1,), eos_token_id, dtype=torch.int64)
+99|    input_ids = torch.cat((prompts, responses))
+100|    attention_mask = torch.ones_like(input_ids, dtype=torch.int64)
+101|    response_mask = torch.zeros_like(responses)
+102|    position_ids = build_padding_position_ids(template_sample.get("position_ids"), attention_mask)
+103|    routed_experts = build_padding_routed_experts(template_sample.get("routed_experts"), input_ids.size(0))
+104|
+105|    sequence_length = input_ids.size(0)
+106|    teacher_ids = template_sample.get("teacher_ids")
+107|    if teacher_ids is not None:
+108|        template_sample["teacher_ids"] = teacher_ids.new_full((sequence_length, *teacher_ids.shape[1:]), eos_token_id)
+109|
+110|    teacher_logprobs = template_sample.get("teacher_logprobs")
+111|    if teacher_logprobs is not None:
+112|        template_sample["teacher_logprobs"] = teacher_logprobs.new_zeros((sequence_length, *teacher_logprobs.shape[1:]))
+113|
+114|    # Update the fields and remove redundant parts
+115|    template_sample.update(
+116|        prompts=prompts,
+117|        responses=responses,
+118|        input_ids=input_ids,
+119|        attention_mask=attention_mask,
+120|        position_ids=position_ids,
+121|        num_turns=0,
+122|        response_mask=response_mask,
+123|        loss_mask=response_mask,
+124|        rm_scores=torch.zeros_like(response_mask, dtype=torch.float32),
+125|        rollout_log_probs=torch.zeros_like(response_mask, dtype=torch.float32),
+126|    )
+127|    if "multi_modal_inputs" in template_sample:
+128|        template_sample["multi_modal_inputs"] = {}
+129|    if routed_experts is not None:
+130|        template_sample["routed_experts"] = routed_experts
+131|    else:
+132|        template_sample.pop("routed_experts", None)
+133|
+134|    # Padding flag is deployed to protect metrics calculation (e.g. response length, score, reward).
+135|    template_tag.update(
+136|        is_padding=True,
+137|        prompt_len=SYNTHETIC_PADDING_SEQ_LEN - 1,
+138|        response_len=1,
+139|        seq_len=SYNTHETIC_PADDING_SEQ_LEN,
+140|    )
+141|    return template_sample, template_tag
+142|
+143|
+144|def upsample_batch_to_divisible_size(
+145|    batch: KVBatchMeta,
+146|    batch_multiple: int,
+147|    eos_token_id: int,
+148|) -> KVBatchMeta:
+149|    """Append synthetic no-op samples so the batch size becomes divisible by *batch_multiple*.
+150|
+151|    The synthetic samples reuse the first real sample as a metadata template,
+152|    but manually construct an aligned ``prompt_len=SYNTHETIC_PADDING_SEQ_LEN - 1 / response_len=1``
+153|    sequence and zero out reward-related fields so they do not contribute to PPO,
+154|    entropy, or KL losses.  An ``is_padding`` flag is added in the tag for
+155|    downstream metrics filtering.
+156|
+157|    Args:
+158|        batch: The current KVBatchMeta from TransferQueue.
+159|        batch_multiple: The required divisor (e.g. lcm of dp_size and mini-batch sizes).
+160|        eos_token_id: The EOS token id from the tokenizer.
+161|
+162|    Returns:
+163|        The (possibly enlarged) KVBatchMeta.
+164|    """
+165|    remainder = len(batch) % batch_multiple
+166|    if remainder == 0:
+167|        return batch
+168|
+169|    # Take the first trajectory as the metadata template for padding data.
+170|    source_idx = 0
+171|    source_key = batch.keys[source_idx]
+172|    source_td = tq.kv_batch_get(keys=[source_key], partition_id=batch.partition_id)[0]
+173|
+174|    # Construct the aligned padding template
+175|    template_sample, template_tag = construct_minimal_padding_template(source_td, batch.tags[source_idx], eos_token_id)
+176|
+177|    # All padding data use the same uid (also the same trajectory_id 0 but with ascending session_ids)
+178|    # This uid is not identical to any of the actual data, so it won't affect the grpo advantage value.
+179|    pad_uid = f"pad{uuid.uuid4().hex}"
+180|    template_sample["uid"] = pad_uid
+181|
+182|    # Construct the padding samples in a for-loop
+183|    pad_keys = []
+184|    pad_tags = []
+185|    pad_fields = []
+186|    pad_size = batch_multiple - remainder
+187|    for local_idx in range(pad_size):
+188|        sample = copy.deepcopy(template_sample)
+189|        # Use incremental local_idx as different session_ids
+190|        pad_keys.append(f"{pad_uid}_{local_idx}_0")
+191|        if "session_id" in sample:
+192|            sample["session_id"] = local_idx
+193|        pad_fields.append(sample)
+194|        pad_tags.append(copy.deepcopy(template_tag))
+195|
+196|    tq.kv_batch_put(
+197|        keys=pad_keys,
+198|        partition_id=batch.partition_id,
+199|        fields=list_of_dict_to_tensordict(pad_fields),
+200|        tags=pad_tags,
+201|    )
+202|    logger.info(
+203|        "Upsampled batch from %d to %d with %d synthetic padding samples for required_multiple=%d",
+204|        len(batch),
+205|        len(batch) + pad_size,
+206|        pad_size,
+207|        batch_multiple,
+208|    )
+209|    return KVBatchMeta(
+210|        keys=batch.keys + pad_keys,
+211|        tags=batch.tags + pad_tags,
+212|        partition_id=batch.partition_id,
+213|        fields=batch.fields,
+214|        extra_info=batch.extra_info,
+215|    )

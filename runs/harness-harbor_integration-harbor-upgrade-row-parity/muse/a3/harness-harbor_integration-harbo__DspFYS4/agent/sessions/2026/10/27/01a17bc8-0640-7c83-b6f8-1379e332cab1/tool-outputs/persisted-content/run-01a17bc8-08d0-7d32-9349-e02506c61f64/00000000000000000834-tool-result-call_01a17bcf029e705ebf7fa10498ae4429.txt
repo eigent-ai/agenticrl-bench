@@ -1,0 +1,163 @@
+Read text file `/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/agents/terminus_2/terminus_2.py`.
+(1659 line(s) above)
+1660|                    # First completion attempt - ask for confirmation and continue
+1661|                    prompt = observation
+1662|                    continue
+1663|
+1664|            prompt = observation
+1665|
+1666|    def _reset_per_run_state(self) -> None:
+1667|        """Reset all per-run state. The same Terminus2 instance is reused
+1668|        across multiple `run()` invocations in multi-step trials, so any
+1669|        accumulator that should be scoped to a single step must be reset here.
+1670|        """
+1671|        self._trajectory_steps = []
+1672|        self._api_request_times = []
+1673|        self._n_episodes = 0
+1674|        self._summarization_count = 0
+1675|        self._subagent_metrics = SubagentMetrics()
+1676|        self._subagent_rollout_details = []
+1677|        self._pending_completion = False
+1678|        self._pending_subagent_refs = None
+1679|        self._pending_handoff_prompt = None
+1680|        self._session_id = (
+1681|            self.options.session_id or self.session_id or str(uuid.uuid4())
+1682|        )
+1683|        session_id_headers = {
+1684|            name: self._session_id for name in self._session_id_headers or []
+1685|        }
+1686|        if session_id_headers:
+1687|            extra_headers = self._llm_call_kwargs.setdefault("extra_headers", {})
+1688|            if not isinstance(extra_headers, dict):
+1689|                raise ValueError("llm_call_kwargs.extra_headers must be a mapping")
+1690|            extra_headers.update(session_id_headers)
+1691|
+1692|    @override
+1693|    async def run(
+1694|        self,
+1695|        instruction: str,
+1696|        environment: BaseEnvironment,
+1697|        context: AgentContext,
+1698|    ) -> None:
+1699|        self._reset_per_run_state()
+1700|        self._chat = Chat(
+1701|            self._llm, interleaved_thinking=self.options.interleaved_thinking
+1702|        )
+1703|        self._context = context
+1704|
+1705|        if self._session is None:
+1706|            raise RuntimeError("Session is not set")
+1707|
+1708|        # Get the terminal state for the initial prompt
+1709|        terminal_state = self._limit_output_length(
+1710|            await self._session.get_incremental_output()
+1711|        )
+1712|
+1713|        augmented_instruction = instruction
+1714|        if self.mcp_servers:
+1715|            mcp_info = "\n\nMCP Servers:\nThe following MCP servers are available for this task.\n"
+1716|            for s in self.mcp_servers:
+1717|                if s.transport == "stdio":
+1718|                    args_str = " ".join(s.args)
+1719|                    mcp_info += f"- {s.name}: stdio transport, command: {s.command} {args_str}\n"
+1720|                else:
+1721|                    mcp_info += f"- {s.name}: {s.transport} transport, url: {s.url}\n"
+1722|            augmented_instruction = instruction + mcp_info
+1723|
+1724|        skills_section = await self._build_skills_section(environment)
+1725|        if skills_section:
+1726|            augmented_instruction += skills_section
+1727|
+1728|        initial_prompt = self._prompt_template.format(
+1729|            instruction=augmented_instruction,
+1730|            terminal_state=terminal_state,
+1731|        )
+1732|
+1733|        self._trajectory_steps.append(
+1734|            Step(
+1735|                step_id=1,
+1736|                timestamp=datetime.now(timezone.utc).isoformat(),
+1737|                source="user",
+1738|                message=initial_prompt,
+1739|            )
+1740|        )
+1741|
+1742|        try:
+1743|            await self._run_agent_loop(
+1744|                initial_prompt=initial_prompt,
+1745|                chat=self._chat,
+1746|                original_instruction=instruction,
+1747|            )
+1748|        finally:
+1749|            # Always capture metrics and rollout details even if the agent times out or errors
+1750|            # Combine main chat rollout details with subagent rollout details
+1751|            context.rollout_details = (
+1752|                self._chat.rollout_details + self._subagent_rollout_details
+1753|            )
+1754|
+1755|            # Include subagent metrics in context totals
+1756|            context.n_input_tokens = (
+1757|                self._chat.total_input_tokens
+1758|                + self._subagent_metrics.total_prompt_tokens
+1759|            )
+1760|            context.n_output_tokens = (
+1761|                self._chat.total_output_tokens
+1762|                + self._subagent_metrics.total_completion_tokens
+1763|            )
+1764|            context.n_cache_tokens = (
+1765|                self._chat.total_cache_tokens
+1766|                + self._subagent_metrics.total_cached_tokens
+1767|            )
+1768|            total_cost = self._chat.total_cost + self._subagent_metrics.total_cost_usd
+1769|            context.cost_usd = total_cost if total_cost > 0 else None
+1770|            context.metadata = {
+1771|                "n_episodes": self._n_episodes,
+1772|                "api_request_times_msec": self._api_request_times,
+1773|                "summarization_count": self._summarization_count,
+1774|            }
+1775|            if self.options.store_all_messages:
+1776|                context.metadata["all_messages"] = self._chat.messages
+1777|
+1778|            # Dump trajectory to JSON
+1779|            self._dump_trajectory()
+1780|
+1781|    # ===== Trajectory-related helper functions =====
+1782|
+1783|    @staticmethod
+1784|    def _remove_metrics_from_copied_steps(steps: list[Step]) -> None:
+1785|        """Remove metrics from copied trajectory steps and mark as copied context.
+1786|
+1787|        Args:
+1788|            steps: List of trajectory steps to modify in-place
+1789|        """
+1790|        for step in steps:
+1791|            # Mark all copied steps with is_copied_context=True
+1792|            step.is_copied_context = True
+1793|
+1794|            # Remove metrics to avoid duplication
+1795|            if step.metrics:
+1796|                step.metrics = None
+1797|                if step.extra is None:
+1798|                    step.extra = {}
+1799|                step.extra["note"] = (
+1800|                    "Metrics omitted to avoid duplication - already recorded in parent trajectory"
+1801|                )
+1802|
+1803|    def _prepare_copied_trajectory_steps(
+1804|        self, steps_to_include: int
+1805|    ) -> tuple[list[Step], int]:
+1806|        """Prepare trajectory steps for subagent by copying and removing metrics.
+1807|
+1808|        Args:
+1809|            steps_to_include: Number of steps to include from main trajectory
+1810|
+1811|        Returns:
+1812|            Tuple of (copied_steps, next_step_id)
+1813|        """
+1814|        copied_steps = copy.deepcopy(self._trajectory_steps[:steps_to_include])
+1815|        self._remove_metrics_from_copied_steps(copied_steps)
+1816|        next_step_id = len(copied_steps) + 1
+1817|        return copied_steps, next_step_id
+1818|
+1819|    def _append_subagent_response_step(
+(more lines below)

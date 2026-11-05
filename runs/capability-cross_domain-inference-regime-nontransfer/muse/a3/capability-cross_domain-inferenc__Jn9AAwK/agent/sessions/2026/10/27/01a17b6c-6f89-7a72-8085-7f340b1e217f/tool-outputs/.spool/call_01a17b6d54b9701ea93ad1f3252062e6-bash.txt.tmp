@@ -1,0 +1,318 @@
+35:    OutputLengthExceededError,
+75:    """Metrics for subagent operations (summarization, etc.)."""
+116:    enable_summarize: bool = Field(
+118:        description="Enable context summarization.",
+120:    proactive_summarization_threshold: int = Field(
+122:        description="Free-token threshold for proactive summarization. 0 disables it.",
+277:        enable_summarize: bool = True,
+278:        proactive_summarization_threshold: int = 8000,
+308:                NOTE: Rollout details will be incomplete if context summarization occurs.
+313:            enable_summarize: Whether to enable context summarization (default: True)
+314:            proactive_summarization_threshold: Number of free tokens below which to trigger
+315:                proactive summarization. Set to 0 to disable proactive summarization. (default: 8000)
+321:                - max_output_tokens: Maximum output tokens
+330:                  summarization occurs, ensuring each trajectory represents a continuous linear
+367:            enable_summarize=enable_summarize,
+368:            proactive_summarization_threshold=proactive_summarization_threshold,
+456:        self._summarization_count: int = (
+457:            0  # Track number of summarization subagents created
+479:                "`max_input_tokens`, `max_output_tokens`, and cost fields. "
+693:    def _unwind_messages_to_free_tokens(
+694:        self, chat: Chat, target_free_tokens: int = 4000
+696:        """Remove recent messages until we have enough free tokens."""
+697:        context_limit = self._llm.get_model_context_limit()
+701:            free_tokens = context_limit - current_tokens
+703:            if free_tokens >= target_free_tokens:
+713:        free_tokens = context_limit - self._count_total_tokens(chat)
+716:            f"Free tokens: approximately {free_tokens}"
+794:        summary_text: str,
+813:            agent_name: Name of the subagent (e.g., "terminus-2-summarization-summary")
+814:            filename_suffix: Suffix for trajectory filename (e.g., "summary", "questions", "answers")
+815:            summary_text: Human-readable summary for the trajectory ref
+860:            summary_text=summary_text,
+865:    async def _summarize(
+868:        """Create a summary of the agent's work to pass to a new agent instance.
+870:        This method implements a three-step context summarization process using separate
+874:        - Message history: Unwound chat.messages (limited context after token freeing)
+875:        - Prompt: Generate comprehensive summary of all work completed so far
+876:        - Response: summary_response.content (detailed narrative of progress)
+880:        - Prompt: Given the original task, summary from Step 1, and current terminal screen,
+881:        generate questions about information missing from the summary.
+885:        - Message history: chat.messages + [summary_prompt, summary_response] (extended context)
+890:        - Chat history replaced with: [system, question_prompt (which includes summary from step 1), model_questions]
+894:        **Why three steps?** This question-answer approach ensures the summarization doesn't
+906:                - subagent_trajectory_refs: List of 3 SubagentTrajectoryRef objects, or None if summarization failed
+911:        # Increment summarization count
+912:        self._summarization_count += 1
+916:        summary_session_id = (
+917:            f"{self._session_id}-summarization-{self._summarization_count}-summary"
+921:        # history, minus the messages that were removed to free up tokens.
+927:        summary_steps, step_id_counter = self._prepare_copied_trajectory_steps(
+931:        summary_prompt = f"""You are about to hand off your work to another AI agent.
+932:            Please provide a comprehensive summary of what you have
+937:Based on the conversation history, please provide a detailed summary covering:
+940:2. **Important Information Learned** - A summary of crucial findings, file
+950:        summary_response, summary_trajectory_ref = await self._run_subagent(
+951:            prompt=summary_prompt,
+953:            steps=summary_steps,
+954:            session_id=summary_session_id,
+955:            agent_name="terminus-2-summarization-summary",
+956:            filename_suffix="summary",
+957:            summary_text=f"Context summarization {self._summarization_count}: Step 1 - Summary generation",
+958:            subagent_name_for_logging="summary generation LLM call",
+960:        subagent_trajectory_refs.append(summary_trajectory_ref)
+965:            f"{self._session_id}-summarization-{self._summarization_count}-questions"
+974:{summary_response.content}
+980:about the current state of the solution that are not answered in the summary
+989:            agent_name="terminus-2-summarization-questions",
+991:            summary_text=f"Context summarization {self._summarization_count}: Step 2 - Question asking",
+999:            f"{self._session_id}-summarization-{self._summarization_count}-answers"
+1002:        # Reuse the actual trajectory steps (same as summary subagent)
+1003:        # At this point, chat.messages has the same unwound history as in summary subagent
+1008:        # Add the summary prompt and response steps that are part of the message history
+1009:        # Mark these as copied context since they were already part of the summary subagent trajectory
+1015:                message=summary_prompt,
+1026:                model_name=summary_response.model_name or self._model_name,
+1027:                message=summary_response.content,
+1028:                reasoning_content=summary_response.reasoning_content,
+1031:                    "note": "Copied from summary subagent - metrics already recorded there"
+1042:        # The answer subagent should see: unwound chat history + summary prompt + summary response
+1044:            {"role": "user", "content": summary_prompt},
+1045:            {"role": "assistant", "content": summary_response.content},
+1053:            agent_name="terminus-2-summarization-answers",
+1055:            summary_text=f"Context summarization {self._summarization_count}: Step 3 - Answer providing",
+1081:    async def _check_proactive_summarization(
+1084:        """Check if we should proactively summarize due to token usage.
+1087:            tuple: (summary_prompt, subagent_trajectory_ref) if summarization occurred, None otherwise
+1089:        context_limit = self._llm.get_model_context_limit()
+1091:        free_tokens = context_limit - current_tokens
+1093:        if free_tokens < self.options.proactive_summarization_threshold:
+1095:                f"Proactively summarizing. Free tokens: approximately {free_tokens}"
+1098:                summary_prompt, subagent_trajectory_refs = await self._summarize(
+1101:                return (summary_prompt, subagent_trajectory_refs)
+1103:                self.logger.error(f"Error in proactively summarizing: {e}")
+1109:        # Do not retry since it is only raised when summarization is OFF, and we will
+1139:            # First, we check whether we want to summarize or not
+1140:            if not self.options.enable_summarize:
+1141:                self.logger.debug("Context length exceeded and summarization is OFF.")
+1144:            self.logger.debug("Context length exceeded. Using fallback summarization.")
+1149:            self._unwind_messages_to_free_tokens(chat, target_free_tokens=4000)
+1151:            summary_prompt = None
+1152:            # Fallback 1: Try full summary
+1154:                self.logger.debug("SUMMARIZATION: Attempting full summary")
+1155:                summary_prompt, subagent_trajectory_refs = await self._summarize(
+1161:                self._pending_handoff_prompt = summary_prompt
+1162:                self.logger.debug("SUMMARIZATION: Full summary succeeded")
+1164:                self.logger.debug(f"SUMMARIZATION: Full summary failed: {e}")
+1166:            # Fallback 2: Try short summary
+1167:            if summary_prompt is None:
+1169:                    self.logger.debug("SUMMARIZATION: Attempting short summary")
+1179:                    summary_prompt = f"{original_instruction}\n\nSummary: {short_llm_response.content}"
+1180:                    self.logger.debug("SUMMARIZATION: Short summary succeeded")
+1182:                    self.logger.error(f"SUMMARIZATION: Short summary failed: {e}")
+1185:            if summary_prompt is None:
+1189:                summary_prompt = (
+1196:                    summary_prompt,
+1211:        except OutputLengthExceededError as e:
+1250:            output_limit = self._llm.get_model_output_limit()
+1384:            if original_instruction and self.options.enable_summarize:
+1385:                proactive_summary_result = await self._check_proactive_summarization(
+1390:                if proactive_summary_result:
+92:_HOSTED_VLLM_PREFIX = "hosted_vllm/"
+101:def validate_hosted_vllm_model_config(
+105:    Validate hosted_vllm model configuration.
+108:        full_model_name: The user-provided model name (e.g., hosted_vllm/llama)
+120:            "hosted_vllm models must start with 'hosted_vllm/'. "
+126:            "hosted_vllm model names must contain exactly one '/'. "
+133:            "hosted_vllm canonical model names may only contain letters, numbers, "
+140:            "hosted_vllm models require `model_info` specifying token limits and costs. "
+150:            raise ValueError(f"hosted_vllm model_info missing '{field}'.")
+155:                f"hosted_vllm model_info field '{field}' must be a number. "
+import copy
+import re
+from typing import Any
+
+from litellm import Message
+
+
+# Anthropic (and Bedrock) reject a request that carries more than this many
+# ``cache_control`` breakpoints with:
+#   "A maximum of 4 blocks with cache_control may be provided. Found N."
+_MAX_ANTHROPIC_CACHE_BLOCKS = 4
+
+
+def add_anthropic_caching(
+    messages: list[dict[str, Any] | Message], model_name: str
+) -> list[dict[str, Any] | Message]:
+    """
+    Add ephemeral caching to the most recent messages for Anthropic models.
+
+    Anthropic allows at most ``_MAX_ANTHROPIC_CACHE_BLOCKS`` (4)
+    ``cache_control`` breakpoints per request. Multimodal messages (e.g.
+    computer-use ``[text, image]`` observations) carry multiple content
+    items each, so naively tagging every item in the most recent few
+    messages can exceed the limit and 400 the whole request. To stay under
+    the cap we tag content blocks newest-first and stop once 4 blocks have
+    been placed.
+
+    Args:
+        messages: List of message dictionaries
+        model_name: The model name to check if it's an Anthropic model
+
+    Returns:
+        List of messages with caching added to the most recent content
+        blocks, never exceeding 4 ``cache_control`` breakpoints total.
+    """
+    # Only apply caching for Anthropic models
+    if not ("anthropic" in model_name.lower() or "claude" in model_name.lower()):
+        return messages
+
+    # Create a deep copy to avoid modifying the original messages
+    cached_messages = copy.deepcopy(messages)
+
+    # Walk messages newest-first and tag content blocks until the budget is
+    # exhausted, so the total number of cache_control markers never exceeds
+    # Anthropic's limit regardless of how many content items each message has.
+    remaining = _MAX_ANTHROPIC_CACHE_BLOCKS
+
+    for msg in reversed(cached_messages):
+        if remaining <= 0:
+            break
+
+        # Handle both dict and Message-like objects
+        if isinstance(msg, dict):
+            if isinstance(msg.get("content"), str):
+                msg["content"] = [
+                    {
+                        "type": "text",
+                        "text": msg["content"],
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ]
+                remaining -= 1
+            elif isinstance(msg.get("content"), list):
+                # Tag content items newest-first, stopping at the budget.
+                for content_item in reversed(msg["content"]):
+                    if remaining <= 0:
+                        break
+                    if isinstance(content_item, dict) and "type" in content_item:
+                        content_item["cache_control"] = {"type": "ephemeral"}
+                        remaining -= 1
+        elif hasattr(msg, "content"):
+            if isinstance(msg.content, str):
+                msg.content = [  # type: ignore
+                    {
+                        "type": "text",
+                        "text": msg.content,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ]
+                remaining -= 1
+            elif isinstance(msg.content, list):
+                for content_item in reversed(msg.content):
+                    if remaining <= 0:
+                        break
+                    if isinstance(content_item, dict) and "type" in content_item:
+                        content_item["cache_control"] = {"type": "ephemeral"}
+                        remaining -= 1
+
+    return cached_messages
+
+
+_HOSTED_VLLM_PREFIX = "hosted_vllm/"
+_HOSTED_VLLM_MODEL_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_HOSTED_VLLM_REQUIRED_INT_FIELDS = ("max_input_tokens", "max_output_tokens")
+_HOSTED_VLLM_REQUIRED_FLOAT_FIELDS = (
+    "input_cost_per_token",
+    "output_cost_per_token",
+)
+
+
+def validate_hosted_vllm_model_config(
+    full_model_name: str, model_info: dict[str, Any] | None
+) -> tuple[str, dict[str, Any]]:
+    """
+    Validate hosted_vllm model configuration.
+
+    Args:
+        full_model_name: The user-provided model name (e.g., hosted_vllm/llama)
+        model_info: Optional metadata dictionary that must include token limits + cost info
+
+    Returns:
+        (canonical_model_name, normalized_model_info)
+
+    Raises:
+        ValueError: If validation fails
+    """
+
+    if not full_model_name.startswith(_HOSTED_VLLM_PREFIX):
+        raise ValueError(
+            "hosted_vllm models must start with 'hosted_vllm/'. "
+            f"Got '{full_model_name}'."
+        )
+
+    if full_model_name.count("/") != 1:
+        raise ValueError(
+            "hosted_vllm model names must contain exactly one '/'. "
+            f"Got '{full_model_name}'."
+        )
+
+    canonical = full_model_name.split("/", 1)[1]
+    if not _HOSTED_VLLM_MODEL_PATTERN.fullmatch(canonical):
+        raise ValueError(
+            "hosted_vllm canonical model names may only contain letters, numbers, "
+            "'.', '-', '_' and must be fewer than 64 characters with no spaces. "
+            f"Got '{canonical}'."
+        )
+
+    if not model_info:
+        raise ValueError(
+            "hosted_vllm models require `model_info` specifying token limits and costs. "
+            "Please provide max_input_tokens, max_output_tokens, "
+            "input_cost_per_token, and output_cost_per_token."
+        )
+
+    normalized_info = dict(model_info)
+
+    for field in _HOSTED_VLLM_REQUIRED_INT_FIELDS:
+        value = model_info.get(field)
+        if value is None:
+            raise ValueError(f"hosted_vllm model_info missing '{field}'.")
+        try:
+            normalized_info[field] = int(float(value))
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"hosted_vllm model_info field '{field}' must be a number. "
+                f"Got '{value}'."
+            )
+
+    for field in _HOSTED_VLLM_REQUIRED_FLOAT_FIELDS:
+        value = model_info.get(field)
+        if value is None:
+            raise ValueError(f"hosted_vllm model_info missing '{field}'.")
+        try:
+            normalized_info[field] = float(value)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"hosted_vllm model_info field '{field}' must be a float. "
+                f"Got '{value}'."
+            )
+
+    return canonical, normalized_info
+
+
+def split_provider_model_name(model_name: str) -> tuple[str | None, str]:
+    """
+    Split a model name into (provider_prefix, canonical_name).
+
+    Args:
+        model_name: e.g. "anthropic/claude-3" or "gpt-4"
+
+    Returns:
+        tuple(provider_prefix | None, canonical_name)
+    """
+    if "/" not in model_name:
+        return None, model_name
+
+    provider, canonical = model_name.split("/", 1)
+    return provider.lower(), canonical

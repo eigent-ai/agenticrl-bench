@@ -1,0 +1,46 @@
+319:def _parse_llama(text: str, properties: dict[str, dict]) -> list[tuple[str, dict]]:
+320-    """Llama-3.1 JSON calls: a bare JSON object, optionally after ``<|python_tag|>``."""
+321-    calls: list[tuple[str, dict]] = []
+322-    decoder = json.JSONDecoder()
+323-    structured = "<|python_tag|>" in text or text.lstrip().startswith("{")
+324-    action = text.split("<|python_tag|>", 1)[1] if "<|python_tag|>" in text else text
+325-    i = 0
+326-    while i < len(action):
+327-        brace = action.find("{", i)
+328-        if brace == -1:
+329-            break
+330-        if structured and action[i:brace].strip(" \t\r\n;"):
+331-            # In a structured reply, only separators may sit between calls.
+332-            nxt = action.find("<|python_tag|>", i)
+333-            if nxt == -1:
+334-                break
+335-            i = nxt + len("<|python_tag|>")
+336-            continue
+337-        try:
+338-            obj, end = decoder.raw_decode(action[brace:])
+339-        except (json.JSONDecodeError, ValueError):
+340-            end_at = _matching_brace(action, brace)
+341-            if end_at == -1:
+342-                break  # unfinished object
+343-            try:
+344-                obj = ast.literal_eval(action[brace:end_at])
+345-            except Exception:
+346-                if structured:
+347-                    break
+348-                i = brace + 1
+349-                continue
+350-            calls.extend(_calls_from_json_value(obj, properties))
+351-            i = end_at
+352-            continue
+353-        found = _calls_from_json_value(obj, properties)
+354-        calls.extend(found)
+355-        i = brace + end if (found or structured) else brace + 1
+356-        if not structured and not found:
+357-            continue
+358-    return calls
+359-
+360-
+361-_HARMONY_ENDS = ("<|call|>", "<|end|>", "<|return|>")
+362-_RECIPIENT_RE = re.compile(r"to=([A-Za-z_][A-Za-z0-9_.\-]*)")
+363-_CHANNEL_RE = re.compile(r"<\|channel\|>\s*(analysis|commentary|final)", re.I)
+364-

@@ -1,0 +1,28 @@
+diff -ruN '--exclude=__pycache__' base/verl/trainer/ppo/core_algos.py M05/verl/trainer/ppo/core_algos.py
+--- base/verl/trainer/ppo/core_algos.py	2026-10-12 11:39:31.000000000 +0000
++++ M05/verl/trainer/ppo/core_algos.py	2026-10-12 12:10:25.025066679 +0000
+@@ -349,7 +349,7 @@
+     with torch.no_grad():
+         scores = token_level_rewards.sum(dim=-1)
+         g = as_torch_index(index, device=scores.device)
+-        mean_g, std_g, _ = group_mean_std(scores, g, eps=0.0, device=scores.device)
++        mean_g, std_g, _ = group_mean_std(scores, g, eps=epsilon, device=scores.device)
+         if norm_adv_by_std_in_grpo:
+             scalars = (scores - mean_g[g]) / (std_g[g] + epsilon)
+         else:
+diff -ruN '--exclude=__pycache__' base/verl/utils/groupwise.py M05/verl/utils/groupwise.py
+--- base/verl/utils/groupwise.py	2026-10-12 11:39:31.000000000 +0000
++++ M05/verl/utils/groupwise.py	2026-10-12 12:10:25.025066679 +0000
+@@ -204,9 +204,10 @@
+ 
+     count = torch.zeros(G, device=target, dtype=torch.float32).index_add_(0, gidx, ones)
+     s1 = torch.zeros(G, device=target, dtype=torch.float32).index_add_(0, gidx, scores)
++    s2 = torch.zeros(G, device=target, dtype=torch.float32).index_add_(0, gidx, scores * scores)
++
+     mean = s1 / count.clamp_min(1.0)
+-    centered = scores - mean[gidx]
+-    var_num = torch.zeros(G, device=target, dtype=torch.float32).index_add_(0, gidx, centered * centered)
++    var_num = s2 - (s1 * s1) / count.clamp_min(1.0)
+     denom = (count - 1.0).clamp_min(1.0)
+     var = var_num / denom
+     std = torch.sqrt(torch.clamp(var, min=eps))

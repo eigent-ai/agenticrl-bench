@@ -1,0 +1,113 @@
+Read text file `/opt/verl/verl/experimental/agent_loop/agent_loop.py`.
+(89 line(s) above)
+90|
+91|    prompt_ids: list[int]
+92|    """Prompt token ids."""
+93|    response_ids: list[int]
+94|    """Response token ids including LLM generated token, tool response token."""
+95|    response_mask: list[int]
+96|    """Response mask, 1 for LLM generated token, 0 for tool response token."""
+97|    response_logprobs: Optional[list[float]] = None
+98|    """Log probabilities for the response tokens."""
+99|    routed_experts: Optional[Any] = None
+100|    """Routed experts for the total tokens."""
+101|    multi_modal_data: Optional[dict[str, Any]] = None
+102|    """Multi-modal data for multi-modal tools."""
+103|    reward_score: Optional[float] = None
+104|    """Reward score for the trajectory."""
+105|    num_turns: int = 0
+106|    """Number of chat turns, including user, assistant, tool."""
+107|    metrics: AgentLoopMetrics
+108|    """Auxiliary performance metrics"""
+109|    extra_fields: dict[str, Any] = {}
+110|    """Extra fields for dynamic addition."""
+111|    mm_processor_kwargs: Optional[dict[str, Any]] = None
+112|    """Processor/backend kwargs that must stay aligned across rollout and training paths."""
+113|    mm_processor_output: Optional[list[dict[str, Any]]] = None
+114|    """SGLang video payload (see AgentLoopBase.build_sglang_video_payload); reused by the teacher
+115|    (OPD) path so an SGLang teacher receives the video instead of raw frames. None otherwise."""
+116|
+117|    def as_dict(self) -> dict[str, Any]:
+118|        """Convert agent loop output to a dictionary."""
+119|        output = self.model_dump(exclude_unset=True)
+120|
+121|        output["prompts"] = torch.tensor(output.pop("prompt_ids"), dtype=torch.int64)
+122|        output["responses"] = torch.tensor(output.pop("response_ids"), dtype=torch.int64)
+123|        output["response_mask"] = torch.tensor(output.pop("response_mask"), dtype=torch.int64)
+124|
+125|        response_logprobs = output.pop("response_logprobs", None)
+126|        if response_logprobs is not None:
+127|            output["rollout_log_probs"] = torch.tensor(response_logprobs, dtype=torch.float32)
+128|
+129|        routed_experts = output.pop("routed_experts", None)
+130|        if routed_experts is not None:
+131|            routed_experts = torch.tensor(routed_experts, dtype=torch.int16)
+132|            # Router replay indexes this field by absolute token position, so it must
+133|            # span the whole sequence. The rollout engine records fewer rows than that:
+134|            # it only sees tokens fed through the model, and multi-turn loops stop
+135|            # recording at the last generation. Trailing rows stay zero; replay masks
+136|            # them out instead of consuming them.
+137|            total_length = output["prompts"].size(0) + output["responses"].size(0)
+138|            aligned = routed_experts.new_zeros((total_length, *routed_experts.shape[1:]))
+139|            num_rows = min(routed_experts.size(0), total_length)
+140|            aligned[:num_rows] = routed_experts[:num_rows]
+141|            output["routed_experts"] = aligned
+142|
+143|        # rm_scores: reward score for each token
+144|        reward_score = output.pop("reward_score", None)
+145|        if reward_score is not None:
+146|            rm_scores = torch.zeros_like(output["response_mask"], dtype=torch.float32)
+147|            rm_scores[-1] = reward_score
+148|            output["rm_scores"] = rm_scores
+149|
+150|        # Mutating a default dict does not add the field to Pydantic's fields-set,
+151|        # so model_dump(exclude_unset=True) can omit populated extra fields.
+152|        extra_fields = output.setdefault("extra_fields", self.extra_fields.copy())
+153|        teacher_ids, teacher_logprobs = (
+154|            extra_fields.pop("teacher_ids", None),
+155|            extra_fields.pop("teacher_logprobs", None),
+156|        )
+157|        if teacher_ids is not None:
+158|            output["teacher_ids"] = teacher_ids
+159|        if teacher_logprobs is not None:
+160|            output["teacher_logprobs"] = teacher_logprobs
+161|        return output
+162|
+163|
+164|class _InternalAgentLoopOutput(AgentLoopOutput):
+165|    """Internal agent loop output with padded sequences."""
+166|
+167|    model_config = ConfigDict(arbitrary_types_allowed=True)
+168|
+169|    prompt_ids: torch.Tensor
+170|    """Padded prompt token ids."""
+171|    response_ids: torch.Tensor
+172|    """Padded response token ids."""
+173|    input_ids: torch.Tensor
+174|    """Padded input ids(prompt_ids + response_ids)."""
+175|    position_ids: torch.Tensor
+176|    """Padded position ids."""
+177|    response_mask: torch.Tensor
+178|    """Padded response mask."""
+179|    attention_mask: torch.Tensor
+180|    """Padded attention mask."""
+181|    response_logprobs: Optional[torch.Tensor] = None
+182|    """Padded log probabilities for the response tokens."""
+183|    teacher_logprobs: Optional[torch.Tensor] = None
+184|    """Padded log probabilities from teacher model for prompt/response tokens."""
+185|    teacher_ids: Optional[torch.Tensor] = None
+186|    """Padded token ids corresponding to the teacher log probabilities."""
+187|    routed_experts: Optional[torch.Tensor] = None
+188|    """Padded routed experts for the total tokens."""
+189|    multi_modal_inputs: Optional[dict[str, torch.Tensor]] = None
+190|    """Multi-modal inputs for processors (e.g. pixel_values, image_grid_thw, video_grid_thw)."""
+191|    extra_fields: dict[str, Any] = {}
+192|    """Extra fields for dynamic addition."""
+193|
+194|
+195|class DictConfigWrap:
+196|    """Wrapper for DictConfig to avoid hydra.utils.instantiate recursive resolve."""
+197|
+198|    def __init__(self, config: DictConfig):
+199|        self.config = config
+(more lines below)

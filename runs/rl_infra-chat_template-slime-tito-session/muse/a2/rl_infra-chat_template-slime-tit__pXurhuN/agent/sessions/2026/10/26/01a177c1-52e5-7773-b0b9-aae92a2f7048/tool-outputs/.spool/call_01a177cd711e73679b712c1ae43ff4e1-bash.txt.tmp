@@ -1,0 +1,81 @@
+    @classmethod
+    def from_pp_proxy(
+        cls, logits_output, next_pp_outputs: PPProxyTensors, can_run_cuda_graph
+    ):
+        # TODO(lsyin): refactor PP and avoid using dict
+        proxy_dict = next_pp_outputs.tensors
+        return cls(
+            logits_output=logits_output,
+            pp_hidden_states_proxy_tensors=None,
+            next_token_ids=next_pp_outputs["next_token_ids"],
+            extend_input_len_per_req=proxy_dict.get("extend_input_len_per_req", None),
+            extend_logprob_start_len_per_req=proxy_dict.get(
+                "extend_logprob_start_len_per_req", None
+            ),
+            can_run_cuda_graph=can_run_cuda_graph,
+        )
+
+
+def validate_input_length(
+    req: Req, max_req_input_len: int, allow_auto_truncate: bool
+) -> Optional[str]:
+    """Validate and potentially truncate input length.
+
+    Args:
+        req: The request containing input_ids to validate
+        max_req_input_len: Maximum allowed input length
+        allow_auto_truncate: Whether to truncate long inputs
+
+    Returns:
+        Error message if validation fails, None if successful
+    """
+    if len(req.origin_input_ids) >= max_req_input_len:
+        if allow_auto_truncate:
+            logger.warning(
+                "Request length is longer than the KV cache pool size or "
+                "the max context length. Truncated. "
+                f"{len(req.origin_input_ids)=}, {max_req_input_len=}."
+            )
+            req.origin_input_ids = req.origin_input_ids[:max_req_input_len]
+            return None
+        else:
+            error_msg = (
+                f"Input length ({len(req.origin_input_ids)} tokens) exceeds "
+                f"the maximum allowed length ({max_req_input_len} tokens). "
+                f"Use a shorter input or enable --allow-auto-truncate."
+            )
+            return error_msg
+
+    return None
+
+
+def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
+
+    logits_output = result.logits_output
+    assert logits_output is not None
+
+    return {
+        "extend_input_len_per_req": result.extend_input_len_per_req,
+        "extend_logprob_start_len_per_req": result.extend_logprob_start_len_per_req,
+        "next_token_logprobs": result.logits_output.next_token_logprobs,
+        "next_token_top_logprobs_val": result.logits_output.next_token_top_logprobs_val,
+        "next_token_top_logprobs_idx": result.logits_output.next_token_top_logprobs_idx,
+        "next_token_token_ids_logprobs_val": result.logits_output.next_token_token_ids_logprobs_val,
+        "next_token_token_ids_logprobs_idx": result.logits_output.next_token_token_ids_logprobs_idx,
+        "input_token_logprobs": result.logits_output.input_token_logprobs,
+        "input_top_logprobs_val": result.logits_output.input_top_logprobs_val,
+        "input_top_logprobs_idx": result.logits_output.input_top_logprobs_idx,
+        "input_token_ids_logprobs_val": result.logits_output.input_token_ids_logprobs_val,
+        "input_token_ids_logprobs_idx": result.logits_output.input_token_ids_logprobs_idx,
+    }
+
+/usr/local/lib/python3.12/site-packages/sglang/srt/entrypoints/engine.py:1087:    tokenizer_manager.max_req_input_len = scheduler_infos[0]["max_req_input_len"]
+/usr/local/lib/python3.12/site-packages/sglang/srt/managers/data_parallel_controller.py:504:        self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
+/usr/local/lib/python3.12/site-packages/sglang/srt/managers/data_parallel_controller.py:602:                "max_req_input_len": controller.max_req_input_len,
+/usr/local/lib/python3.12/site-packages/sglang/srt/managers/scheduler.py:580:            self.max_req_input_len,
+/usr/local/lib/python3.12/site-packages/sglang/srt/managers/scheduler.py:1590:            if len(req.origin_input_ids) >= self.max_req_input_len:
+/usr/local/lib/python3.12/site-packages/sglang/srt/managers/scheduler.py:1594:                        f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
+/usr/local/lib/python3.12/site-packages/sglang/srt/managers/scheduler.py:1607:            self.max_req_input_len,
+/usr/local/lib/python3.12/site-packages/sglang/srt/managers/scheduler.py:1835:            if len(req.origin_input_ids) >= self.max_req_input_len:
+/usr/local/lib/python3.12/site-packages/sglang/srt/managers/scheduler.py:1839:                        f"After expanding {len(req.origin_input_ids_unpadded)=} => {len(req.origin_input_ids)} >= {self.max_req_input_len}."
+/usr/local/lib/python3.12/site-packages/sglang/srt/managers/scheduler.py:1848:            self.max_req_input_len,

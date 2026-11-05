@@ -1,0 +1,83 @@
+Read text file `/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/agents/terminus_2/terminus_xml_plain_parser.py`.
+(499 line(s) above)
+500|                f"Command {command_num}: Use double quotes for attribute "
+501|                f"'{attr_name}': {attr_name}=\"{attr_value}\""
+502|            )
+503|
+504|        # Check for unknown attribute names
+505|        known_attributes = {"duration"}
+506|        all_attributes = re.findall(r"(\w+)\s*=", attributes_str)
+507|        for attr_name in all_attributes:
+508|            if attr_name not in known_attributes:
+509|                warnings.append(
+510|                    f"Command {command_num}: Unknown attribute '{attr_name}' - "
+511|                    f"known attributes are: {', '.join(sorted(known_attributes))}"
+512|                )
+513|
+514|    def _check_task_complete(self, response_content: str) -> bool:
+515|        """Check if the response indicates the task is complete."""
+516|        # Check for <task_complete>true</task_complete>
+517|        true_match = re.search(
+518|            r"<task_complete>\s*true\s*</task_complete>",
+519|            response_content,
+520|            re.IGNORECASE,
+521|        )
+522|        if true_match:
+523|            return True
+524|
+525|        # All other cases (false, empty, self-closing, missing) = not complete
+526|        return False
+527|
+528|    def salvage_truncated_response(
+529|        self, truncated_response: str
+530|    ) -> tuple[str | None, bool]:
+531|        """
+532|        Try to salvage a valid response from truncated output.
+533|
+534|        Args:
+535|            truncated_response: The truncated response from the LLM
+536|
+537|        Returns:
+538|            Tuple of (salvaged_response, has_multiple_blocks)
+539|            - salvaged_response: Clean response up to </response> if salvageable, "
+540|                "None otherwise
+541|            - has_multiple_blocks: True if multiple response/commands blocks "
+542|                "were detected
+543|        """
+544|        # Check if we can find a complete response structure
+545|        commands_end = truncated_response.find("</commands>")
+546|        if commands_end == -1:
+547|            return None, False
+548|
+549|        # Find the </response> tag after </commands>
+550|        response_end = truncated_response.find("</response>", commands_end)
+551|        if response_end == -1:
+552|            return None, False
+553|
+554|        # We have a complete response up to at least </commands>
+555|        # Truncate cleanly at </response>
+556|        clean_response = truncated_response[: response_end + len("</response>")]
+557|
+558|        # Check if this is a valid response with no critical issues
+559|        try:
+560|            parse_result = self.parse_response(clean_response)
+561|
+562|            # Check if there are no errors and no "multiple blocks" warnings
+563|            has_multiple_blocks = False
+564|            if parse_result.warning:
+565|                warning_lower = parse_result.warning.lower()
+566|                has_multiple_blocks = (
+567|                    "only issue one" in warning_lower
+568|                    and "block at a time" in warning_lower
+569|                )
+570|
+571|            if not parse_result.error and not has_multiple_blocks:
+572|                # Valid response! Return the clean truncated version
+573|                return clean_response, False
+574|            else:
+575|                # Has errors or multiple blocks
+576|                return None, has_multiple_blocks
+577|
+578|        except Exception:
+579|            # If parsing fails, not salvageable
+580|            return None, False

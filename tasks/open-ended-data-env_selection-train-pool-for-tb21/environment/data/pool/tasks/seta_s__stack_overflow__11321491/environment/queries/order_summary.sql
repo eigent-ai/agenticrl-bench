@@ -1,0 +1,1 @@
+SELECT COUNT(*) AS total_orders, SUM(amount) AS total_amount FROM order WHERE status = active

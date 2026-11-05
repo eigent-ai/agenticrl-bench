@@ -1,0 +1,167 @@
+Read text file `/opt/verl/verl/utils/seqlen_balancing.py`.
+(497 line(s) above)
+498|    micro_batches = []
+499|
+500|    for partition in micro_bsz_idx:
+501|        curr_micro_batch = tu.index_select_tensor_dict(batch, partition)
+502|        micro_batches.append(curr_micro_batch)
+503|
+504|    return micro_batches, micro_bsz_idx
+505|
+506|
+507|def get_reverse_idx(idx_map):
+508|    """
+509|    Build the inverse of an index mapping.
+510|
+511|    Args:
+512|        idx_map (Sequence[int]): Sequence where idx_map[i] = j.
+513|
+514|    Returns:
+515|        List[int]: Inverse mapping list such that output[j] = i for each i.
+516|    """
+517|    reverse_idx_map = copy.deepcopy(idx_map)
+518|
+519|    for i, idx in enumerate(idx_map):
+520|        reverse_idx_map[idx] = i
+521|
+522|    return reverse_idx_map
+523|
+524|
+525|def prepare_dynamic_batch(
+526|    data: DataProto,
+527|    max_token_len: int,
+528|    dp_group=None,
+529|    num_batches_divided_by=None,
+530|    same_micro_num_in_dp=True,
+531|    min_num_micro_batch=None,
+532|    use_dynamic_bsz_balance=True,
+533|) -> tuple[list[DataProto], list[list[int]]]:
+534|    """
+535|    Prepare a batch for dynamic batching.
+536|
+537|    Args:
+538|        data (DataProto): The input data.
+539|        max_token_len (int): The maximum token length for dynamic batching.
+540|
+541|    Returns:
+542|        Tuple[List[DataProto], List[List[int]]]: A tuple containing a list of DataProto objects
+543|        and a list of index lists.
+544|    """
+545|    batch, batch_idx_list = rearrange_micro_batches(
+546|        data.batch,
+547|        max_token_len=max_token_len,
+548|        dp_group=dp_group,
+549|        num_batches_divided_by=num_batches_divided_by,
+550|        same_micro_num_in_dp=same_micro_num_in_dp,
+551|        min_num_micro_batch=min_num_micro_batch,
+552|        use_dynamic_bsz_balance=use_dynamic_bsz_balance,
+553|    )
+554|    micro_batches = []
+555|    for i, batch_idx in enumerate(batch_idx_list):
+556|        tensors = dict(batch[i])
+557|        non_tensors = {key: value[batch_idx] for key, value in data.non_tensor_batch.items()}
+558|        meta_info = copy.deepcopy(data.meta_info)
+559|        micro_batches.append(DataProto.from_dict(tensors, non_tensors, meta_info=meta_info))
+560|
+561|    return micro_batches, batch_idx_list
+562|
+563|
+564|def restore_dynamic_batch(data: torch.Tensor, batch_idx_list: list[list[int]]) -> torch.Tensor:
+565|    """
+566|    Restore a batch from dynamic batching.
+567|
+568|    Args:
+569|        data (torch.Tensor): The input data.
+570|        batch_idx_list (List[List[int]]): The list of index lists.
+571|
+572|    Returns:
+573|        torch.Tensor: The restored data.
+574|    """
+575|    indices = list(chain.from_iterable(batch_idx_list))
+576|    batch_size = data.shape[0]
+577|    assert len(indices) == batch_size, f"{len(indices)} vs. {batch_size}"
+578|    revert_indices = torch.tensor(get_reverse_idx(indices), dtype=torch.long)
+579|
+580|    if data.is_nested:
+581|        data_lst = data.unbind()
+582|        tensors = [data_lst[i] for i in revert_indices]
+583|        reverted_data = torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
+584|    else:
+585|        reverted_data = data[revert_indices]
+586|
+587|    return reverted_data
+588|
+589|
+590|def get_group_balanced_partitions(
+591|    seqlen_list: list[int],
+592|    uid_list: list,
+593|    k_partitions: int,
+594|) -> list[list[int]]:
+595|    """
+596|    Partition samples into k groups while keeping samples with the same uid together.
+597|
+598|    Args:
+599|        seqlen_list: List of sequence lengths for each sample.
+600|        uid_list: List of uids identifying which samples share the same prefix.
+601|                  Samples with the same uid will be kept together.
+602|        k_partitions: Number of partitions (typically world_size).
+603|
+604|    Returns:
+605|        List of k lists, each containing sample indices assigned to that partition.
+606|        Samples with the same uid are guaranteed to be in the same partition.
+607|    """
+608|    assert len(seqlen_list) == len(uid_list), "seqlen_list and uid_list must have same length"
+609|
+610|    # Build groups: each group contains indices of samples with the same uid
+611|    # Assumes samples with same uid are contiguous
+612|    groups = []  # List of (group_indices, group_total_seqlen)
+613|    current_uid = None
+614|    current_indices = []
+615|    current_seqlen = 0
+616|
+617|    for i, (seqlen, uid) in enumerate(zip(seqlen_list, uid_list, strict=False)):
+618|        if uid != current_uid:
+619|            if current_indices:
+620|                groups.append((current_indices, current_seqlen))
+621|            current_uid = uid
+622|            current_indices = [i]
+623|            current_seqlen = seqlen
+624|        else:
+625|            current_indices.append(i)
+626|            current_seqlen += seqlen
+627|
+628|    # Don't forget the last group
+629|    if current_indices:
+630|        groups.append((current_indices, current_seqlen))
+631|
+632|    num_groups = len(groups)
+633|    assert num_groups >= k_partitions, (
+634|        f"Number of uid groups ({num_groups}) must be >= k_partitions ({k_partitions}). "
+635|        f"Consider reducing world_size or increasing batch_size."
+636|    )
+637|
+638|    # Calculate workload for each group (as integers for partitioning)
+639|    group_workloads = []
+640|    for indices, total_seqlen in groups:
+641|        # Use sum of individual workloads for more accurate estimation
+642|        workload = sum(int(calculate_workload(torch.tensor([seqlen_list[i]])).item()) for i in indices)
+643|        group_workloads.append(workload)
+644|
+645|    # Use Karmarkar-Karp to partition groups
+646|    # equal_size=True ensures each partition gets the same number of groups,
+647|    # which is required when each group has the same number of samples (rollout.n)
+648|    group_partitions = get_seqlen_balanced_partitions(
+649|        seqlen_list=group_workloads,
+650|        k_partitions=k_partitions,
+651|        equal_size=True,
+652|    )
+653|
+654|    # Convert group partitions to sample partitions
+655|    sample_partitions = []
+656|    for group_partition in group_partitions:
+657|        sample_indices = []
+658|        for group_idx in group_partition:
+659|            sample_indices.extend(groups[group_idx][0])
+660|        sample_partitions.append(sorted(sample_indices))
+661|
+662|    return sample_partitions

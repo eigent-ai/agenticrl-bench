@@ -1,0 +1,61 @@
+...........................................................F.            [100%]06:14:41 - LiteLLM:WARNING: get_model_cost_map.py:315 - LiteLLM: model cost map fetch attempt 2/3 failed (ConnectError fetching https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json: [Errno 104] Connection reset by peer); retrying in 4.6s
+
+=================================== FAILURES ===================================
+__________ test_seq_len_llm_aborts_instead_of_salvaging_or_continuing __________
+
+    def test_seq_len_llm_aborts_instead_of_salvaging_or_continuing():
+        from harbor.llms.base import LLMResponse, OutputLengthExceededError, UsageInfo
+    
+        import harbor_compat
+    
+        class Truncated:
+            async def call(self, **kwargs):
+                raise OutputLengthExceededError("too long", truncated_response="partial")
+    
+        class Crossing:
+            async def call(self, **kwargs):
+                return LLMResponse(
+                    content="x", usage=UsageInfo(prompt_tokens=8000, completion_tokens=300)
+                )
+    
+        with pytest.raises(harbor_compat.SingleTurnMaxSeqLenExceededError):
+            asyncio.run(harbor_compat._SeqLenLLM(Truncated(), 8192, True).call())
+        with pytest.raises(harbor_compat.MaxSeqLenExceededError):
+>           asyncio.run(harbor_compat._SeqLenLLM(Crossing(), 8192, True).call())
+
+tests/test_harbor_contract.py:127: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/usr/local/lib/python3.12/asyncio/runners.py:195: in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/asyncio/runners.py:118: in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/usr/local/lib/python3.12/asyncio/base_events.py:691: in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+harbor_compat.py:73: in call
+    response = await self._inner.call(*args, **kwargs)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <test_harbor_contract.test_seq_len_llm_aborts_instead_of_salvaging_or_continuing.<locals>.Crossing object at 0x2b4275633590>
+kwargs = {}
+
+    async def call(self, **kwargs):
+        return LLMResponse(
+>           content="x", usage=UsageInfo(prompt_tokens=8000, completion_tokens=300)
+                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        )
+E       pydantic_core._pydantic_core.ValidationError: 2 validation errors for UsageInfo
+E       cache_tokens
+E         Field required [type=missing, input_value={'prompt_tokens': 8000, 'completion_tokens': 300}, input_type=dict]
+E           For further information visit https://errors.pydantic.dev/2.14/v/missing
+E       cost_usd
+E         Field required [type=missing, input_value={'prompt_tokens': 8000, 'completion_tokens': 300}, input_type=dict]
+E           For further information visit https://errors.pydantic.dev/2.14/v/missing
+
+tests/test_harbor_contract.py:121: ValidationError
+=========================== short test summary info ============================
+FAILED tests/test_harbor_contract.py::test_seq_len_llm_aborts_instead_of_salvaging_or_continuing
+1 failed, 60 passed in 4.55s

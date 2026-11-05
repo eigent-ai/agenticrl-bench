@@ -1,0 +1,66 @@
+    ):
+        self.auto_create_handle_loop()
+
+        # Normalize the request
+        obj.normalize_batch_and_arguments()
+        self._set_default_priority(obj)
+        if (
+            isinstance(obj, GenerateReqInput)
+            and obj.max_thinking_tokens is not None
+            and not get_serving().enable_strict_thinking
+        ):
+            raise ValueError(
+                "max_thinking_tokens requires the server to be launched with "
+                "--enable-strict-thinking"
+            )
+
+        if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
+            num_dp_ranks = self.elastic_worker_count
+            if num_dp_ranks <= 1 and obj.routed_dp_rank == 0:
+                logger.debug(
+                    f"routed_dp_rank={obj.routed_dp_rank} is ignored because num_dp_ranks={num_dp_ranks}"
+                )
+            elif obj.routed_dp_rank < 0 or obj.routed_dp_rank >= num_dp_ranks:
+                raise ValueError(
+                    f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {num_dp_ranks})"
+                )
+
+        self._init_req_state(obj, request)
+        request_states = {
+            rid: self.rid_to_state[rid]
+            for rid in ([obj.rid] if obj.is_single else obj.rid)
+        }
+        try:
+            if get_disagg().language_only:
+                self._handle_epd_disaggregation_encode_request(obj)
+
+            # Log the request
+            self.request_logger.log_received_request(obj, self.tokenizer, request)
+
+            async with self.is_pause_cond:
+                await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+
+            async with self.model_update_lock.reader_lock:
+                await self._validate_and_resolve_lora(obj)
+
+                # Tokenize the request and send it to the scheduler
+                if obj.is_single:
+                    tokenized_obj = await self._tokenize_one_request(obj)
+                    state = self.rid_to_state[obj.rid]
+                    if obj.return_prompt_token_ids:
+                        state.prompt_token_ids = list(tokenized_obj.input_ids)
+                    await self._send_one_request(tokenized_obj)
+                    async for response in self._wait_one_response(obj, request):
+                        yield response
+                else:
+                    async for response in self._handle_batch_request(
+                        obj, request, request_states
+                    ):
+                        yield response
+        except BaseException:
+            # _init_req_state created a rid_to_state entry per (sub-)request up
+582:        # (is_multimodal, is_*_understandable_model) must see both sources,
+730:        self.is_multimodal = (
+734:                is_multimodal_model(self.hf_config.architectures)
+742:        # Gated on `is_multimodal` because this flag is advertised via /model_info
+744:        # media input for models that are not `is_multimodal`. A text-only model

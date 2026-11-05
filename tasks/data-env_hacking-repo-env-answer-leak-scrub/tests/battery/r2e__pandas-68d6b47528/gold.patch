@@ -1,0 +1,84 @@
+diff --git a/doc/source/whatsnew/v1.6.0.rst b/doc/source/whatsnew/v1.6.0.rst
+index 7c1c96b5af..07d406ae7d 100644
+--- a/doc/source/whatsnew/v1.6.0.rst
++++ b/doc/source/whatsnew/v1.6.0.rst
+@@ -31,6 +31,7 @@ Other enhancements
+ - :meth:`.GroupBy.quantile` now preserving nullable dtypes instead of casting to numpy dtypes (:issue:`37493`)
+ - :meth:`Series.add_suffix`, :meth:`DataFrame.add_suffix`, :meth:`Series.add_prefix` and :meth:`DataFrame.add_prefix` support an ``axis`` argument. If ``axis`` is set, the default behaviour of which axis to consider can be overwritten (:issue:`47819`)
+ - :func:`assert_frame_equal` now shows the first element where the DataFrames differ, analogously to ``pytest``'s output (:issue:`47910`)
++- Added ``index`` parameter to :meth:`DataFrame.to_dict` (:issue:`46398`)
+ -
+ 
+ .. ---------------------------------------------------------------------------
+diff --git a/pandas/core/frame.py b/pandas/core/frame.py
+index c52a7b0daa..26a068fc94 100644
+--- a/pandas/core/frame.py
++++ b/pandas/core/frame.py
+@@ -1864,6 +1864,7 @@ class DataFrame(NDFrame, OpsMixin):
+             "dict", "list", "series", "split", "tight", "records", "index"
+         ] = "dict",
+         into: type[dict] = dict,
++        index: bool = True,
+     ) -> dict | list[dict]:
+         """
+         Convert the DataFrame to a dictionary.
+@@ -1900,6 +1901,13 @@ class DataFrame(NDFrame, OpsMixin):
+             instance of the mapping type you want.  If you want a
+             collections.defaultdict, you must pass it initialized.
+ 
++        index : bool, default True
++            Whether to include the index item (and index_names item if `orient`
++            is 'tight') in the returned dictionary. Can only be ``False``
++            when `orient` is 'split' or 'tight'.
++
++            .. versionadded:: 1.6.0
++
+         Returns
+         -------
+         dict, list or collections.abc.Mapping
+@@ -2005,6 +2013,11 @@ class DataFrame(NDFrame, OpsMixin):
+             elif orient.startswith("i"):
+                 orient = "index"
+ 
++        if not index and orient not in ["split", "tight"]:
++            raise ValueError(
++                "'index=False' is only valid when 'orient' is 'split' or 'tight'"
++            )
++
+         if orient == "dict":
+             return into_c((k, v.to_dict(into)) for k, v in self.items())
+ 
+@@ -2015,8 +2028,8 @@ class DataFrame(NDFrame, OpsMixin):
+ 
+         elif orient == "split":
+             return into_c(
+-                (
+-                    ("index", self.index.tolist()),
++                ((("index", self.index.tolist()),) if index else ())
++                + (
+                     ("columns", self.columns.tolist()),
+                     (
+                         "data",
+@@ -2030,8 +2043,8 @@ class DataFrame(NDFrame, OpsMixin):
+ 
+         elif orient == "tight":
+             return into_c(
+-                (
+-                    ("index", self.index.tolist()),
++                ((("index", self.index.tolist()),) if index else ())
++                + (
+                     ("columns", self.columns.tolist()),
+                     (
+                         "data",
+@@ -2040,9 +2053,9 @@ class DataFrame(NDFrame, OpsMixin):
+                             for t in self.itertuples(index=False, name=None)
+                         ],
+                     ),
+-                    ("index_names", list(self.index.names)),
+-                    ("column_names", list(self.columns.names)),
+                 )
++                + ((("index_names", list(self.index.names)),) if index else ())
++                + (("column_names", list(self.columns.names)),)
+             )
+ 
+         elif orient == "series":

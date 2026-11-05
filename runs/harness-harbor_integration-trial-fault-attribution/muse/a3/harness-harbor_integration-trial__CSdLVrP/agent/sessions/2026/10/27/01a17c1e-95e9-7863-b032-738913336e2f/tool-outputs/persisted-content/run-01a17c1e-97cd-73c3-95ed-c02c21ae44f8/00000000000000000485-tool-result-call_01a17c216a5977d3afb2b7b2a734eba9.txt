@@ -1,0 +1,156 @@
+Read text file `/app/reference/harbor-0.23.0/harbor/llms/chat.py`.
+1|from pathlib import Path
+2|from typing import Any
+3|
+4|from harbor.llms.base import BaseLLM, LLMResponse
+5|from harbor.models.agent.rollout_detail import RolloutDetail
+6|
+7|
+8|class Chat:
+9|    def __init__(self, model: BaseLLM, interleaved_thinking: bool = False):
+10|        self._model = model
+11|        self._messages = []
+12|        self._cumulative_input_tokens = 0
+13|        self._cumulative_output_tokens = 0
+14|        self._cumulative_cache_tokens = 0
+15|        self._cumulative_cost = 0.0
+16|        self._prompt_token_ids_list: list[list[int]] = []
+17|        self._completion_token_ids_list: list[list[int]] = []
+18|        self._logprobs_list: list[list[float]] = []
+19|        self._extra_list: list[dict[str, Any]] = []
+20|        self._interleaved_thinking = interleaved_thinking
+21|        self._last_response_id: str | None = None
+22|
+23|    @property
+24|    def total_input_tokens(self) -> int:
+25|        return self._cumulative_input_tokens
+26|
+27|    @property
+28|    def total_output_tokens(self) -> int:
+29|        return self._cumulative_output_tokens
+30|
+31|    @property
+32|    def total_cache_tokens(self) -> int:
+33|        return self._cumulative_cache_tokens
+34|
+35|    @property
+36|    def total_cost(self) -> float:
+37|        return self._cumulative_cost
+38|
+39|    @property
+40|    def messages(self) -> list[Any]:
+41|        return self._messages
+42|
+43|    @property
+44|    def rollout_details(self) -> list[RolloutDetail]:
+45|        """Get detailed rollout information from all chat interactions.
+46|
+47|        Returns:
+48|            List containing a single RolloutDetail representing the complete
+49|            linear chat history, or an empty list if no rollout data was collected.
+50|
+51|            TODO: consider multiple rollout details for non-linear chat histories, e.g.
+52|            subagents, summarization, etc.
+53|        """
+54|        if (
+55|            not self._prompt_token_ids_list
+56|            and not self._completion_token_ids_list
+57|            and not self._logprobs_list
+58|            and not self._extra_list
+59|        ):
+60|            return []
+61|
+62|        rollout_detail: RolloutDetail = {}
+63|
+64|        if self._prompt_token_ids_list:
+65|            rollout_detail["prompt_token_ids"] = self._prompt_token_ids_list
+66|
+67|        if self._completion_token_ids_list:
+68|            rollout_detail["completion_token_ids"] = self._completion_token_ids_list
+69|
+70|        if self._logprobs_list:
+71|            rollout_detail["logprobs"] = self._logprobs_list
+72|
+73|        if self._extra_list:
+74|            # Pivot per-turn dicts to per-field lists for consistent indexing
+75|            all_keys = {k for d in self._extra_list for k in d}
+76|            rollout_detail["extra"] = {
+77|                key: [turn.get(key) for turn in self._extra_list]
+78|                for key in sorted(all_keys)
+79|            }
+80|
+81|        return [rollout_detail]
+82|
+83|    async def chat(
+84|        self,
+85|        prompt: str,
+86|        logging_path: Path | None = None,
+87|        **kwargs,
+88|    ) -> LLMResponse:
+89|        llm_response: LLMResponse = await self._model.call(
+90|            prompt=prompt,
+91|            message_history=self._messages,
+92|            logging_path=logging_path,
+93|            previous_response_id=self._last_response_id,
+94|            **kwargs,
+95|        )
+96|
+97|        # Track response chain for Responses API
+98|        if llm_response.response_id is not None:
+99|            self._last_response_id = llm_response.response_id
+100|
+101|        # Get token usage and cost from the LLM response
+102|        usage = llm_response.usage
+103|        if usage is not None:
+104|            self._cumulative_input_tokens += usage.prompt_tokens
+105|            self._cumulative_output_tokens += usage.completion_tokens
+106|            self._cumulative_cache_tokens += usage.cache_tokens
+107|            self._cumulative_cost += usage.cost_usd
+108|
+109|        # Accumulate rollout details from the response
+110|        self._accumulate_rollout_details(llm_response)
+111|
+112|        # Build assistant message with optional reasoning content
+113|        assistant_message = {"role": "assistant", "content": llm_response.content}
+114|        if self._interleaved_thinking and llm_response.reasoning_content:
+115|            assistant_message["reasoning_content"] = llm_response.reasoning_content
+116|
+117|        self._messages.extend(
+118|            [
+119|                {"role": "user", "content": prompt},
+120|                assistant_message,
+121|            ]
+122|        )
+123|        return llm_response
+124|
+125|    def reset_response_chain(self) -> None:
+126|        """Reset the response chain so the next call sends full message history.
+127|
+128|        Call this whenever chat._messages is directly modified (e.g., after
+129|        summarization or unwinding) to ensure the next Responses API call
+130|        doesn't use a stale previous_response_id.
+131|        """
+132|        self._last_response_id = None
+133|
+134|    def _accumulate_rollout_details(self, llm_response: LLMResponse) -> None:
+135|        """Accumulate rollout details from an LLM response.
+136|
+137|        Args:
+138|            llm_response: The LLM response containing token IDs and logprobs
+139|        """
+140|        # Accumulate prompt token IDs per turn
+141|        if llm_response.prompt_token_ids:
+142|            self._prompt_token_ids_list.append(llm_response.prompt_token_ids)
+143|
+144|        # Accumulate completion token IDs per turn
+145|        if llm_response.completion_token_ids:
+146|            # Store completion token IDs for this turn
+147|            self._completion_token_ids_list.append(llm_response.completion_token_ids)
+148|
+149|            # Store logprobs for this turn (if available)
+150|            if llm_response.logprobs:
+151|                self._logprobs_list.append(llm_response.logprobs)
+152|
+153|        # Accumulate extra provider-specific fields per turn
+154|        if llm_response.extra:
+155|            self._extra_list.append(llm_response.extra)

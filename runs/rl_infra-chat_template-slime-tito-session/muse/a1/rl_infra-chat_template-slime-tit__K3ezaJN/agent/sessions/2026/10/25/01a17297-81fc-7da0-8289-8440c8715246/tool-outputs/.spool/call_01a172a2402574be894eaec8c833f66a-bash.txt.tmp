@@ -1,0 +1,381 @@
+236:                    arguments = self._parse_argument_pairs(pairs, func_name, tools)
+237-
+238-                # construct match_result for parse_base_json
+239-                match_result = {"name": func_name, "parameters": arguments}
+240-                calls.extend(self.parse_base_json(match_result, tools))
+241-            return StreamingParseResult(normal_text=normal_text, calls=calls)
+242-        except Exception as e:
+243-            logger.error(f"Error in detect_and_parse: {e}", exc_info=True)
+244-            # return the normal text if parsing fails
+245-            return StreamingParseResult(normal_text=text)
+246-
+247-    def _get_value_type(self, func_name: str, key: str, tools: List[Tool]) -> str:
+248-        """Get parameter type from tool definition, with fallback to auto-detection.
+249-
+250-        Args:
+251-            func_name: Name of the function
+252-            key: Parameter name
+253-            tools: List of available tools
+254-
+255-        Returns:
+256-            Type string: 'string', 'number', 'object', 'array', or 'boolean'
+257-        """
+258-        arg_type = get_argument_type(func_name, key, tools)
+259-        if arg_type:
+260-            return arg_type
+261-
+262-        # Improved auto-detection type from value (best effort)
+263-        value_content = self._current_value.strip() if self._current_value else ""
+264-
+265-        if not value_content:
+266-            return "string"
+267-
+268-        # Try to parse as valid JSON first
+269-        try:
+270-            parsed = json.loads(value_content)
+271-            if isinstance(parsed, dict):
+272-                return "object"
+273-            elif isinstance(parsed, list):
+274-                return "array"
+275-            elif isinstance(parsed, bool):
+276-                return "boolean"
+277-            elif isinstance(parsed, (int, float)):
+278-                return "number"
+279-            # For string values, check if they look like numbers
+280-            elif isinstance(parsed, str):
+281-                if parsed.isdigit() or (
+282-                    parsed.startswith("-") and parsed[1:].isdigit()
+283-                ):
+284-                    return "number"
+285-                return "string"
+286-        except json.JSONDecodeError:
+287-            # Not valid JSON, try heuristic detection
+288-            first_char = value_content[0] if value_content else ""
+289-
+290-            if first_char.isdigit() or first_char in ["-", "."]:
+291-                return "number"
+292-            elif first_char in ["{", "["]:
+293-                return "object"
+294-            elif first_char in ['"', "'"]:
+295-                return "string"
+296-
+--
+600:                    arguments = self._parse_argument_pairs(pairs, func_name, tools)
+601-                    self.prev_tool_call_arr[self.current_tool_id][
+602-                        "arguments"
+603-                    ] = arguments
+604-            except Exception as e:
+605-                logger.debug(f"Failed to parse arguments: {e}", exc_info=True)
+606-
+607-        # Clean buffer
+608-        self._buffer = current_text[match_end_pos:]
+609-
+610-        # Reset state for next tool call
+611-        self._tool_call_completed = True
+612-        self.current_tool_id += 1
+613-        self._last_arguments = ""
+614-        self.current_tool_name_sent = False
+615-        self._streamed_raw_length = 0
+616-        self._reset_streaming_state()
+617-
+618-        return calls
+619-
+620-    def parse_streaming_increment(
+621-        self, new_text: str, tools: List[Tool]
+622-    ) -> StreamingParseResult:
+623-        """
+624-        Streaming incremental parsing tool calls for GLM-4.5 and GLM-4.6 format.
+625-        Uses a state machine to convert XML to JSON incrementally for true character-by-character streaming.
+626-        Outputs JSON increments immediately as XML data arrives.
+627-        """
+628-        self._buffer += new_text
+629-        current_text = self._buffer
+630-
+631-        # Check if we have a tool call
+632-        has_tool_call = self.bot_token in current_text
+633-
+634-        if not has_tool_call:
+635-            # Check if buffer could be the start of a tool call
+636-            # Keep buffer if it could be a partial match of bot_token
+637-            is_potential_start = any(
+638-                self.bot_token.startswith(current_text[-i:])
+639-                for i in range(1, min(len(current_text), len(self.bot_token)) + 1)
+640-            )
+641-
+642-            if not is_potential_start:
+643-                # Not a potential tool call, return as normal text
+644-                # Must return the entire buffer (current_text), not just new_text,
+645-                # because buffer may contain previously accumulated characters like '<'
+646-                # that turned out not to be part of a tool call
+647-                output_text = current_text
+648-                self._buffer = ""
+649-                if self.eot_token in output_text:
+650-                    output_text = output_text.replace(self.eot_token, "")
+651-                return StreamingParseResult(normal_text=output_text)
+652-            else:
+653-                # Could be start of tool call, keep buffering
+654-                return StreamingParseResult(normal_text="", calls=[])
+655-
+656-        # Extract any text before the first bot_token and return it as normal_text
+657-        normal_text = ""
+658-        first_bot_token_idx = current_text.find(self.bot_token)
+659-        if first_bot_token_idx > 0:
+660-            normal_text = current_text[:first_bot_token_idx]
+--
+746:    def _parse_argument_pairs(
+747-        self, pairs: List[Tuple[str, str]], func_name: str, tools: List[Tool]
+748-    ) -> Dict[str, Any]:
+749-        """Parse argument key-value pairs with type coercion.
+750-
+751-        Args:
+752-            pairs: List of (key, value) tuples from regex matching
+753-            func_name: Name of the function
+754-            tools: List of available tools
+755-
+756-        Returns:
+757-            Dictionary of parsed arguments
+758-        """
+759-        arguments = {}
+760-        for arg_key, arg_value in pairs:
+761-            arg_key = arg_key.strip()
+762-            arg_value = arg_value.strip()
+763-            arg_type = get_argument_type(func_name, arg_key, tools)
+764-            parsed_value, is_good_json = parse_arguments(arg_value, arg_type)
+765-
+766-            if arg_type == "string":
+767-                # Only convert to string if explicitly defined as string type
+768-                if isinstance(parsed_value, str):
+769-                    arguments[arg_key] = parsed_value
+770-                elif isinstance(parsed_value, (dict, list)):
+771-                    # If parsed as dict/list but schema says string, convert to JSON string
+772-                    arguments[arg_key] = json.dumps(parsed_value, ensure_ascii=False)
+773-                else:
+774-                    arguments[arg_key] = str(parsed_value)
+775-            elif arg_type is None:
+776-                # If type is not defined, keep the parsed value as-is
+777-                arguments[arg_key] = parsed_value if is_good_json else arg_value
+778-            else:
+779-                # For other types (number, object, array, etc.), use parsed value
+780-                arguments[arg_key] = parsed_value if is_good_json else arg_value
+781-
+782-        return arguments
+783-
+784-    def supports_structural_tag(self) -> bool:
+785-        return False
+786-
+787-    def structure_info(self) -> _GetInfoFunc:
+788-        raise NotImplementedError()
+import logging
+from typing import Dict, List, Literal, Optional, Set, Tuple, Type, Union
+
+from sglang.srt.entrypoints.openai.protocol import (
+    LegacyStructuralTagResponseFormat,
+    StructuresResponseFormat,
+    Tool,
+    ToolCallConstraint,
+    ToolChoice,
+)
+from sglang.srt.environ import ToolStrictLevel, envs
+from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
+from sglang.srt.function_call.deepseekv31_detector import DeepSeekV31Detector
+from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
+from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
+from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
+from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
+from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
+from sglang.srt.function_call.hermes_detector import HermesDetector
+from sglang.srt.function_call.internlm_detector import InternlmDetector
+from sglang.srt.function_call.kimik2_detector import KimiK2Detector
+from sglang.srt.function_call.lfm2_detector import Lfm2Detector
+from sglang.srt.function_call.llama32_detector import Llama32Detector
+from sglang.srt.function_call.mimo_detector import MiMoDetector
+from sglang.srt.function_call.minimax_m2 import MinimaxM2Detector
+from sglang.srt.function_call.mistral_detector import MistralDetector
+from sglang.srt.function_call.pythonic_detector import PythonicDetector
+from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
+from sglang.srt.function_call.qwen25_detector import Qwen25Detector
+from sglang.srt.function_call.step3_detector import Step3Detector
+from sglang.srt.function_call.trinity_detector import TrinityDetector
+from sglang.srt.function_call.utils import get_json_schema_constraint
+
+logger = logging.getLogger(__name__)
+
+
+class FunctionCallParser:
+    """
+    Parser for function/tool calls in model outputs.
+
+    This class handles both streaming and non-streaming parsing of function calls using a detector.
+    In streaming scenarios, each time new_text is received, it calls detector.parse_streaming_increment
+    and returns the resulting normal_text and calls to the upper layer (or SSE).
+    """
+
+    ToolCallParserEnum: Dict[str, Type[BaseFormatDetector]] = {
+        "deepseekv3": DeepSeekV3Detector,
+        "deepseekv31": DeepSeekV31Detector,
+        "deepseekv32": DeepSeekV32Detector,
+        "glm": Glm4MoeDetector,
+        "glm45": Glm4MoeDetector,
+        "glm47": Glm47MoeDetector,
+        "gpt-oss": GptOssDetector,
+        "kimi_k2": KimiK2Detector,
+        "lfm2": Lfm2Detector,
+        "llama3": Llama32Detector,
+        "mimo": MiMoDetector,
+        "mistral": MistralDetector,
+        "pythonic": PythonicDetector,
+        "qwen": Qwen25Detector,
+        "qwen25": Qwen25Detector,
+        "qwen3_coder": Qwen3CoderDetector,
+        "step3": Step3Detector,
+        "step3p5": Qwen3CoderDetector,
+        "minimax-m2": MinimaxM2Detector,
+        "trinity": TrinityDetector,
+        "interns1": InternlmDetector,
+        "hermes": HermesDetector,
+        "gigachat3": GigaChat3Detector,
+    }
+
+    def __init__(self, tools: List[Tool], tool_call_parser: str):
+        detector_class = self.ToolCallParserEnum.get(tool_call_parser)
+        if detector_class:
+            detector = detector_class()
+        else:
+            raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
+
+        self.detector = detector
+        self.tools = tools
+        self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
+
+    def has_tool_call(self, text: str) -> bool:
+        """
+        Check if the given text contains a tool call in the format supported by this parser.
+        This delegates to the detector's implementation.
+
+        Args:
+            text: The text to check for tool calls
+
+        Returns:
+            True if the text contains a tool call, False otherwise
+        """
+        if not self.tools:
+            return False
+        return self.detector.has_tool_call(text)
+
+    def parse_non_stream(self, full_text: str) -> Tuple[str, list[ToolCallItem]]:
+        """
+        One-time parsing of the full text to extract tool calls.
+
+        Args:
+            full_text: The complete text to parse
+
+        Returns:
+            A tuple containing:
+            - The remaining text after parsing that was not consumed by the detector (can be treated as normal text)
+            - A list of tool calls parsed from the text
+        """
+        if not self.tools:
+            return full_text, []
+        parsed_result = self.detector.detect_and_parse(full_text, self.tools)
+        tool_call_list = parsed_result.calls
+        if tool_call_list:
+            return parsed_result.normal_text, tool_call_list
+        else:
+            return full_text, []
+
+    def parse_stream_chunk(self, chunk_text: str) -> Tuple[str, list[ToolCallItem]]:
+        """
+        Streaming incremental parsing of chunks of text as they arrive.
+
+        Args:
+            chunk_text: The new chunk of text to parse
+
+        Returns:
+            A tuple containing:
+            - The normal text that should be displayed to the user
+            - A list of tool calls parsed from the chunk
+        """
+        if not self.tools:
+            return chunk_text, []
+        final_normal_text = ""
+        final_calls = []
+
+        sp_result = self.detector.parse_streaming_increment(chunk_text, self.tools)
+        if sp_result.normal_text:
+            final_normal_text = sp_result.normal_text
+        if sp_result.calls:
+            final_calls.extend(sp_result.calls)
+            final_normal_text = sp_result.normal_text
+
+        return final_normal_text, final_calls
+
+    def get_structure_tag(self) -> LegacyStructuralTagResponseFormat:
+        """
+        Generate a structural tag response format for all available tools.
+
+        This creates the necessary structural tags that guide the model's output format.
+        """
+        tool_structures: List[StructuresResponseFormat] = list()
+        tool_trigger_set: Set[str] = set()
+
+        get_structure_info = self.detector.structure_info()
+        for tool in self.tools:
+            function = tool.function
+            name = function.name
+            assert name is not None
+            info = get_structure_info(name)
+
+            # accept all if not strict, otherwise only accept the schema
+            is_strict = (
+                function.strict or self.tool_strict_level >= ToolStrictLevel.PARAMETER
+            )
+            schema = function.parameters if is_strict else {}
+
+            tool_structures.append(
+                StructuresResponseFormat(
+                    begin=info.begin,
+                    schema=schema or {},  # type: ignore
+                    end=info.end,
+                )
+            )
+            tool_trigger_set.add(info.trigger)
+
+        # TODO(dark): move this into new structural tag format
+        # This requires all grammar backend support the new format
+        return LegacyStructuralTagResponseFormat(
+            type="structural_tag",
+            structures=tool_structures,
+            triggers=list(tool_trigger_set),
+        )
+
+    def get_structure_constraint(
+        self, tool_choice: Union[ToolChoice, Literal["auto", "required"]]
+    ) -> Optional[ToolCallConstraint]:
+        """
+        Returns the appropriate structure constraint for tool calls based on the tool_choice.
+        The constraint is used to guide the model's output format.
+
+        Args:
+            tool_choice: The tool choice setting from the request
+
+        Returns:
+            A tuple of (constraint_type, constraint_value) to be added to sampling parameters,
+            or None if no constraint applies.
+        """
+        # NOTE: structural_tag only supports JSON-compatible content between the begin and end.
+        # It cannot parse or validate function call Pythonic or XML-ish syntax.
+        if (
+            self.detector.supports_structural_tag()
+            and tool_choice == "auto"
+            and (
+                any(tool.function.strict for tool in self.tools)
+                or self.tool_strict_level >= ToolStrictLevel.FUNCTION
+            )
+        ):
+            tag = self.get_structure_tag()
+            return ("structural_tag", tag)
+        elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
+            json_schema = get_json_schema_constraint(self.tools, tool_choice)
+            return ("json_schema", json_schema)

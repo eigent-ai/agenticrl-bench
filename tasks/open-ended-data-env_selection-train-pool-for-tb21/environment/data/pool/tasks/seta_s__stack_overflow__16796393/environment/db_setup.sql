@@ -1,0 +1,11 @@
+CREATE DATABASE IF NOT EXISTS logmon;
+USE logmon;
+
+DROP TABLE IF EXISTS events;
+
+CREATE TABLE events (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    event_time TIMESTAMP,
+    event_type VARCHAR(50),
+    message TEXT
+) AUTO_INCREMENT = 5000;

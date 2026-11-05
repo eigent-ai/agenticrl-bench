@@ -1,0 +1,116 @@
+Read text file `/app/rollout/replay/rows.py`.
+1|"""What the trainer gets from one episode, as a JSON-able row, and a comparison of two rows files.
+2|
+3|A row carries exactly the fields the training step consumes from a sample: the token ids, the loss mask, the rollout
+4|log-probs, the reward and whether the sample is kept (``status``; ABORTED samples are filtered out before training).
+5|
+6|    python -m replay.rows diff old.jsonl new.jsonl
+7|"""
+8|
+9|from __future__ import annotations
+10|
+11|import hashlib
+12|import json
+13|import math
+14|import sys
+15|
+16|
+17|def _num(x):
+18|    if x is None:
+19|        return None
+20|    x = float(x)
+21|    if math.isnan(x):
+22|        return "nan"
+23|    if math.isinf(x):
+24|        return "inf" if x > 0 else "-inf"
+25|    return x
+26|
+27|
+28|def sample_to_row(sample) -> dict:
+29|    tokens = list(sample.tokens or [])
+30|    loss_mask = list(sample.loss_mask or [])
+31|    logprobs = [round(float(x), 6) for x in (sample.rollout_log_probs or [])]
+32|    reward = sample.reward
+33|    if isinstance(reward, dict):
+34|        reward = {k: _num(v) for k, v in reward.items()}
+35|    else:
+36|        reward = _num(reward)
+37|    return {
+38|        "status": sample.status.value,
+39|        "reward": reward,
+40|        "response_length": int(sample.response_length or 0),
+41|        "n_tokens": len(tokens),
+42|        "tokens": tokens,
+43|        "loss_mask": loss_mask,
+44|        "rollout_log_probs": logprobs,
+45|    }
+46|
+47|
+48|def training_view(row: dict) -> dict:
+49|    """The part of a row that reaches the optimizer: nothing of an aborted sample does."""
+50|    if row["status"] == "aborted":
+51|        return {"status": "aborted"}
+52|    keep = ("status", "reward", "response_length", "tokens", "loss_mask", "rollout_log_probs")
+53|    return {k: row[k] for k in keep}
+54|
+55|
+56|def digest(row: dict) -> str:
+57|    return hashlib.sha256(json.dumps(training_view(row), sort_keys=True).encode()).hexdigest()[:16]
+58|
+59|
+60|def load(path: str) -> dict[str, dict]:
+61|    out = {}
+62|    with open(path) as f:
+63|        for line in f:
+64|            if line.strip():
+65|                rec = json.loads(line)
+66|                out[rec["trial_id"]] = rec
+67|    return out
+68|
+69|
+70|def _explain(a: dict, b: dict) -> str:
+71|    if a["status"] != b["status"]:
+72|        return f"status {a['status']} -> {b['status']}"
+73|    if a["status"] == "aborted":
+74|        return ""
+75|    parts = []
+76|    if a["reward"] != b["reward"]:
+77|        parts.append(f"reward {a['reward']} -> {b['reward']}")
+78|    if a["tokens"] != b["tokens"]:
+79|        n = next((i for i, (x, y) in enumerate(zip(a["tokens"], b["tokens"])) if x != y), min(len(a["tokens"]), len(b["tokens"])))
+80|        parts.append(f"tokens differ at {n} (len {len(a['tokens'])} -> {len(b['tokens'])})")
+81|    elif a["loss_mask"] != b["loss_mask"]:
+82|        parts.append("loss_mask differs")
+83|    elif a["rollout_log_probs"] != b["rollout_log_probs"]:
+84|        parts.append("rollout_log_probs differ")
+85|    return "; ".join(parts)
+86|
+87|
+88|def diff(path_a: str, path_b: str) -> int:
+89|    a, b = load(path_a), load(path_b)
+90|    bad = 0
+91|    for tid in sorted(set(a) | set(b)):
+92|        ra, rb = a.get(tid), b.get(tid)
+93|        if ra is None or rb is None:
+94|            print(f"{tid}: only in {'B' if ra is None else 'A'}")
+95|            bad += 1
+96|            continue
+97|        if "error" in ra or "error" in rb:
+98|            print(f"{tid}: replay error A={ra.get('error')} B={rb.get('error')}")
+99|            bad += 1
+100|            continue
+101|        va = [training_view(r) for r in ra["rows"]]
+102|        vb = [training_view(r) for r in rb["rows"]]
+103|        if va != vb:
+104|            bad += 1
+105|            why = "; ".join(_explain(x, y) for x, y in zip(ra["rows"], rb["rows"])) or f"{len(va)} vs {len(vb)} rows"
+106|            print(f"{tid}: {why}")
+107|    print(f"{len(set(a) | set(b)) - bad}/{len(set(a) | set(b))} trials identical")
+108|    return 1 if bad else 0
+109|
+110|
+111|if __name__ == "__main__":
+112|    if len(sys.argv) == 4 and sys.argv[1] == "diff":
+113|        sys.exit(diff(sys.argv[2], sys.argv[3]))
+114|    print(__doc__)
+115|    sys.exit(2)

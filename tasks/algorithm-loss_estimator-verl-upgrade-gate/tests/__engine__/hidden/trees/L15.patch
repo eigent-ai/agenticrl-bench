@@ -1,0 +1,63 @@
+diff -ruN '--exclude=__pycache__' base/verl/workers/engine/utils.py L15/verl/workers/engine/utils.py
+--- base/verl/workers/engine/utils.py	2026-10-12 11:39:31.000000000 +0000
++++ L15/verl/workers/engine/utils.py	2026-11-02 17:52:06.375952944 +0000
+@@ -14,6 +14,7 @@
+ 
+ import os
+ import random
++from itertools import chain
+ 
+ import numpy as np
+ import torch
+@@ -25,7 +26,7 @@
+ from verl.utils.device import manual_seed as device_manual_seed
+ from verl.utils.device import manual_seed_all as device_manual_seed_all
+ from verl.utils.py_functional import append_to_dict
+-from verl.utils.seqlen_balancing import rearrange_micro_batches, restore_dynamic_batch
++from verl.utils.seqlen_balancing import get_reverse_idx, rearrange_micro_batches, restore_dynamic_batch  # noqa: F401
+ 
+ 
+ def enable_full_determinism(seed: int):
+@@ -155,6 +156,21 @@
+     return obj
+ 
+ 
++def _rows_in_input_order(chunks, batch_idx_list, use_dynamic_bsz):
++    """Unbind per-micro-batch nested outputs into one jagged tensor with a row per input sample.
++
++    With dynamic batch size the micro-batches hold the samples in packing order: ``batch_idx_list`` gives the input
++    index of every packed row, and the rows are put back in input order before the nested tensor is built, so it is
++    built once instead of being built and then re-ordered.
++    """
++    rows = [row for nt in chunks for row in nt.unbind()]
++    if use_dynamic_bsz:
++        order = list(chain.from_iterable(batch_idx_list))
++        assert len(order) == len(rows), f"{len(order)} vs. {len(rows)}"
++        rows = [rows[i] for i in get_reverse_idx(order)]
++    return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
++
++
+ def postprocess_batch_func(output_lst, indices, data: TensorDict):
+     """postprocess the output of a forward_backward_batch.
+     output_lst is a list of dict containing outputs for each micro-batch
+@@ -187,18 +203,13 @@
+                     model_output[key] = []
+                 model_output[key].append(val)
+ 
+-    # concat results from micro batches
++    # concat results from micro batches, back in input order (dynamic bsz packs the rows out of order)
+     for key, val in model_output.items():
+         if pad_mode == DatasetPadMode.NO_PADDING:
+-            tensors = [tensor for nt in model_output[key] for tensor in nt.unbind()]
+-            model_output[key] = torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
++            model_output[key] = _rows_in_input_order(val, indices, use_dynamic_bsz)
+         else:
+             raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
+ 
+-        # reverse with dynamic bsz
+-        if use_dynamic_bsz:
+-            model_output[key] = restore_dynamic_batch(model_output[key], indices)
+-
+     # loss
+     for o in output_lst:
+         if "loss" in o:

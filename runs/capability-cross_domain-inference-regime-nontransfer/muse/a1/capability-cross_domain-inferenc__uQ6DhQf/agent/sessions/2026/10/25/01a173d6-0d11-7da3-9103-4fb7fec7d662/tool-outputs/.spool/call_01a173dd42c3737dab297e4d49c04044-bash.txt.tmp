@@ -1,0 +1,46 @@
+111:def parse_kwargs(kwargs_list: list[str] | None) -> dict[str, Any]:
+112-    """Parse key=value strings into a dictionary.
+113-
+114-    Values are parsed as JSON or Python literals if valid, otherwise treated as strings.
+115-    This allows non-string parameters like numbers, booleans, lists, and dictionaries.
+116-
+117-    Examples:
+118-        key=value -> {"key": "value"}
+119-        key=123 -> {"key": 123}
+120-        key=true -> {"key": True}
+121-        key=True -> {"key": True}
+122-        key=[1,2,3] -> {"key": [1, 2, 3]}
+123-        key={"a":1} -> {"key": {"a": 1}}
+124-    """
+125-    if not kwargs_list:
+126-        return {}
+127-
+128-    result = {}
+129-    for kwarg in kwargs_list:
+130-        if "=" not in kwarg:
+131-            raise ValueError(f"Invalid kwarg format: {kwarg}. Expected key=value")
+132-        key, value = kwarg.split("=", 1)
+133-        key = key.strip()
+134-        value = value.strip()
+135-
+136-        # Try to parse as JSON first
+137-        try:
+138-            result[key] = json.loads(value)
+139-        except json.JSONDecodeError:
+140-            # Handle Python-style literals that JSON doesn't recognize
+141-            if value == "True":
+142-                result[key] = True
+143-            elif value == "False":
+144-                result[key] = False
+145-            elif value == "None":
+146-                result[key] = None
+147-            else:
+148-                # If JSON parsing fails and not a Python literal, treat as string
+149-                result[key] = value
+150-
+151-    return result
+31:    parse_kwargs,
+158:        PluginConfig(import_path=p, kwargs=parse_kwargs(kwargs_by_plugin[p]))
+1519:        parsed_kwargs = parse_kwargs(agent_kwargs)
+1558:        parsed_kwargs = parse_kwargs(agent_kwargs)
+1627:            resolved_bridge.setdefault("kwargs", {}).update(parse_kwargs(bridge_kwargs))

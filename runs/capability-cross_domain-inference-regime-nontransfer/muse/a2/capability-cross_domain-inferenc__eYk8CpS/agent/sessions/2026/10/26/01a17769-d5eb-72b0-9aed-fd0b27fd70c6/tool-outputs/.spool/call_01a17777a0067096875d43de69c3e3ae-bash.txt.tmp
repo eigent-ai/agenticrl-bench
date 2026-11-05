@@ -1,0 +1,91 @@
+    sample_chars: Final = total_chars // sample_count
+    last_start: Final = len(text) - sample_chars
+    return tuple(
+        text[start : start + sample_chars]
+        for start in (last_start * index // max(sample_count - 1, 1) for index in range(sample_count))
+    )
+
+
+def _get_count_function(
+    model: str | None,
+    custom_tokenizer: dict | SelectTokenizerResponse | None = None,
+) -> TokenCounterFunction:
+    return _get_extrapolating_count_function(_get_exact_count_function(model, custom_tokenizer))
+
+
+def _get_exact_count_function(
+    model: str | None,
+    custom_tokenizer: dict | SelectTokenizerResponse | None = None,
+) -> TokenCounterFunction:
+    """
+    Get the function to count tokens based on the model and custom tokenizer."""
+    from litellm.utils import _select_tokenizer
+
+    if model is not None or custom_tokenizer is not None:
+        tokenizer_json: Final = custom_tokenizer or _select_tokenizer(model)
+        if tokenizer_json["type"] == "huggingface_tokenizer":
+            tokenizer: Final[HuggingFace] = tokenizer_json["tokenizer"]
+
+            def count_tokens(text: str) -> int:
+                if isinstance(tokenizer, HuggingFaceTokenizer):
+                    return tokenizer.count(text)
+                return len(tokenizer.encode_batch_fast([text])[0])
+
+            return count_tokens
+        elif tokenizer_json["type"] == "openai_tokenizer":
+            encoding: Final = openai_tokenizer_encoding(model)
+
+            def encode_length(text: str) -> int:
+                return _encoding_count(encoding, text)
+
+            return _get_tiktoken_count_function(encode_length)
+        else:
+            raise ValueError("Unsupported tokenizer type")
+    else:
+        default_encoding: Final = _get_default_encoding()
+
+        def encode_length(text: str) -> int:
+            return _encoding_count(default_encoding, text)
+
+        return _get_tiktoken_count_function(encode_length)
+
+
+def _encoding_count(encoding: Encoding, text: str) -> int:
+    if isinstance(encoding, OpenAIEncoding):
+        return encoding.count(text)
+    return len(encoding.encode(text, disallowed_special=()))
+
+
+def openai_tokenizer_encoding(model: str) -> Encoding:
+    """The encoding `token_counter` uses for a model on the `openai_tokenizer` path."""
+    return get_encoding(openai_tokenizer_encoding_name(model))
+
+
+def openai_tokenizer_encoding_name(model: str) -> str:
+    """The tiktoken encoding name for `model`, without loading the encoding."""
+    from litellm.utils import print_verbose
+
+    model_to_use: Final = _fix_model_name(model)
+    if "gpt-4o" in model_to_use:
+        return "o200k_base"
+    try:
+        return tiktoken.encoding_name_for_model(model_to_use)
+    except KeyError:
+        print_verbose("Warning: model not found. Using cl100k_base encoding.")
+        return "cl100k_base"
+
+
+def uses_legacy_message_accounting(model: str) -> bool:
+    """Whether `token_counter` prices messages with the `gpt-3.5-turbo-0301` constants (4 per message, -1 per name)."""
+    return _fix_model_name(model) == "gpt-3.5-turbo-0301"
+
+
+def _fix_model_name(model: str) -> str:
+    """We normalize some model names to others"""
+    if model in litellm.azure_llms:
+        # azure llms use gpt-35-turbo instead of gpt-3.5-turbo 🙃
+        return model.replace("-35", "-3.5")
+    elif model in litellm.open_ai_chat_completion_models:
+        return model
+    else:
+        return "gpt-3.5-turbo"

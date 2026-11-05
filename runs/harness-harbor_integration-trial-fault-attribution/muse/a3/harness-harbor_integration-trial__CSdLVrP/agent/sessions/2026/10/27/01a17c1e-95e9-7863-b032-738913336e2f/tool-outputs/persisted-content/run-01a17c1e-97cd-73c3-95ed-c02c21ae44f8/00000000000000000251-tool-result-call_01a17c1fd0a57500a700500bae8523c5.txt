@@ -1,0 +1,156 @@
+Read text file `/app/reference/sandbox-broker/sandbox_broker/harbor_env.py`.
+1|"""Harbor environment backed by the sandbox broker.
+2|
+3|Use it wherever Harbor would otherwise create Modal sandboxes itself::
+4|
+5|    EnvironmentConfig(import_path="sandbox_broker.harbor_env:BrokerEnvironment", kwargs={...})
+6|
+7|or on the command line: ``harbor run --environment-import-path sandbox_broker.harbor_env:BrokerEnvironment``.
+8|
+9|The task's image comes from ``[environment].docker_image`` when set, otherwise from its
+10|``environment/`` build context (the broker only builds contexts on its allowlist). CPU and
+11|memory follow the task config and Harbor's overrides. Task containers never have network
+12|access, whatever the task's ``network_mode`` says.
+13|
+14|For code that builds ``EnvironmentConfig(type=...)`` and cannot be changed, call
+15|``use_for_modal_environment_type()`` once in the process before trials start.
+16|"""
+17|from __future__ import annotations
+18|
+19|import asyncio
+20|import logging
+21|import shlex
+22|from pathlib import Path
+23|
+24|from harbor.environments.base import BaseEnvironment, ExecResult
+25|from harbor.environments.capabilities import EnvironmentCapabilities
+26|
+27|from .client import AsyncBrokerClient, AsyncSandbox, pack_build_context
+28|
+29|log = logging.getLogger("sandbox_broker.harbor")
+30|
+31|try:  # present in current Harbor releases
+32|    from harbor.environments.definition import parse_dockerfile_workdir
+33|except ImportError:  # pragma: no cover
+34|    def parse_dockerfile_workdir(path: Path) -> str | None:
+35|        workdir = None
+36|        try:
+37|            for line in Path(path).read_text().splitlines():
+38|                parts = line.strip().split(None, 1)
+39|                if len(parts) == 2 and parts[0].upper() == "WORKDIR":
+40|                    workdir = parts[1].strip()
+41|        except OSError:
+42|            return None
+43|        return workdir
+44|
+45|
+46|class BrokerEnvironment(BaseEnvironment):
+47|    """Runs each trial's task container as a broker sandbox."""
+48|
+49|    def __init__(self, environment_dir: Path, environment_name: str, session_id: str, trial_paths,
+50|                 task_env_config, *args, socket_path: str | None = None, sandbox_timeout_secs: int | None = None,
+51|                 idle_timeout_secs: int | None = None, **kwargs):
+52|        for unused in ("app_name", "secrets", "registry_secret", "volumes", "modal_sandbox_v2", "sandbox_idle_timeout_secs",
+53|                       "auto_labels", "labels", "region", "keepalive"):
+54|            kwargs.pop(unused, None)
+55|        self._client = AsyncBrokerClient(socket_path)
+56|        self._sandbox: AsyncSandbox | None = None
+57|        self._sandbox_timeout = sandbox_timeout_secs
+58|        self._idle_timeout = idle_timeout_secs
+59|        super().__init__(environment_dir=environment_dir, environment_name=environment_name, session_id=session_id,
+60|                         trial_paths=trial_paths, task_env_config=task_env_config, *args, **kwargs)
+61|        self._workdir = task_env_config.workdir or parse_dockerfile_workdir(self.environment_dir / "Dockerfile")
+62|
+63|    @staticmethod
+64|    def type() -> str:
+65|        return "sandbox-broker"
+66|
+67|    @property
+68|    def capabilities(self) -> EnvironmentCapabilities:
+69|        return EnvironmentCapabilities(disable_internet=True)
+70|
+71|    @classmethod
+72|    def preflight(cls) -> None:
+73|        return None
+74|
+75|    def _validate_definition(self) -> None:
+76|        if self.task_env_config.docker_image:
+77|            return
+78|        if not (self.environment_dir / "Dockerfile").is_file():
+79|            raise FileNotFoundError(f"{self.environment_dir / 'Dockerfile'} not found")
+80|
+81|    async def start(self, force_build: bool) -> None:
+82|        cfg = self.task_env_config
+83|        if getattr(self, "_network_is_public", False):
+84|            log.info("%s: task asks for network access; broker sandboxes run without it", self.environment_name)
+85|        source: dict = {}
+86|        if cfg.docker_image:
+87|            source["image"] = cfg.docker_image
+88|        else:
+89|            source["build_context"] = await asyncio.to_thread(pack_build_context, self.environment_dir)
+90|        cpus = getattr(self, "_effective_cpus", cfg.cpus)
+91|        memory = getattr(self, "_effective_memory_mb", cfg.memory_mb)
+92|        labels = {"session": self.session_id[:128], "environment": self.environment_name[:128]}
+93|        self._sandbox = await self._client.create(
+94|            **source, cpu=cpus, memory_mb=memory, timeout_s=self._sandbox_timeout,
+95|            idle_timeout_s=self._idle_timeout, labels=labels)
+96|        if cfg.workdir:
+97|            await self.exec(f"mkdir -p {shlex.quote(cfg.workdir)}", user="root")
+98|        if hasattr(self, "ensure_dirs") and hasattr(self, "_mount_targets"):
+99|            await self.ensure_dirs(self._mount_targets(writable_only=True))
+100|        if hasattr(self, "_upload_environment_dir_after_start"):
+101|            await self._upload_environment_dir_after_start()
+102|
+103|    async def stop(self, delete: bool) -> None:
+104|        if self._sandbox is not None:
+105|            try:
+106|                await self._sandbox.terminate()
+107|            except Exception as exc:  # noqa: BLE001
+108|                log.warning("terminate failed: %s", exc)
+109|            self._sandbox = None
+110|
+111|    def _require(self) -> AsyncSandbox:
+112|        if self._sandbox is None:
+113|            raise RuntimeError("Sandbox not found. Please start the environment first.")
+114|        return self._sandbox
+115|
+116|    async def exec(self, command: str, cwd: str | None = None, env: dict[str, str] | None = None,
+117|                   timeout_sec: int | None = None, user: str | int | None = None) -> ExecResult:
+118|        sb = self._require()
+119|        user = self._resolve_user(user)
+120|        if user is not None:
+121|            if isinstance(user, int):
+122|                user_arg = f"$(getent passwd {user} | cut -d: -f1)"
+123|            else:
+124|                user_arg = shlex.quote(str(user))
+125|            command = f"su {user_arg} -s /bin/bash -c {shlex.quote(command)}"
+126|        r = await sb.exec("bash", "-c", command, timeout=timeout_sec, workdir=cwd or self._workdir,
+127|                          env=self._merge_env(env))
+128|        return ExecResult(stdout=r.stdout, stderr=r.stderr, return_code=r.returncode)
+129|
+130|    async def upload_file(self, source_path: Path | str, target_path: str) -> None:
+131|        await self._require().put_file(target_path, Path(source_path))
+132|
+133|    async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
+134|        await self._require().upload_dir(source_dir, target_dir)
+135|
+136|    async def download_file(self, source_path: str, target_path: Path | str) -> None:
+137|        data = await self._require().get_file(source_path)
+138|        target = Path(target_path)
+139|        target.parent.mkdir(parents=True, exist_ok=True)
+140|        await asyncio.to_thread(target.write_bytes, data)
+141|
+142|    async def download_dir(self, source_dir: str, target_dir: Path | str) -> None:
+143|        await self._require().download_dir(source_dir, target_dir)
+144|
+145|
+146|def use_for_modal_environment_type() -> None:
+147|    """Route Harbor's built-in ``modal`` environment type to the broker in this process."""
+148|    from harbor.environments import factory
+149|    from harbor.models.environment_type import EnvironmentType
+150|
+151|    factory._ENVIRONMENT_REGISTRY[EnvironmentType.MODAL] = factory._EnvEntry(
+152|        "sandbox_broker.harbor_env", "BrokerEnvironment", None)
+153|
+154|
+155|__all__ = ["BrokerEnvironment", "use_for_modal_environment_type"]

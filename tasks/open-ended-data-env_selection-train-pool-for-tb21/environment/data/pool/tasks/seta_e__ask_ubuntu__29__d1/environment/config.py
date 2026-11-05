@@ -1,0 +1,5 @@
+CONFIG = {
+    "app_name": "MyApp",
+    "version": "1.0.0",
+    "debug": False
+}

@@ -1,0 +1,65 @@
+Read text file `/root/miles/examples/sql_agent/rescue/episode.py`.
+(69 line(s) above)
+70|        # the router address is only known once the engines are up, after the rollout function is built
+71|        return f"http://{self.args.sglang_router_ip}:{self.args.sglang_router_port}/generate"
+72|
+73|    def encode(self, text: str) -> list[int]:
+74|        return self.tokenizer.encode(text, add_special_tokens=False)
+75|
+76|    async def continue_episode(self, prompt_ids: list[int], prefix: Episode) -> Episode:
+77|        """Generate turns after `prompt_ids + prefix.ids` until the policy answers or a limit is hit."""
+78|        ep = Episode(ids=list(prefix.ids), logprobs=list(prefix.logprobs), turns=list(prefix.turns))
+79|        parser = create_tool_call_parser(self.tool_specs, self.args.generate_tool_call_parser)
+80|        # One cache namespace per episode: turns of this episode reuse its own prefix entries, while no
+81|        # other trajectory's (or a previous weight version's) cached hybrid state can be restored into it.
+82|        extra_key = f"rescue-ep-{uuid.uuid4().hex}"
+83|        while ep.num_turns < self.max_turns:
+84|            payload, _ = compute_request_payload(self.args, prompt_ids + ep.ids, self.sampling_params)
+85|            if payload is not None:
+86|                payload["extra_key"] = extra_key
+87|            if payload is None:
+88|                ep.truncated = True
+89|                break
+90|            output = await post(self.url, payload)
+91|            items = output["meta_info"].get("output_token_logprobs") or []
+92|            start = len(ep.ids)
+93|            ep.ids += [item[1] for item in items]
+94|            ep.logprobs += [item[0] for item in items]
+95|            if output["meta_info"]["finish_reason"]["type"] in ("abort", "length"):
+96|                ep.turns.append((start, len(ep.ids)))
+97|                ep.truncated = True
+98|                break
+99|            ep.turns.append((start, len(ep.ids)))  # the policy's tokens only, not the tool response after them
+100|            _, calls = parser.parse_non_stream(output["text"])
+101|            if not calls:
+102|                ep.finished = True
+103|                break
+104|            tool_messages = await execute_tool_calls(calls, self.execute_tool)
+105|            obs = tokenize_tool_responses(tool_messages, tokenizer=self.tokenizer)
+106|            ep.ids += obs
+107|            ep.logprobs += [0.0] * len(obs)
+108|        ep.text = self.tokenizer.decode(ep.ids)
+109|        return ep
+110|
+111|    async def token_logprobs(self, ids: list[int], start: int) -> list[float]:
+112|        """Log-probs of `ids[start:]` from a prefill on the rollout engine (nothing generated).
+113|
+114|        SGLang returns input_token_logprobs aligned to ids[logprob_start_len:] with None in front (no logits before
+115|        the first scored position), so start one token earlier and drop that entry.
+116|        """
+117|        assert start >= 1, "need at least one context token"
+118|        payload = {
+119|            "input_ids": ids,
+120|            "sampling_params": {"max_new_tokens": 0, "temperature": 0, "skip_special_tokens": False},
+121|            "return_logprob": True,
+122|            "logprob_start_len": start - 1,
+123|            # A fresh cache namespace per scoring request forces a full prefill: these log-probs drive
+124|            # the MH acceptance and become the sample's rollout log-probs for TIS, so they must not be
+125|            # computed from hybrid state restored from another (hinted or stale-weight) trajectory.
+126|            "extra_key": f"rescue-score-{uuid.uuid4().hex}",
+127|        }
+128|        output = await post(self.url, payload)
+129|        items = output["meta_info"]["input_token_logprobs"][1:]
+130|        if [item[1] for item in items] != ids[start:]:
+131|            raise ValueError("prefill scoring returned misaligned tokens")
+132|        return [float(item[0]) for item in items]

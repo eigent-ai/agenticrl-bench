@@ -1,0 +1,1 @@
+- [Terminal-RL pool repair](terminal-rl-pool-repair.md) — /app/pool fixed 2026-10-24; 7 env-changed tasks still need building + oracle check

@@ -1,0 +1,183 @@
+                    f"Unsupported content type: {type(message['content'])}, expected str or list of dicts"
+                )
+
+    return prompt
+
+
+class Dataset:
+    def __init__(
+        self,
+        path,
+        tokenizer,
+        processor,
+        max_length,
+        *,
+        prompt_key="text",
+        multimodal_keys=None,
+        label_key=None,
+        tool_key=None,
+        metadata_key="metadata",
+        seed=42,
+        apply_chat_template=False,
+        apply_chat_template_kwargs=None,
+    ):
+        origin_samples = []
+        for data in read_file(path):
+            # Both chat templates and multimodal inputs require conversation format (list of message dicts)
+            as_conversation = apply_chat_template or (multimodal_keys is not None)
+            prompt = _build_messages(data, prompt_key, as_conversation, multimodal_keys)
+
+            metadata = data.get(metadata_key) or {}
+            tools = None
+            if tool_key is not None and tool_key in data:
+                tools = data[tool_key]
+                if isinstance(tools, str):
+                    tools = json.loads(tools)
+                elif isinstance(tools, np.ndarray):
+                    tools = tools.tolist()
+                assert isinstance(tools, list), f"tools must be a list, got {type(tools)} instead"
+                metadata["tools"] = tools
+
+            if apply_chat_template:
+                output_prompt = chat_template_utils.apply_chat_template(
+                    prompt,
+                    tokenizer=tokenizer,
+                    tools=tools,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    **(apply_chat_template_kwargs or {}),
+                )
+            else:
+                output_prompt = prompt
+
+            if processor:
+                from miles.utils.processing_utils import process_vision_info
+
+                assert isinstance(
+                    prompt, list
+                ), f"prompt must be a list when processor is not None, got {type(prompt)} instead"
+                multimodal_inputs = process_vision_info(prompt, processor)
+            else:
+                multimodal_inputs = None
+            "alias will be removed in a future release."
+        )
+        args.chat_template_path = None
+
+    # A named family is one fixed renderer contract.  Letting a custom path or
+    # conflicting required kwarg through would detach its declared role
+    # capability from the renderer that actually runs.
+    if args.tito_model != TITOTokenizerType.DEFAULT.value:
+        tito_model = TITOTokenizerType(args.tito_model)
+        from miles.utils.chat_template_utils import resolve_fixed_chat_template
+
+        if args.chat_template_path is not None:
+            raise ValueError(
+                f"--chat-template-path cannot override the template registered for "
+                f"--tito-model={tito_model.value}; use --tito-model=default for a custom template"
+            )
+
+        resolved_path, resolved_kwargs = resolve_fixed_chat_template(tito_model)
+        if resolved_path is not None:
+            args.chat_template_path = resolved_path
+        user_kwargs = dict(args.apply_chat_template_kwargs or {})
+        for key, value in resolved_kwargs.items():
+            if key in user_kwargs and user_kwargs[key] != value:
+                raise ValueError(
+                    f"--apply-chat-template-kwargs {key}={user_kwargs[key]!r} conflicts "
+                    f"with the value registered for --tito-model={tito_model.value}: {value!r}"
+                )
+            user_kwargs[key] = value
+        args.apply_chat_template_kwargs = user_kwargs
+
+    if args.chat_template_path is not None:
+        if not os.path.isfile(args.chat_template_path):
+            raise FileNotFoundError(f"--chat-template-path file not found: {args.chat_template_path}")
+        args.sglang_chat_template = args.chat_template_path
+
+    if args.kl_coef != 0 or args.use_kl_loss:
+        if not os.path.exists(args.ref_load):
+            raise FileNotFoundError(f"ref_load {args.ref_load} does not exist, please check the path.")
+
+        if not os.path.exists(os.path.join(args.ref_load, "latest_checkpointed_iteration.txt")):
+            logger.info(
+30:class GenerateState:
+31-    def __init__(self, args: Namespace) -> None:
+32-        # persistent state for the generation process
+33-        self.args = args
+34-        self.tokenizer = load_tokenizer(
+35-            args.hf_checkpoint, chat_template_path=args.chat_template_path, trust_remote_code=True
+36-        )
+37-        self.processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
+38-
+39-        self.generate_fn_semaphore = asyncio.Semaphore(
+40-            args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
+41-        )
+42-        self.sampling_params: dict[str, Any] = compute_sampling_params(
+43-            args,
+44-            temperature=args.rollout_temperature,
+45-            top_p=args.rollout_top_p,
+46-            top_k=args.rollout_top_k,
+47-            max_new_tokens=args.rollout_max_response_len,
+48-        )
+49-
+50-        self.generate_function = load_generate_function(args.custom_generate_function_path) or generate
+51-
+52-        self.reset()
+53-
+54-    def reset(self) -> None:
+55-        self.aborted = False
+56-
+57-
+58-async def generate_and_rm(
+59-    state: GenerateState,
+60-    sample: Sample | list[Sample],
+61-    sampling_params: dict[str, Any],
+62-    evaluation: bool = False,
+63-) -> Sample | list[Sample]:
+64-    args = state.args
+65-
+66-    # mask previous off-policy generation for partial rollout
+67-    if args.partial_rollout and args.mask_offpolicy_in_partial_rollout and sample.response_length > 0:
+68-        sample.loss_mask = [0] * sample.response_length
+69-
+70-    # For samples with existing response, check if they're complete
+71-    if sample.status == Sample.Status.COMPLETED or sample.status == Sample.Status.TRUNCATED:
+72-        assert sample.response is not None
+73-        if not args.group_rm:
+74-            assert sample.reward is not None
+75-        return sample
+76-
+77-    # dashboard lifecycle probe: the semaphore wait is the queue; attempt_end fires before reward
+78-    sink = None if evaluation else TrajectoryLifecycle().sink
+79-    if sink is not None:
+80-        sink.attempt_start(sample)
+81-
+82-    # generate
+83-    log_prefix = f"[sample={getattr(sample, 'index', '?')}]"
+84-    logger.debug(f"{log_prefix} Waiting for semaphore...")
+85-    try:
+86-        async with state.generate_fn_semaphore:
+87-            if state.aborted:
+88-                sample.status = Sample.Status.ABORTED
+89-                return sample
+90-
+91-            logger.debug(f"{log_prefix} Acquired semaphore, calling generate_function")
+92-            if sink is not None:
+93-                sink.gen_start(sample)
+94-            # per-sample override, e.g. an eval dataset naming its own generate function
+95-            generate_fn = load_generate_function(sample.generate_function_path) or state.generate_function
+96-            output = await generate_fn(
+97-                GenerateFnInput(
+98-                    state=state,
+99-                    sample=sample,
+100-                    sampling_params=deepcopy(sampling_params),
+101-                    evaluation=evaluation,
+102-                )
+103-            )
+104-            sample = output.samples
+105-            logger.debug(f"{log_prefix} generate_function returned")
+106-    finally:
+107-        if sink is not None:
+108-            sink.attempt_end(sample)
+109-
+110-    # TODO change to `if not args.group_rm: do reward model` for more clarity after the refactor below

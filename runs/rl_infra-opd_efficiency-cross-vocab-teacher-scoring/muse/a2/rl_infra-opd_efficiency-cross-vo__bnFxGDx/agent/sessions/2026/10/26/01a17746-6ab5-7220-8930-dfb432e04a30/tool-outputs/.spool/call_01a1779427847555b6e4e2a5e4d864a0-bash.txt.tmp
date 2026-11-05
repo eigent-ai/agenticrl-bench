@@ -1,0 +1,59 @@
+total 75
+drwxr-xr-x 1 agent agent   100 Oct 26 09:06 .
+drwxr-xr-x 1 agent agent    60 Oct 26 08:43 ..
+-rw-r--r-- 1 agent agent  1511 Oct 20 18:03 agent.py
+-rw-r--r-- 1 agent agent     0 Oct 20 18:03 __init__.py
+-rw-r--r-- 1 agent agent  1094 Oct 20 18:03 LICENSE.mini-swe-agent.md
+-rw-r--r-- 1 agent agent  8274 Oct 20 18:03 mini_swe_agent.py
+-rw-r--r-- 1 agent agent  5696 Oct 20 18:03 mini_textbased.yaml
+-rw-r--r-- 1 agent agent  3011 Oct 26 08:45 reward.py
+-rw-r--r-- 1 agent agent 47961 Oct 26 09:20 teacher_scoring.py
+-rw-rw-r-- 1 agent agent  6812 Oct 26 08:56 test_teacher_scoring.py
+---
+# Cross-family OPD teacher scoring: findings and changes
+
+What was wrong with the ported slime #2032 code on our episodes:
+
+- It rendered only the prompt before the first assistant turn with the teacher template and appended
+  `sample.response` verbatim, so every later turn was scored in the student's ChatML/think/tool-XML format,
+  with the student's special tokens as plain text for other families. It sent `text` (server re-tokenizes;
+  prompt-length slicing breaks with BOS-adding tokenizers and boundary merges), and its 1:1 token-text
+  alignment dropped every split token and derailed on split UTF-8. Any YAML naming a teacher tokenizer
+  also routed same-tokenizer teachers (Qwen3.5-9B) through it.
+
+What the hooks do now (`examples/terminal_opd/teacher_scoring.py`, `reward.py`):
+
+- Same-tokenizer detection from the tokenizers themselves (backend/vocab fingerprint, chat template
+  excluded): such teachers keep the legacy `sample.tokens` path exactly, even with a teacher YAML.
+- Otherwise each assistant turn is scored once in the conversation as the teacher would see it at that
+  turn: teacher template render of the prefix with a generation prompt (YAML chat-template kwargs and
+  tools applied) plus the turn as that template renders it (think wrapper, native tool-call
+  serialisation, turn end) — per turn, because whole-transcript renders drop all but the last turn's
+  reasoning. Sent as teacher `input_ids` with `logprob_start_len` at the turn. Render fallbacks
+  (JSON-string arguments, tool-as-user, merged system, ...) cover templates without a system/tool surface.
+- Log-probs are mapped back in byte space: student writing (reasoning, content, tool name/keys/values,
+  line-level fallback when a template reinterprets text, identical scaffolding/EOS) is located in both
+  token streams; shared spans are split at common token boundaries, a student token the teacher
+  partitions gets the summed teacher log-prob, and boundary-crossing groups share their summed teacher
+  log-prob by byte length (group KL totals preserved). Anything the teacher cannot judge (dropped or
+  re-serialised text, unrenderable turns, missing messages, teacher failures) keeps the student rollout
+  log-prob, i.e. zero reverse-KL delta. A focused test lives in `test_teacher_scoring.py` next to the hooks.
+
+Checks: full fake-teacher replays (Qwen3-8B think/no-think, Falcon) over all three dumps, exact-equality
+of the Qwen3.5-9B YAML path against the legacy no-YAML path, and an independent oracle recomputation of
+boundary-aligned tokens. Live run `20261026T092642Z-c6967a78` (Falcon-H1R-7B, kept): replay signal on
+trained tokens 98.4% (mswea), 98.5% (terminus_think), 57.4% (sql — the rest is student-only tool-call
+scaffolding; tool names/values are ~96–100% covered), and the Miles OPD step completed (rc 0, mean
+reverse KL 0.485). SQL coverage is bounded by format, not by content: student `<parameter=...>` XML
+tokens have no counterpart in the teachers' JSON calls and correctly get no signal.
+---
+[run 09:26:42] snapshot of /app/miles
+[run 09:26:52] replay mswea (48 episodes)
+mswea: ok in 93s, 48/48 samples usable; trained tokens 227681, with teacher signal 224078 (0.984); mean(student-teacher) on them 0.434
+[run 09:28:32] replay terminus_think (32 episodes)
+terminus_think: ok in 100s, 32/32 samples usable; trained tokens 196765, with teacher signal 193772 (0.985); mean(student-teacher) on them 0.592
+[run 09:30:18] replay sql (64 episodes)
+sql: ok in 19s, 64/64 samples usable; trained tokens 28608, with teacher signal 16409 (0.574); mean(student-teacher) on them 0.512
+[run 09:30:45] Miles OPD step on 144 episodes (Qwen3.5-2B, colocated)
+Miles OPD step: done (rc 0, 144 samples, mean reverse KL 0.485)
+[run 09:38:52] run 20261026T092642Z-c6967a78 kept (code digest b3cdcad0a021ab16)

@@ -1,0 +1,187 @@
+Read text file `/opt/miles/examples/experimental/swe-agent-harbor-daytona/README.md`.
+1|# SWE-Agent training with Harbor on Daytona sandboxes
+2|
+3|This example trains GLM-4.7-Flash on agentic terminal and coding tasks, with
+4|task sandboxes hosted on [Daytona](https://www.daytona.io/) instead of local
+5|Docker. Miles runs synchronous GRPO and serves the policy through its session
+6|server; a Harbor agent server drives the agent and returns verifier rewards.
+7|It is meant to run on a single node of 8 H200 GPUs.
+8|
+9|It is the `examples/swe-agent-harbor-docker` pipeline with two changes:
+10|
+11|- **Daytona sandboxes.** The agent-server host needs outbound HTTPS but no
+12|  Docker daemon, no local image builds, and no local disk for task images. This
+13|  is the practical option when the trainer runs on a GPU node where you cannot
+14|  or do not want to run Docker-in-Docker.
+15|- **terminus-2 agent.** terminus-2 runs as a host process and calls the model
+16|  endpoint itself, rather than from inside the sandbox, so the model endpoint
+17|  must be reachable from the agent-server host.
+18|
+19|Everything else — TITO, the session server, GRPO, the reward path — is identical
+20|to `examples/swe-agent-harbor-docker`, and so is the trainer side: this example has no
+21|launcher of its own and runs `examples/swe-agent-harbor-docker/run.py` unchanged. Daytona is
+22|selected entirely by the agent server's environment, which the trainer never
+23|sees.
+24|
+25|## Files
+26|
+27|| File | Purpose |
+28|| --- | --- |
+29|| `launch_agent_server.sh` | Starts the Harbor agent server in Daytona mode. |
+30|
+31|## 1. Provision Daytona
+32|
+33|Create an API key in the Daytona dashboard and export it on the agent-server
+34|host:
+35|
+36|```bash
+37|export DAYTONA_API_KEY=<your-daytona-api-key>
+38|```
+39|
+40|Daytona accounts have a total-disk quota, so keep concurrent sandboxes times
+41|`HARBOR_DAYTONA_DISK_GB` under it.
+42|
+43|## 2. Start the Harbor agent server
+44|
+45|Use the `harbor-miles-v0.20.0` branch of `harbor-framework/harbor`, which
+46|carries the Miles integration:
+47|
+48|```bash
+49|git clone https://github.com/harbor-framework/harbor.git
+50|cd harbor
+51|git checkout harbor-miles-v0.20.0
+52|uv sync
+53|
+54|export DAYTONA_API_KEY=<your-daytona-api-key>
+55|export HARBOR_TASKS_DIR=/path/to/harbor_tasks
+56|export TRIALS_DIR=/path/to/trials
+57|bash /path/to/miles/examples/experimental/swe-agent-harbor-daytona/launch_agent_server.sh
+58|```
+59|
+60|`HARBOR_TASKS_DIR` must contain one Harbor task directory for every
+61|`metadata.instance_id` in the training data; a missing directory makes the trial
+62|score 0 rather than raise. Set `--max-concurrent` to at least one sandbox per
+63|trajectory in a rollout step (`--rollout-batch-size` times
+64|`--n-samples-per-prompt`). Keep the agent timeout generous — agentic trials
+65|routinely run past an hour.
+66|
+67|Run the agent server under a process supervisor or a detached terminal
+68|multiplexer on its own host, not in a foreground shell over SSH: if that shell
+69|dies it takes the agent server and every live sandbox with it, and the trainer
+70|then starves without an obvious error.
+71|
+72|Verify `http://<agent-server>:11000/health` before launching Miles.
+73|
+74|## 3. Prepare data
+75|
+76|`examples/swe-agent-harbor-docker/download_and_process_data.py` converts a local JSONL into
+77|Miles format. For terminus-2, set the agent name accordingly:
+78|
+79|```bash
+80|python examples/swe-agent-harbor-docker/download_and_process_data.py \
+81|    --input /path/to/terminal-bench.jsonl \
+82|    --output /path/to/tb2_train.jsonl \
+83|    --agent-name terminus-2 \
+84|    --prompt-key instruction
+85|```
+86|
+87|## 4. Launch training
+88|
+89|The shape below is what a multi-day Terminal-Bench 2 run used, with the agent
+90|server colocated on the same host as the trainer:
+91|
+92|```bash
+93|export WANDB_API_KEY=<your-wandb-key>
+94|
+95|python examples/swe-agent-harbor-docker/run.py \
+96|    --num-nodes 1 \
+97|    --num-gpus-per-node 8 \
+98|    --skip-prepare \
+99|    --megatron-path /root/Megatron-LM \
+100|    --hf-checkpoint /path/to/GLM-4.7-Flash \
+101|    --ref-load /path/to/GLM-4.7-Flash_torch_dist \
+102|    --save-dir /path/to/checkpoints \
+103|    --prompt-data /path/to/tb2_train.jsonl \
+104|    --max-seq-len 65536 \
+105|    --rollout-batch-size 4 \
+106|    --n-samples-per-prompt 8 \
+107|    --global-batch-size 32 \
+108|    --num-rollout 200 \
+109|    --save-interval 10 \
+110|    --agent-server-url http://127.0.0.1:11000 \
+111|    --session-server-external-host <trainer-address-reachable-from-agent-server> \
+112|    --save-traces-dir /path/to/traces \
+113|    --wandb-project <your-wandb-project>
+114|```
+115|
+116|For a smoke test, set `--num-rollout 1`.
+117|
+118|`--session-server-external-host` is the address the agent server uses to reach
+119|the Miles session server: the driver builds the base URL handed to the agent
+120|from it and keeps the session servers on the head node. It only has to resolve from
+121|the agent-server host, so a hostname is fine — use one when the agent server
+122|reaches the trainer over a tailnet or other overlay. Do not confuse it with
+123|`--miles-host-ip`, which is bound locally on the trainer and must be an address
+124|that already exists on one of its interfaces. Ports 30000 and 31000 must be
+125|reachable from the agent-server host. On a multi-node job see the network note
+126|in [the docker recipe](../../swe-agent-harbor-docker/README.md).
+127|
+128|## Sizing the per-turn response cap
+129|
+130|`--rollout-max-response-len` and the agent server's `AGENT_MAX_OUTPUT_TOKENS`
+131|both cap a **single turn**, not the whole trajectory. Agentic trajectories are
+132|routinely several times longer than one turn, so a cap that looks generous
+133|against `--max-seq-len` can still abort most trials.
+134|
+135|When a turn exceeds the cap, `HARBOR_RESPONSE_LENGTH_POLICY=abort` ends the
+136|trial and **none of that turn's tool calls are performed**, so the trial scores
+137|0 and dilutes its GRPO group. The symptoms are
+138|`SingleTurnMaxSeqLenExceededError` and `ContextLengthExceededError` in the trial
+139|exception files, with `rollout/truncated_ratio` well above 0.
+140|
+141|To size these, compare `rollout/response_len/mean` and `rollout/response_len/max`
+142|against the cap, and keep `AGENT_MAX_INPUT_TOKENS` above the largest observed
+143|context.
+144|`--max-seq-len 65536` leaves plenty of headroom to raise both.
+145|
+146|`examples/swe-agent-harbor-docker/run.py` hardcodes `--rollout-max-response-len 8192`, so raise
+147|it there; `AGENT_MAX_OUTPUT_TOKENS` is an environment variable on the agent
+148|server and is set in `launch_agent_server.sh`. Raise the two together — leaving
+149|either one behind reintroduces the aborts.
+150|
+151|## Verify progress
+152|
+153|Read `rollout/raw_reward` for the task solve rate. `rollout/rewards` is the
+154|GRPO-centered advantage and sits near zero by construction, so it never shows
+155|learning.
+156|
+157|Two properties of this shape make per-step reward misleading:
+158|
+159|- With `--rollout-batch-size 4` there are only 4 GRPO groups per step. Uniform
+160|  groups (all solved or all failed) contribute no gradient, and which 4 tasks
+161|  were drawn dominates the step reward. Judge progress on repeated tasks across
+162|  many batches, never on consecutive steps.
+163|- A long run's headline health number is the fraction of trials that return
+164|  successfully, not the reward. Census the trial directories under
+165|  `--trials-dir` by outcome: no `exception.txt` means success, and the last
+166|  exception class named in that file is the failure mode. Key the census on the
+167|  **trial start time** — the mtime of the trial's `config.json`, written at
+168|  launch — because writing `exception.txt` bumps the directory mtime and makes
+169|  any mtime-sorted listing look like everything is failing.
+170|
+171|Confirm a suspected stall on disk before believing a dashboard. W&B uploads can
+172|fail partway through a long run, dropping some metric rows while others keep
+173|arriving, which looks exactly like a frozen reward curve. The per-step
+174|`train_data/<step>` and `rollout_data/<step>.pt` dumps under `--save-traces-dir`
+175|are written by the trainer itself and are authoritative.
+176|
+177|## Troubleshooting
+178|
+179|| Symptom | Cause |
+180|| --- | --- |
+181|| `DaytonaValidationError` on sandbox create | Daytona disk quota exhausted. |
+182|| `EnvironmentStartTimeoutError` in bursts | Sandbox creation is slow because the account is near its disk quota. |
+183|| `SingleTurnMaxSeqLenExceededError` | Per-turn output cap too low; see the sizing section. |
+184|| `ContextLengthExceededError` | `AGENT_MAX_INPUT_TOKENS` below the observed context length. |
+185|| sgl-router fails to bind | `--miles-host-ip` is not an address the trainer host can bind; leave it unset to auto-detect. |
+186|| Every trial scores 0 | `metadata.instance_id` values have no matching directory under `HARBOR_TASKS_DIR`. |

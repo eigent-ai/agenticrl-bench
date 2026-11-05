@@ -1,0 +1,351 @@
+"""Capability flags describing what an environment type can do.
+
+Feature capabilities (``EnvironmentCapabilities``) are exposed via
+``BaseEnvironment.capabilities``. Resource policy capabilities
+(``EnvironmentResourceCapabilities``) are declared on each environment class
+via ``resource_capabilities()`` and used for job preflight and trial validation.
+"""
+
+from pydantic import BaseModel
+
+
+class EnvironmentCapabilities(BaseModel):
+    stream: bool = False
+    """Whether the environment supports SSH execution and TCP forwarding for stream mode."""
+
+    gpus: bool = False
+    """Whether the environment can allocate GPUs to containers."""
+
+    tpus: bool = False
+    """Whether the environment can allocate TPUs to containers."""
+
+    disable_internet: bool = False
+    """Whether the environment can run containers without internet access."""
+
+    network_allowlist: bool = False
+    """Whether the environment can restrict egress to configured allowlist entries."""
+
+    network_allowlist_hostnames: bool = False
+    """Whether network allowlists can contain exact hostnames."""
+
+    network_allowlist_wildcard_hostnames: bool = False
+    """Whether network allowlists can contain leading-wildcard hostnames."""
+
+    network_allowlist_ipv4_addresses: bool = False
+    """Whether network allowlists can contain IPv4 address literals."""
+
+    network_allowlist_ipv6_addresses: bool = False
+    """Whether network allowlists can contain IPv6 address literals."""
+
+    network_allowlist_ipv4_cidrs: bool = False
+    """Whether network allowlists can contain IPv4 CIDR ranges."""
+
+    network_allowlist_ipv6_cidrs: bool = False
+    """Whether network allowlists can contain IPv6 CIDR ranges."""
+
+    dynamic_network_policy: bool = False
+    """Whether the environment can change network policy after start.
+
+    This is the provider contract for switching the active NetworkPolicy between
+    execution phases in a long-lived environment. Providers that set this must
+    implement BaseEnvironment.set_network_policy.
+    """
+
+    windows: bool = False
+    """Whether the environment can run Windows containers."""
+
+    mounted: bool = False
+    """Whether the environment mounts log directories as host filesystems."""
+
+    docker_compose: bool = False
+    """Whether the environment can run Docker Compose task environments.
+
+    Compose-capable providers must also support per-service operations
+    (exec/copy/stop on individual compose services), which sidecar artifact
+    collection and verifier collect hooks rely on.
+    """
+
+
+class EnvironmentResourceCapabilities(BaseModel):
+    cpu_limit: bool = False
+    """Whether CPU resources can be applied as a hard ceiling."""
+
+    cpu_request: bool = False
+    """Whether CPU resources can be applied as a resource request/reservation."""
+
+    memory_limit: bool = False
+    """Whether memory resources can be applied as a hard ceiling."""
+
+    memory_request: bool = False
+    """Whether memory resources can be applied as a resource request/reservation."""
+238:        self._validate_network_policy_support()
+239-        self._validate_windows_support()
+240-
+241-    @cached_property
+242-    def environment_id(self) -> str:
+243-        """Stable content identity for this environment definition.
+244-
+245-        Use this when linking, caching, or tagging a specific environment
+246-        build across systems. Use ``environment_name`` for the human-readable
+247-        task/environment handle.
+248-        """
+249-        return environment_content_hash(
+250-            self.environment_dir,
+251-            docker_image=self.task_env_config.docker_image,
+252-        )
+253-
+254-    @staticmethod
+255-    def _normalize_extra_docker_compose_paths(
+256-        paths: Sequence[Path | str] | None,
+257-    ) -> list[Path]:
+258-        normalized: list[Path] = []
+259-        for raw_path in paths or []:
+260-            path = Path(raw_path).expanduser()
+261-            if not path.is_file():
+262-                raise FileNotFoundError(f"Extra Docker Compose file not found: {path}")
+263-            normalized.append(path.resolve())
+264-        return normalized
+265-
+266-    @property
+267:    def network_policy(self) -> NetworkPolicy:
+268-        return self._network_policy
+269-
+270-    @property
+271:    def _network_disabled(self) -> bool:
+272-        return self._network_policy.network_mode == NetworkMode.NO_NETWORK
+273-
+274-    @property
+275:    def _network_is_public(self) -> bool:
+276-        return self._network_policy.network_mode == NetworkMode.PUBLIC
+277-
+278-    @property
+279:    def _network_is_allowlist(self) -> bool:
+280-        return self._network_policy.network_mode == NetworkMode.ALLOWLIST
+281-
+282-    @property
+283-    def _uses_compose(self) -> bool:
+284-        return False
+285-
+286-    def _validate_extra_docker_compose_support(self):
+287-        if self.extra_docker_compose_paths and not self.capabilities.docker_compose:
+288-            raise ValueError(
+289-                f"{self.type()} environment does not support --extra-docker-compose."
+290-            )
+291-
+292-    def _maybe_resolve_task_env(self):
+293-        if self.task_env_config.env and not self._uses_compose:
+294-            resolved = resolve_env_vars(self.task_env_config.env)
+295-            self._persistent_env = {**resolved, **self._persistent_env}
+296-
+297-    def _startup_env(self) -> dict[str, str]:
+298-        """Return task and trial environment variables for sandbox creation."""
+299-        task_env = (
+300-            resolve_env_vars(self.task_env_config.env)
+301-            if self.task_env_config.env
+302-            else {}
+303-        )
+304-        return {**task_env, **self._persistent_env}
+305-
+306-    def _maybe_override_task_env_config(self):
+307-        if self._override_cpus is not None:
+308-            self.task_env_config.cpus = self._override_cpus
+309-        if self._override_memory_mb is not None:
+310-            self.task_env_config.memory_mb = self._override_memory_mb
+311-        if self._override_storage_mb is not None:
+312-            self.task_env_config.storage_mb = self._override_storage_mb
+313-        if self._override_gpus is not None:
+314-            self.task_env_config.gpus = self._override_gpus
+315-        if self._override_tpu is not None:
+316-            # tpu is a single TpuSpec; there is no "clear" sentinel here
+317-            # (we deliberately do not overload None to mean both "no
+318-            # override" and "clear" — see EnvironmentConfig.tpu).
+319-            self.task_env_config.tpu = self._override_tpu
+320-
+321-    def _resource_mode(self, resource: Literal["cpu", "memory"]) -> ResourceMode:
+322-        return (
+323-            self._cpu_resource_mode if resource == "cpu" else self._memory_resource_mode
+324-        )
+325-
+326-    def _resource_value(self, resource: Literal["cpu", "memory"]) -> int | None:
+327-        if self._resource_mode(resource) == ResourceMode.IGNORE:
+328-            return None
+329-        if resource == "cpu":
+--
+809:    def validate_network_policy_support(
+810-        self, network_policy: NetworkPolicy | None = None
+811-    ) -> None:
+812-        """Validate that this provider can enforce a network policy."""
+813-        network_policy = network_policy or self._network_policy
+814-        if (
+815-            network_policy.network_mode == NetworkMode.NO_NETWORK
+816-            and not self.capabilities.disable_internet
+817-        ):
+818-            raise ValueError(
+819-                f"network_mode='no-network' is not supported by {self.type()} "
+820-                "environment. Environment providers must enforce the requested "
+821-                "network policy or reject the task."
+822-            )
+823-        if (
+824-            network_policy.network_mode == NetworkMode.ALLOWLIST
+825-            and not self.capabilities.network_allowlist
+826-        ):
+827-            raise ValueError(
+828-                f"network_mode='allowlist' is not supported by {self.type()} "
+829-                "environment. Environment providers must enforce the requested "
+830-                "network policy or reject the task."
+831-            )
+832-        if network_policy.network_mode != NetworkMode.ALLOWLIST:
+833-            return
+834-
+835-        allowlist_entry_types = {
+836-            classify_network_allowlist_entry(entry)
+837-            for entry in network_policy.allowed_hosts
+838-        }
+839-        entry_type_capabilities: dict[NetworkAllowlistEntryType, tuple[str, bool]] = {
+840-            NetworkAllowlistEntryType.HOSTNAME: (
+841-                "hostnames",
+842-                self.capabilities.network_allowlist_hostnames,
+843-            ),
+844-            NetworkAllowlistEntryType.WILDCARD_HOSTNAME: (
+845-                "wildcard hostnames",
+846-                self.capabilities.network_allowlist_wildcard_hostnames,
+847-            ),
+848-            NetworkAllowlistEntryType.IPV4_ADDRESS: (
+849-                "IPv4 addresses",
+850-                self.capabilities.network_allowlist_ipv4_addresses,
+851-            ),
+852-            NetworkAllowlistEntryType.IPV6_ADDRESS: (
+853-                "IPv6 addresses",
+854-                self.capabilities.network_allowlist_ipv6_addresses,
+855-            ),
+856-            NetworkAllowlistEntryType.IPV4_CIDR: (
+857-                "IPv4 CIDR ranges",
+858-                self.capabilities.network_allowlist_ipv4_cidrs,
+859-            ),
+--
+873:    def _validate_network_policy_support(self):
+874-        """Validate that this provider can enforce the requested network policy."""
+875-        self.validate_network_policy_support()
+876-        for network_policy in self._phase_network_policies:
+877-            self.validate_network_policy_support(network_policy)
+878-
+879:    async def set_network_policy(self, network_policy: NetworkPolicy) -> None:
+880-        """Switch the active runtime network policy for this environment."""
+881-        self.validate_network_policy_support(network_policy)
+882-        if network_policy == self._network_policy:
+883-            return
+884-        if not self.capabilities.dynamic_network_policy:
+885-            raise ValueError(
+886-                f"{self.type()} environment cannot change network policy after start."
+887-            )
+888-        await self._apply_network_policy(network_policy)
+889-        self._network_policy = network_policy
+890-
+891:    async def _apply_network_policy(self, network_policy: NetworkPolicy) -> None:
+892-        raise NotImplementedError(
+893-            f"{self.type()} environment advertises dynamic_network_policy but does "
+894-            "not implement runtime network policy switching."
+895-        )
+896-
+897-    def _validate_windows_support(self):
+898-        """
+899-        Validate that the target OS is supported by this environment.
+900-
+901-        Raises:
+902-            RuntimeError: If the task targets Windows but the environment
+903-                cannot run Windows containers.
+904-        """
+905-        if self.task_env_config.os == TaskOS.WINDOWS and not self.capabilities.windows:
+906-            raise RuntimeError(
+907-                f"Task declares [environment].os = 'windows' but the "
+            raise RuntimeError("Trial result accessed before initialization")
+        return self._result
+
+    @staticmethod
+    def _now() -> datetime:
+        return datetime.now(timezone.utc)
+
+    def _network_plan(
+        self,
+        step_cfg: StepConfig | None = None,
+        *,
+        env_config: EnvironmentConfig | None = None,
+    ) -> TrialNetworkPlan:
+        verifier_mode = (
+            resolve_step_verifier_mode(self.task.config, step_cfg)
+            if step_cfg is not None
+            else resolve_task_verifier_mode(self.task.config)
+        )
+        if env_config is not None:
+            verifier_mode = VerifierEnvironmentMode.SEPARATE
+        return resolve_trial_network_plan(
+            self.task.config,
+            self.config.agent,
+            self.config.environment,
+            step_cfg,
+            verifier_mode=verifier_mode,
+            env_config=env_config,
+        )
+
+    def _validate_network_policy_modes(self) -> None:
+        """Reject phase policies that require unsupported dynamic switching."""
+        if not self.task.config.steps:
+            self._validate_network_plan(self._network_plan(None), label="[agent]")
+            return
+
+        for step in self.task.config.steps:
+            self._validate_network_plan(
+                self._network_plan(step),
+                label=f"Step {step.name!r}",
+            )
+
+    def _validate_network_plan(
+        self,
+        plan: TrialNetworkPlan,
+        *,
+        label: str,
+    ) -> None:
+        if plan.agent_phase != plan.agent_env_baseline:
+            self._validate_dynamic_phase_switch(
+                self.agent_environment,
+                phase=plan.agent_phase,
+                phase_label=f"{label} agent phase",
+                environment_label="agent environment",
+            )
+
+        if plan.verifier_phase != plan.verifier_phase_baseline:
+            if plan.verifier_env_baseline is None:
+                self._validate_dynamic_phase_switch(
+                    self.agent_environment,
+                    phase=plan.verifier_phase,
+                    phase_label=f"{label} verifier phase",
+                    environment_label="agent environment",
+                )
+
+    def _validate_dynamic_phase_switch(
+        self,
+        environment: BaseEnvironment,
+        *,
+        phase: NetworkPolicy,
+        phase_label: str,
+        environment_label: str,
+    ) -> None:
+        environment.validate_network_policy_support(phase)
+        if not environment.capabilities.dynamic_network_policy:
+            raise ValueError(
+                f"{phase_label} network policy differs from the {environment_label} "
+                "baseline, but this environment cannot change network policy after "
+                "start."
+            )
+
+    def _validate_separate_verifier_env_policies(
+        self,
+        environment: BaseEnvironment,
+        *,
+        plan: TrialNetworkPlan,
+    ) -> None:
+        if plan.verifier_env_baseline is None:
+            raise RuntimeError(
+                "separate verifier env validation requires a verifier baseline"
+            )
+        environment.validate_network_policy_support(plan.verifier_env_baseline)

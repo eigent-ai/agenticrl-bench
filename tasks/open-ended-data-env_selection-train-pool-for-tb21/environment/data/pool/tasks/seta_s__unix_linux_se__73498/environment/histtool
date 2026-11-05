@@ -1,0 +1,46 @@
+#!/bin/bash
+# histtool - Bash history management utility
+#
+# Subcommands:
+#   dedup [FILE]           Remove duplicate commands, keeping last occurrence
+#   recent [N] [FILE]      Show N most recent unique commands (default: 10)
+#   search PATTERN [FILE]  Show commands matching PATTERN
+
+_default_hist="${HOME}/.bash_history"
+
+_dedup() {
+    local file="${1:-$_default_hist}"
+    if [[ ! -f "$file" ]]; then
+        echo "histtool: file not found: $file" >&2
+        return 1
+    fi
+    awk '!seen[$0]++' "$file"
+}
+
+_recent() {
+    local n="${1:-10}"
+    local file="${2:-$_default_hist}"
+    _dedup "$file" | head -n "$n"
+}
+
+_search() {
+    local pattern="$1"
+    local file="${2:-$_default_hist}"
+    if [[ -z "$pattern" ]]; then
+        echo "histtool: search requires a pattern" >&2
+        return 1
+    fi
+    _dedup "$file" | grep -- "$pattern"
+}
+
+case "${1:-}" in
+    dedup)  _dedup "${2:-}" ;;
+    recent) _recent "${2:-10}" "${3:-}" ;;
+    search) _search "${2:-}" "${3:-}" ;;
+    *)
+        echo "Usage: histtool <dedup|recent|search> [args]"
+        echo "  dedup [FILE]           Remove duplicates, keeping last occurrence"
+        echo "  recent [N] [FILE]      Show N most recent unique commands"
+        echo "  search PATTERN [FILE]  Show commands matching PATTERN"
+        ;;
+esac

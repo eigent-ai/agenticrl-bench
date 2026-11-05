@@ -1,0 +1,99 @@
+edited
+changed lines: lines 8-43
+--- original
++++ updated
+@@
+-import os
+-import re
+-import subprocess
+-import time
+-import signal
+-
+-
+-# ---------------------------------------------------------------------------
+-# Helpers
+-# ---------------------------------------------------------------------------
+-
+-def _start_xorg(display_num: int, timeout: float = 10.0):
+-    """Start Xorg with the dummy driver on *display_num* and wait until ready."""
+-    lock = f"/tmp/.X{display_num}-lock"
+-    if os.path.exists(lock):
+-        try:
+-            os.remove(lock)
+-        except OSError:
+-            pass
+-
+-    proc = subprocess.Popen(
+-        ["Xorg", f":{display_num}", "-config", "/etc/X11/xorg-dummy.conf",
+-         "-noreset", "-ac"],
+-        stdout=subprocess.DEVNULL,
+-        stderr=subprocess.DEVNULL,
+-    )
+-
+-    deadline = time.time() + timeout
+-    while time.time() < deadline:
+-        if os.path.exists(lock):
+-            time.sleep(0.5)
+-            return proc
+-        time.sleep(0.2)
+-
+-    time.sleep(2)
+-    return proc
++import os
++import re
++import socket
++import subprocess
++import time
++import signal
++
++
++# ---------------------------------------------------------------------------
++# Helpers
++# ---------------------------------------------------------------------------
++
++def _display_ready(display_num: int) -> bool:
++    """True once the X server on *display_num* accepts a connection."""
++    path = f"/tmp/.X11-unix/X{display_num}"
++    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
++    try:
++        sock.settimeout(1)
++        sock.connect(path)
++        return True
++    except OSError:
++        return False
++    finally:
++        sock.close()
++
++
++def _start_xorg(display_num: int, timeout: float = 60.0):
++    """Start Xorg with the dummy driver on *display_num* and wait until ready.
++
++    Readiness is probed on the X socket, not guessed from the lock file
++    plus a fixed sleep: the lock appears before the server accepts
++    clients, and under host contention the gap outlasts a sub-second
++    sleep. If Xorg exits or never comes up, return the process anyway
++    and let the calling test's client command report the failure.
++    """
++    lock = f"/tmp/.X{display_num}-lock"
++    if os.path.exists(lock):
++        try:
++            os.remove(lock)
++        except OSError:
++            pass
++
++    proc = subprocess.Popen(
++        ["Xorg", f":{display_num}", "-config", "/etc/X11/xorg-dummy.conf",
++         "-noreset", "-ac"],
++        stdout=subprocess.DEVNULL,
++        stderr=subprocess.DEVNULL,
++    )
++
++    deadline = time.monotonic() + timeout
++    while time.monotonic() < deadline:
++        if _display_ready(display_num):
++            return proc
++        if proc.poll() is not None:
++            return proc
++        time.sleep(0.2)
++
++    return proc

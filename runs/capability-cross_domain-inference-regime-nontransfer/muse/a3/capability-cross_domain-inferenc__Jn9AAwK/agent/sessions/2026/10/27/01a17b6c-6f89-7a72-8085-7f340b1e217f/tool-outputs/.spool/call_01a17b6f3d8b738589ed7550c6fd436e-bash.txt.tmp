@@ -1,0 +1,177 @@
+        if val is not None:
+            return int(rope_scaling_factor * val)
+    return 2048
+
+
+@lru_cache_frozenset(maxsize=32)
+def get_generation_config(
+    model: str,
+    trust_remote_code: bool,
+    revision: Optional[str] = None,
+    **kwargs,
+):
+    try:
+        return GenerationConfig.from_pretrained(
+            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+        )
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        logger.warning(
+            "Failed to load generation config for %s: %s. "
+            "Proceeding without generation config.",
+            model,
+            e,
+        )
+        return None
+
+
+# Qwen-1M related
+def get_sparse_attention_config(
+    model: str,
+    sparse_attention_config_filename: str = "sparse_attention_config.json",
+) -> Dict[str, Any]:
+    is_local = os.path.isdir(model)
+    if not is_local:
+        model = download_from_hf(model, allow_patterns=["*.json"])
+
+    config_file = os.path.join(model, sparse_attention_config_filename)
+    if not os.path.exists(config_file):
+        return {}
+
+    with open(config_file) as f:
+        config = json.load(f)
+    return config
+
+
+        if not tail_str:
+            return False
+
+        for stop_str in self.sampling_params.stop_strs:
+            if not stop_str:
+                continue
+            # Check if stop_str is contained in tail_str (fastest check first)
+            if stop_str in tail_str:
+                return True
+
+            # Check if tail_str suffix matches stop_str prefix
+            # Only check if stop_str is not empty, it's for stream output
+            min_len = min(len(tail_str), len(stop_str))
+            for i in range(1, min_len + 1):
+                if tail_str[-i:] == stop_str[:i]:
+                    return True
+
+        return False
+
+    def _check_token_based_finish(self, new_accepted_tokens: List[int]) -> bool:
+        if self.sampling_params.ignore_eos:
+            return False
+
+        # Check stop token ids
+        matched_eos = False
+
+        for i, token_id in enumerate(new_accepted_tokens):
+            if self.sampling_params.stop_token_ids:
+                matched_eos |= token_id in self.sampling_params.stop_token_ids
+            if self.eos_token_ids:
+                matched_eos |= token_id in self.eos_token_ids
+            if self.tokenizer is not None:
+                matched_eos |= token_id == self.tokenizer.eos_token_id
+                if self.tokenizer.additional_stop_token_ids:
+                    matched_eos |= token_id in self.tokenizer.additional_stop_token_ids
+            if matched_eos:
+                self.finished_reason = FINISH_MATCHED_TOKEN(matched=token_id)
+                matched_pos = len(self.output_ids) - len(new_accepted_tokens) + i
+                self.finished_len = matched_pos + 1
+                return True
+
+        return False
+
+    def _locate_str_stop_finished_len(
+        self,
+        new_accepted_len: int,
+        *,
+        stop_str: Optional[str] = None,
+        stop_regex: Optional[str] = None,
+    ) -> int:
+        """Map a matched stop string/regex to output_ids length (stop included)."""
+
+        def matched(text: str) -> bool:
+            if stop_str is not None:
+                return stop_str in text
+            return re.search(stop_regex, text) is not None
+
+        tail_len = self._stop_match_tail_len(new_accepted_len)
+        start = len(self.output_ids) - tail_len
+        token_window = self.output_ids[start:]
+
+        # Old prefixes were checked in the previous step.
+        for token_count in range(
+            max(1, len(token_window) - new_accepted_len + 1), len(token_window)
+        ):
+            if matched(self.tokenizer.decode(token_window[:token_count])):
+                return start + token_count
+
+        # The full tail window is already known to match by the caller.
+        return len(self.output_ids)
+
+    def _check_str_based_finish(self, new_accepted_len: int = 1):
+        if (
+            len(self.sampling_params.stop_strs) > 0
+            or len(self.sampling_params.stop_regex_strs) > 0
+        ):
+            tail_str = self.tail_str(new_accepted_len)
+
+            # Check stop strings
+            if len(self.sampling_params.stop_strs) > 0:
+                for stop_str in self.sampling_params.stop_strs:
+                    stop_str_in_tail = stop_str in tail_str
+                    if stop_str_in_tail or stop_str in self.decoded_text:
+                        self.finished_reason = FINISH_MATCHED_STR(matched=stop_str)
+                        if stop_str_in_tail:
+                            self.finished_len = self._locate_str_stop_finished_len(
+                                new_accepted_len, stop_str=stop_str
+                            )
+                        return True
+
+            # Check stop regex
+            if len(self.sampling_params.stop_regex_strs) > 0:
+                for stop_regex_str in self.sampling_params.stop_regex_strs:
+                    if re.search(stop_regex_str, tail_str):
+                        self.finished_reason = FINISHED_MATCHED_REGEX(
+                            matched=stop_regex_str
+                        )
+                        self.finished_len = self._locate_str_stop_finished_len(
+                            new_accepted_len, stop_regex=stop_regex_str
+                        )
+                        return True
+
+        return False
+
+    def _check_vocab_boundary_finish(self, new_accepted_tokens: List[int] = None):
+        for i, token_id in enumerate(new_accepted_tokens):
+            if token_id >= self.vocab_size or token_id < 0:
+                offset = len(self.output_ids) - len(new_accepted_tokens) + i
+                if self.sampling_params.stop_token_ids:
+                    self.output_ids[offset] = next(
+                        iter(self.sampling_params.stop_token_ids)
+                    )
+                if self.eos_token_ids:
+                    self.output_ids[offset] = next(iter(self.eos_token_ids))
+                self.finished_reason = FINISH_MATCHED_STR(matched="NaN happened")
+                self.finished_len = offset + 1
+                return True
+
+        return False
+
+    def update_finish_state(self, new_accepted_len: int = 1):
+        if self.finished():
+            return
+
+        if self.to_finish:
+            self.finished_reason = self.to_finish
+            self.to_finish = None
+            return
+
+        if len(self.output_ids) >= self.sampling_params.max_new_tokens:
+            self.finished_reason = FINISH_LENGTH(

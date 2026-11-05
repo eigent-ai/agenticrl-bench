@@ -1,0 +1,223 @@
+Read text file `/opt/verl/verl/utils/groupwise.py`.
+1|# Copyright 2024 Bytedance Ltd. and/or its affiliates
+2|# Copyright 2023-2024 SGLang Team
+3|# Copyright 2025 ModelBest Inc. and/or its affiliates
+4|#
+5|# Licensed under the Apache License, Version 2.0 (the "License");
+6|# you may not use this file except in compliance with the License.
+7|# You may obtain a copy of the License at
+8|#
+9|#     http://www.apache.org/licenses/LICENSE-2.0
+10|#
+11|# Unless required by applicable law or agreed to in writing, software
+12|# distributed under the License is distributed on an "AS IS" BASIS,
+13|# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+14|# See the License for the specific language governing permissions and
+15|# limitations under the License.
+16|
+17|"""
+18|Group-wise helpers for RL training utilities.
+19|
+20|Public API:
+21|    - as_torch_index(index, device=None) -> torch.LongTensor
+22|    - group_mean_std(scores, gidx, eps=1e-6, device=None) -> (mean_g, std_g, count_g)
+23|
+24|Default device policy:
+25|    - If `device` is None:
+26|        * In pytest (detected by env "PYTEST_CURRENT_TEST"): use CPU.
+27|        * Else if CUDA is available: use CUDA.
+28|        * Else: use CPU.
+29|    - You can override via env "VERL_FORCE_DEVICE" (e.g., "cuda:0" / "cpu").
+30|
+31|Notes:
+32|- as_torch_index: canonicalizes arbitrary group labels to a contiguous 1-D torch.long
+33|  tensor in range [0..G-1]. Robust to torch/numpy/list/tuple, ints/floats/bools,
+34|  numeric strings, UUIDs, mixed object arrays. Near-integer floats (|x-round(x)|<=1e-6)
+35|  are rounded; otherwise factorization is applied.
+36|- group_mean_std: pure-PyTorch per-group mean/std with Bessel correction for variance
+37|  (denominator max(count-1, 1)). Singleton groups fallback to mean=0, std=1 for
+38|  compatibility with common “native” conventions.
+39|"""
+40|
+41|from __future__ import annotations
+42|
+43|import os
+44|from typing import Any, Optional
+45|
+46|import numpy as np
+47|import torch
+48|
+49|from verl.utils.device import get_device_name
+50|
+51|__all__ = ["as_torch_index", "group_mean_std"]
+52|
+53|
+54|def _resolve_device(explicit: Optional[torch.device | str]) -> torch.device:
+55|    """
+56|    Resolve device according to policy described in the module docstring.
+57|    Priority:
+58|      1) explicit argument
+59|      2) VERL_FORCE_DEVICE env
+60|      3) pytest detection -> cpu
+61|      4) cuda if available, else cpu
+62|    """
+63|    if explicit is not None:
+64|        return torch.device(explicit)
+65|
+66|    forced = os.getenv("VERL_FORCE_DEVICE")
+67|    if forced:
+68|        return torch.device(forced)
+69|
+70|    # Heuristic: pytest sets PYTEST_CURRENT_TEST
+71|    if "PYTEST_CURRENT_TEST" in os.environ:
+72|        return torch.device("cpu")
+73|
+74|    return torch.device(get_device_name())
+75|
+76|
+77|def _to_1d_numpy_object_array(x: Any) -> np.ndarray:
+78|    """Best-effort: convert arbitrary input into a 1-D numpy array; fallback to object dtype."""
+79|    try:
+80|        arr = np.asarray(x)
+81|    except Exception:
+82|        try:
+83|            arr = np.array(list(x), dtype=object)
+84|        except Exception:
+85|            arr = np.array([x], dtype=object)
+86|    if arr.ndim != 1:
+87|        arr = arr.reshape(-1)
+88|    return arr
+89|
+90|
+91|def as_torch_index(index: Any, device: torch.device | str | None = None) -> torch.Tensor:
+92|    """
+93|    Convert arbitrary group labels to a contiguous 1-D torch.long tensor (0..G-1).
+94|
+95|    Args:
+96|        index: Any iterable of labels or tensor/ndarray.
+97|        device: Target device; if None, resolved via _resolve_device().
+98|
+99|    Returns:
+100|        torch.LongTensor with shape (N,)
+101|    """
+102|    target = _resolve_device(device)
+103|
+104|    # ---------- Fast path: torch.Tensor ----------
+105|    if isinstance(index, torch.Tensor):
+106|        t = index.reshape(-1)
+107|        if t.dtype in (
+108|            torch.int64,
+109|            torch.int32,
+110|            torch.int16,
+111|            torch.int8,
+112|            getattr(torch, "uint8", torch.uint8),
+113|            torch.bool,
+114|        ):
+115|            return t.to(device=target, dtype=torch.long)
+116|
+117|        if t.dtype in (torch.float16, torch.float32, torch.float64, torch.bfloat16):
+118|            t64 = t.to(dtype=torch.float64)
+119|            rounded = torch.round(t64)
+120|            if torch.allclose(t64, rounded, rtol=0.0, atol=1e-6):
+121|                return rounded.to(device=target, dtype=torch.long)
+122|            arr = np.array([str(x.item()) for x in t], dtype=object)
+123|        else:
+124|            arr = np.array([str(x.item()) if hasattr(x, "item") else str(x) for x in t], dtype=object)
+125|
+126|    else:
+127|        # ---------- Non-torch: go through numpy ----------
+128|        arr = _to_1d_numpy_object_array(index)
+129|
+130|        # Pure integers (incl. bool)
+131|        if arr.dtype != object and np.issubdtype(arr.dtype, np.integer):
+132|            return torch.from_numpy(arr.astype(np.int64, copy=False)).to(device=target)
+133|
+134|        # Floats nearly equal to integers
+135|        if arr.dtype != object and np.issubdtype(arr.dtype, np.floating):
+136|            arr64 = arr.astype(np.float64, copy=False)
+137|            rounded = np.rint(arr64)
+138|            if np.allclose(arr64, rounded, rtol=0.0, atol=1e-6):
+139|                return torch.from_numpy(rounded.astype(np.int64)).to(device=target)
+140|            # fall through
+141|
+142|        # Try numeric string coercion
+143|        try:
+144|            coerced = arr.astype(np.int64)
+145|            return torch.from_numpy(coerced).to(device=target)
+146|        except Exception:
+147|            pass
+148|
+149|        if arr.dtype != object:
+150|            arr = arr.astype(object)
+151|
+152|    # ---------- Factorization (UUIDs / mixed types / arbitrary labels) ----------
+153|    try:
+154|        _, inv = np.unique(arr, return_inverse=True)
+155|    except Exception:
+156|        sarr = np.array([str(x) for x in arr], dtype=object)
+157|        _, inv = np.unique(sarr, return_inverse=True)
+158|
+159|    inv = inv.astype(np.int64, copy=False)
+160|    return torch.from_numpy(inv).to(device=target)
+161|
+162|
+163|@torch.no_grad()
+164|def group_mean_std(
+165|    scores: torch.Tensor,
+166|    gidx: torch.Tensor,
+167|    eps: float = 1e-6,
+168|    device: torch.device | str | None = None,
+169|) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+170|    """
+171|    Compute per-group mean/std/count in pure PyTorch.
+172|
+173|    mean_g = sum / count
+174|    std_g  = sqrt( max( (sum2 - sum^2/count) / max(count-1, 1), eps ) )
+175|
+176|    Singleton groups fallback to mean=0, std=1.
+177|
+178|    Args:
+179|        scores: (N,) float tensor.
+180|        gidx  : (N,) long/int tensor with group indices (0..G-1).
+181|        eps   : Numerical floor for variance.
+182|        device: Target device; if None, resolved via _resolve_device().
+183|
+184|    Returns:
+185|        mean_g: (G,) float32
+186|        std_g : (G,) float32
+187|        count : (G,) float32
+188|    """
+189|    target = _resolve_device(device)
+190|
+191|    scores = scores.reshape(-1).to(device=target, dtype=torch.float32)
+192|    gidx = gidx.reshape(-1).to(device=target, dtype=torch.long)
+193|
+194|    if scores.numel() != gidx.numel():
+195|        raise ValueError(f"scores and gidx length mismatch: {scores.numel()} vs {gidx.numel()}")
+196|
+197|    G = int(torch.max(gidx).item()) + 1 if gidx.numel() > 0 else 0
+198|    if G == 0:
+199|        # Return empty tensors on the selected device
+200|        empty = torch.empty(0, device=target, dtype=torch.float32)
+201|        return empty, empty, empty
+202|
+203|    ones = torch.ones_like(scores, dtype=torch.float32)
+204|
+205|    count = torch.zeros(G, device=target, dtype=torch.float32).index_add_(0, gidx, ones)
+206|    s1 = torch.zeros(G, device=target, dtype=torch.float32).index_add_(0, gidx, scores)
+207|    mean = s1 / count.clamp_min(1.0)
+208|    centered = scores - mean[gidx]
+209|    var_num = torch.zeros(G, device=target, dtype=torch.float32).index_add_(0, gidx, centered * centered)
+210|    denom = (count - 1.0).clamp_min(1.0)
+211|    var = var_num / denom
+212|    std = torch.sqrt(torch.clamp(var, min=eps))
+213|
+214|    # Singleton groups: mean=0, std=1
+215|    single = count <= 1.0
+216|    if torch.any(single):
+217|        mean = mean.clone()
+218|        std = std.clone()
+219|        mean[single] = 0.0
+220|        std[single] = 1.0
+221|
+222|    return mean, std, count

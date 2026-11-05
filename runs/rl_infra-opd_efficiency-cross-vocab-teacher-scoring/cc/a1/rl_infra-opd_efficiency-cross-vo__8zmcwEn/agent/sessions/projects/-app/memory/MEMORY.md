@@ -1,0 +1,2 @@
+- [Live run and testing](live-run-and-testing.md) — /opt/live/run.sh snapshots code and keeps the last run; test hooks without pytest
+- [Falcon template mismatch](falcon-template-mismatch.md) — Falcon-H1R-7B template vs model format; OPD KL spikes at EOS and after </think>

@@ -1,0 +1,105 @@
+ref {'Bearer fake-api-key', 'Bearer sk-test'}
+litellm-1.104.0 {'Bearer fake-api-key', 'Bearer sk-test'}
+litellm-1.99.2 {'Bearer fake-api-key', 'Bearer sk-test'}
+harbor-0.23.0 {'Bearer fake-api-key', 'Bearer sk-test'}
+1370:        self._patch_reasoning_skip_special_tokens(request)
+1371-
+1372-        thinking_mode = self._get_reasoning_from_request(request)
+1373-        # SGLang's ReasonerGrammarBackend owns the reasoning prefix
+1374-        # when --reasoning-parser is configured, so builtin xgrammar
+1375-        # tags must describe only the post-reasoning tool-call suffix.
+1376-        xgrammar_reasoning = thinking_mode and (self.reasoning_parser is None)
+1377-        tool_call_constraint = None
+1378-
+1379-        effective_tools = self._effective_tools(request)
+1380-        # Only tool-bearing requests get the full-assistant EBNF: its terminal
+1381-        # state finishes a request even under ignore_eos.
+1382-        glm_constraint = (
+1383-            self.tool_call_parser == "glm47"
+1384-            and bool(effective_tools)
+1385-            and not any(tool.function.strict for tool in effective_tools)
+1386-        )
+1387-        if glm_constraint:
+1388-            enable_thinking = (request.chat_template_kwargs or {}).get(
+1389-                "enable_thinking"
+1390-            )
+1391-            parser = FunctionCallParser(request.tools or [], self.tool_call_parser)
+1392-            tool_call_constraint = parser.get_structure_constraint(
+1393-                request.tool_choice,
+1394-                parallel_tool_calls=request.parallel_tool_calls,
+1395-                thinking_mode=True
+--
+2827:    def _patch_reasoning_skip_special_tokens(
+2828-        self, request: ChatCompletionRequest
+2829-    ) -> None:
+2830-        """Keep parser-specific reasoning markers in the decoded text.
+2831-
+2832-        Some reasoning parsers rely on special-token delimiters that would be
+2833-        removed during detokenization when ``skip_special_tokens=True``.
+2834-        """
+2835-        if self.reasoning_parser == "apertus2509":
+2836-            request.skip_special_tokens = False
+2837-        if self.reasoning_parser == "kimi_k3" or self.chat_encoding_spec == "kimi_k3":
+2838-            request.skip_special_tokens = False
+2839-
+415:    def _handle_last_assistant_message(
+416-        self,
+417-        messages: list[dict[str, Any]],
+418-        request: ChatCompletionRequest,
+419-    ) -> tuple[list[dict[str, Any]], str | None]:
+420-        """
+421-        Handle continue_final_message feature: separate final assistant message.
+422-
+423-        If continue_final_message is enabled and the last message is from assistant,
+424-        extract its content and remove it from the message list.
+425-        If continue_final_message is False and the last message is from assistant,
+426-        convert it to a user message to ensure the last message is always from user.
+427-
+428-        Only processes text-based content (strings), ignoring multimodal content (lists).
+429-
+430-        Args:
+431-            messages: List of message dictionaries
+432-            request: ChatCompletionRequest with continue_final_message flag
+433-
+434-        Returns:
+435-            Tuple of (processed_messages, assistant_prefix)
+436-            - processed_messages: Messages with last assistant message handled appropriately
+437-            - assistant_prefix: Content of the last assistant message (string only), or None
+438-        """
+439-        assistant_prefix = None
+440-        if messages and messages[-1].get("role") == "assistant":
+441-            last_content = messages[-1].get("content")
+442-            # Only process string content, ignore multimodal content (lists)
+443-            if isinstance(last_content, str):
+444-                if request.continue_final_message:
+445-                    # Extract content and remove the assistant message
+--
+575:            messages, assistant_prefix = self._handle_last_assistant_message(
+576-                messages, request
+577-            )
+578-        return messages, image_count, assistant_prefix
+579-
+580-    def _encode_messages(
+581-        self,
+582-        messages: list[dict[str, Any]],
+583-        request: ChatCompletionRequest,
+584-        thinking_mode: ThinkingMode,
+585-        tools: list[dict] | None = None,
+586-    ) -> list[int] | None:
+587-        """Encode messages for custom chat_encoding_spec values.
+259:    def extract_routing_key(self, raw_request):
+260-        if raw_request is None:
+261-            return None
+262-        return raw_request.headers.get("x-smg-routing-key")
+263-
+264-    def extract_routed_dp_rank_from_header(
+265-        self, raw_request: Request, body_routed_dp_rank: Optional[int] = None
+266-    ) -> Optional[int]:
+267-        """Extract routed_dp_rank from HTTP header, with higher priority than routed_dp_rank in body.
+268-
+269-        Header name: X-Data-Parallel-Rank (case-insensitive in HTTP/1.1/2)
+270-        """
+271-        if raw_request is None:
+272-            return body_routed_dp_rank
+273-
+274-        header_value = raw_request.headers.get("x-data-parallel-rank")

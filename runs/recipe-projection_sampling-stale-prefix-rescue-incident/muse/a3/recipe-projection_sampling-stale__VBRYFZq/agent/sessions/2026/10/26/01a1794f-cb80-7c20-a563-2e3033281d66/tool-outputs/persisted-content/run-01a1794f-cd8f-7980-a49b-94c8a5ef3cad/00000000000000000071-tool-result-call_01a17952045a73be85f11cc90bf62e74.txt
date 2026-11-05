@@ -1,0 +1,114 @@
+Read text file `/app/launch/run_sql_rl.py`.
+1|"""GRPO for the SQL data agent (Qwen3.5-2B, Spider) on 2 GPUs: Megatron actor on GPU 0, one SGLang engine on GPU 1.
+2|
+3|    cd /root/miles && python /app/launch/run_sql_rl.py --out /app/runs/<name> [--rescue | --no-rescue] [--seed 1]
+4|
+5|--rescue (default) adds the rescue of all-failed groups (examples/sql_agent/rescue); --no-rescue is plain GRPO.
+6|Held-out eval every 10 steps on two sets: `regular` and `hard` (questions the base model never got right in 4 tries).
+7|Weights are pushed to the engine in place every step (--pause-generation-mode in_place), as in our production async job.
+8|"""
+9|
+10|import os
+11|from dataclasses import dataclass
+12|
+13|import typer
+14|
+15|import miles.utils.external_utils.command_utils as U
+16|
+17|MODEL = "/models/Qwen3.5-2B"
+18|TORCH_DIST = "/models/Qwen3.5-2B_torch_dist"
+19|
+20|
+21|@dataclass
+22|class ScriptArgs(U.ExecuteTrainConfig):
+23|    out: str = "/app/runs/rescue"
+24|    rescue: bool = True
+25|    seed: int = 1
+26|    num_rollout: int = 50
+27|    prompt_data: str = "/data/sql/train.jsonl"
+28|    eval_regular: str = "/data/sql/heldout_regular.jsonl"
+29|    eval_hard: str = "/data/sql/heldout_hard.jsonl"
+30|
+31|
+32|def prepare():
+33|    if not os.path.exists(os.path.join(TORCH_DIST, "latest_checkpointed_iteration.txt")):
+34|        U.convert_checkpoint(model_name="Qwen3.5-2B", megatron_model_type="qwen3.5-2B", num_gpus_per_node=1,
+35|                             hf_checkpoint=MODEL, dir_dst=os.path.dirname(TORCH_DIST))
+36|
+37|
+38|def train_args(args: ScriptArgs) -> str:
+39|    ckpt_args = f"--hf-checkpoint {MODEL} --ref-load {TORCH_DIST} --save {args.out}/ckpt --save-interval 100000 "
+40|    tool_args = (
+41|        "--custom-generate-function-path miles.rollout.generate_hub.multi_turn.generate "
+42|        "--generate-tool-specs-path examples.sql_agent.sql_tool.tool_specs "
+43|        "--generate-execute-tool-function-path examples.sql_agent.sql_tool.execute_tool "
+44|        "--generate-tool-call-parser qwen3_coder "
+45|        "--generate-max-turns 8 --log-multi-turn "
+46|    )
+47|    rollout_args = (
+48|        f"--prompt-data {args.prompt_data} --input-key prompt --label-key label --tool-key tools "
+49|        "--apply-chat-template --apply-chat-template-kwargs '{\"enable_thinking\": false}' --rollout-shuffle "
+50|        "--custom-rm-path examples.sql_agent.sql_tool.reward_func --reward-key score "
+51|        "--rollout-sample-filter-path examples.sql_agent.sql_tool.clip_to_context "
+52|        f"--num-rollout {args.num_rollout} --rollout-batch-size 8 --n-samples-per-prompt 4 "
+53|        "--rollout-max-response-len 4096 --rollout-max-context-len 8192 --rollout-temperature 1 "
+54|        "--global-batch-size 32 "
+55|        f"--rollout-seed {args.seed} --seed {args.seed} "
+56|        f"--save-debug-rollout-data {args.out}/rollout/{{rollout_id}}.pt "
+57|        f"--save-debug-trajectory-data {args.out}/traj/{{rollout_id}}.jsonl "
+58|    )
+59|    rescue_args = ""
+60|    if args.rescue:
+61|        rescue_args = (
+62|            "--rollout-function-path examples.sql_agent.rescue.RescueRolloutFn "
+63|            "--rescue-max-groups 4 --rescue-mcmc-steps 4 --rescue-init-attempts 3 "
+64|            f"--rescue-log-dir {args.out}/rescue "
+65|        )
+66|    eval_args = (
+67|        f"--eval-interval 10 --eval-prompt-data regular {args.eval_regular} hard {args.eval_hard} "
+68|        "--n-samples-per-eval-prompt 2 --eval-max-response-len 4096 --eval-top-p 1 "
+69|    )
+70|    grpo_args = (
+71|        "--advantage-estimator grpo --entropy-coef 0.00 --eps-clip 0.2 --eps-clip-high 0.28 "
+72|        "--use-tis --tis-clip 2.0 "
+73|    )
+74|    optimizer_args = (
+75|        "--optimizer adam --lr 1e-6 --lr-decay-style constant --weight-decay 0.1 --adam-beta1 0.9 --adam-beta2 0.98 "
+76|    )
+77|    perf_args = (
+78|        "--tensor-model-parallel-size 1 --pipeline-model-parallel-size 1 --context-parallel-size 1 "
+79|        "--expert-model-parallel-size 1 --expert-tensor-parallel-size 1 "
+80|        "--recompute-granularity full --recompute-method uniform --recompute-num-layers 1 "
+81|        "--micro-batch-size 1 --log-probs-chunk-size 2048 "
+82|    )
+83|    # One SGLang engine next to the actor; weights are pushed in place each step.
+84|    sglang_args = (
+85|        "--rollout-num-gpus-per-engine 1 --sglang-mem-fraction-static 0.7 "
+86|        "--pause-generation-mode in_place "
+87|    )
+88|    misc_args = (
+89|        "--actor-num-nodes 1 --actor-num-gpus-per-node 1 --num-gpus-per-node 2 --rollout-num-gpus 1 "
+90|        "--attention-dropout 0.0 --hidden-dropout 0.0 --accumulate-allreduce-grads-in-fp32 "
+91|        "--attention-softmax-in-fp32 --attention-backend flash --log-passrate "
+92|        "--update-weight-buffer-size 536870912 "
+93|    )
+94|    return (
+95|        f"{ckpt_args} {rollout_args} {rescue_args} {eval_args} {optimizer_args} {grpo_args} {perf_args} "
+96|        f"{sglang_args} {misc_args} {tool_args}"
+97|    )
+98|
+99|
+100|def execute(args: ScriptArgs):
+101|    os.makedirs(args.out, exist_ok=True)
+102|    U.execute_train(train_args=train_args(args), config=args, num_gpus_per_node=2, megatron_model_type="qwen3.5-2B",
+103|                    train_script="train.py", extra_env_vars={"PYTHONPATH": "/root/Megatron-LM/:/root/miles"})
+104|
+105|
+106|@U.dataclass_cli
+107|def main(args: ScriptArgs):
+108|    prepare()
+109|    execute(args)
+110|
+111|
+112|if __name__ == "__main__":
+113|    typer.run(main)

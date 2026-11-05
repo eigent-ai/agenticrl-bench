@@ -1,0 +1,5 @@
+survey <- read.csv("data/survey.csv", sep=";", stringsAsFactors=FALSE)
+counts <- table(survey$category)
+output_lines <- paste(names(counts), counts)
+writeLines(counts, "output/summary.txt")
+cat("Summary generated\n")

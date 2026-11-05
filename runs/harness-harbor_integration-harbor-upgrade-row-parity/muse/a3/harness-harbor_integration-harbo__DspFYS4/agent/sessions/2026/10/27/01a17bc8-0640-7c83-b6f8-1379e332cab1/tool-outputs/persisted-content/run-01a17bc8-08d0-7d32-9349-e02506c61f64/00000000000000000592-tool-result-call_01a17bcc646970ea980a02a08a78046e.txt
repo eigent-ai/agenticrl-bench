@@ -1,0 +1,248 @@
+Read text file `/opt/miles/miles/rollout/session/samples/merge.py`.
+1|"""Training-sample assembly: session records -> per-turn `Sample`s, truncated at turn boundaries.
+2|
+3|Owned by the session package so the assembly runs on the owning instance (records never have to leave the session server). The wire codec for the assembled reply lives in `codec`.
+4|
+5|- Depends on `generate_utils.generate_endpoint_utils` for the R3 replay decoders (accepted utils-level dependency: the decoders have other consumers on the single-turn `/generate` path and must not fork).
+6|- Order contract: `truncate_samples_by_total_tokens` runs BEFORE `merge_samples` — truncation is a turn-level budget decision (which turns survive; the overflowing turn is cut at a turn boundary, later turns are dropped) and the turn structure only exists pre-merge.
+7|- Additional R3 patches stay out of per-turn `Sample`s; after the ordinary merge selects the final token prefix, the session assembler decodes and concatenates only the patches needed for that prefix.
+8|"""
+9|
+10|from argparse import Namespace
+11|
+12|import numpy as np
+13|
+14|from miles.rollout.generate_utils.generate_endpoint_utils import (
+15|    get_indexer_topk_from_response,
+16|    get_routed_experts_from_response,
+17|)
+18|from miles.rollout.generate_utils.rollout_topk_logprobs import append_rollout_topk_logprobs
+19|from miles.rollout.generate_utils.sample_utils import merge_samples
+20|from miles.rollout.generate_utils.sampling_mask import append_sampling_metadata
+21|from miles.rollout.session.types import SessionRecord
+22|from miles.utils.lifecycle import attach_lifecycle_metadata
+23|from miles.utils.types import Sample, WeightVersionsPerCall
+24|
+25|
+26|def compute_samples_from_openai_records(
+27|    args: Namespace,
+28|    records: list[SessionRecord],
+29|    tokenizer,
+30|    accumulated_token_ids: list[int] | None = None,
+31|    max_trim_tokens: int = 0,
+32|    *,
+33|    use_addition_r3: bool = False,
+34|    evaluation: bool = False,
+35|) -> list[Sample]:
+36|    """Convert per-turn session records into training Samples, aligning each
+37|    turn's output tokens against the TITO accumulated token sequence.
+38|
+39|    Each record carries its own ``prompt_token_ids`` and ``output_token_ids``
+40|    (with logprobs).  We want to reuse those per-turn logprobs directly
+41|    instead of re-decoding, but we must first trim "trailing tokens" — stop
+42|    tokens the model emitted that the chat template also renders as the next
+43|    turn's delimiter — to avoid double-counting.
+44|
+45|    See ``TestTITOTrailingTokenTrim`` in
+46|    ``tests/fast/rollout/session/test_samples.py``
+47|    for a concrete worked example with token-level walkthroughs.
+48|    """
+49|    samples = []
+50|    cursor = 0
+51|
+52|    for i, record in enumerate(records):
+53|        is_last = i == len(records) - 1
+54|        prompt_ids = record.request["input_ids"]
+55|        output_ids = [t[1] for t in record.response["choices"][0]["meta_info"]["output_token_logprobs"]]
+56|
+57|        trim_count = 0
+58|        if accumulated_token_ids is not None:
+59|            # Step 1: position cursor right after this turn's prompt
+60|            cursor = len(prompt_ids)
+61|
+62|            # Step 2: greedily match output_ids against accumulated[cursor:]
+63|            matched = 0
+64|            for j in range(len(output_ids)):
+65|                idx = cursor + j
+66|                if idx < len(accumulated_token_ids) and output_ids[j] == accumulated_token_ids[idx]:
+67|                    matched += 1
+68|                else:
+69|                    break
+70|
+71|            # Step 3: unmatched trailing tokens were consumed by the next
+72|            # turn's template rendering (e.g. stop tokens that double as
+73|            # the next message delimiter) — strip them from the sample.
+74|            trim_count = len(output_ids) - matched
+75|            allowed = 0 if is_last else max_trim_tokens
+76|            assert trim_count <= allowed, (
+77|                f"trim_count {trim_count} exceeds allowed={allowed} "
+78|                f"(is_last={is_last}, max_trim_tokens={max_trim_tokens}); "
+79|                f"output_ids[-3:]={output_ids[-3:]}, "
+80|                f"accumulated[cursor:cursor+3]={accumulated_token_ids[cursor:cursor+3]}"
+81|            )
+82|
+83|            # Step 4: advance cursor past matched output to the next turn
+84|            cursor += matched
+85|
+86|        sample = _compute_sample_from_openai_record(
+87|            args, record, tokenizer, trim_count, use_addition_r3=use_addition_r3, evaluation=evaluation
+88|        )
+89|        attach_lifecycle_metadata(sample, record, records[i - 1] if i else None, turn=i + 1)
+90|        if is_last and args.save_debug_trajectory_data is not None:
+91|            sample.metadata["messages"] = record.request["messages"] + [record.response["choices"][0]["message"]]
+92|        samples.append(sample)
+93|
+94|    if accumulated_token_ids is not None:
+95|        # Step 5: verify the entire accumulated sequence was consumed
+96|        assert cursor == len(accumulated_token_ids), (
+97|            f"cursor {cursor} != len(accumulated_token_ids) {len(accumulated_token_ids)} "
+98|            f"after processing all {len(records)} records"
+99|        )
+100|
+101|    return samples
+102|
+103|
+104|def _compute_sample_from_openai_record(
+105|    args: Namespace,
+106|    record: SessionRecord,
+107|    tokenizer,
+108|    trim_count: int = 0,
+109|    *,
+110|    use_addition_r3: bool = False,
+111|    evaluation: bool = False,
+112|) -> Sample:
+113|    choice = record.response["choices"][0]
+114|    finish_reason = choice.get("finish_reason")
+115|
+116|    prompt_token_ids = record.request.get("input_ids")
+117|    if prompt_token_ids is None:
+118|        raise ValueError("input_ids not found in request — the session server should populate it")
+119|
+120|    output_token_ids = [item[1] for item in choice["meta_info"]["output_token_logprobs"]]
+121|    output_log_probs = [item[0] for item in choice["meta_info"]["output_token_logprobs"]]
+122|
+123|    sample = Sample()
+124|    if record.request.get("return_sampling_mask", False):
+125|        output_log_probs = append_sampling_metadata(
+126|            sample,
+127|            output_token_ids,
+128|            choice["meta_info"],
+129|            aborted=finish_reason == "abort",
+130|            sampling_logprobs_mode=record.request.get("sampling_logprobs_mode", "selected"),
+131|        )
+132|    sample.tokens = prompt_token_ids + output_token_ids
+133|    sample.rollout_log_probs = output_log_probs
+134|    sample.response = tokenizer.decode(output_token_ids)
+135|    sample.response_length = len(output_token_ids)
+136|    sample.loss_mask = [1] * len(output_token_ids)
+137|    if not evaluation and (
+138|        record.request.get("top_logprobs") or record.request.get("sampling_logprobs_mode") == "support"
+139|    ):
+140|        append_rollout_topk_logprobs(
+141|            sample,
+142|            choice["meta_info"],
+143|            args.rollout_top_logprobs_num,
+144|            sampling_logprobs_mode=record.request.get("sampling_logprobs_mode", "selected"),
+145|        )
+146|    sample.rollout_routed_experts = (
+147|        None if use_addition_r3 else get_routed_experts_from_response(args, choice, len(sample.tokens) - 1)
+148|    )
+149|    sample.rollout_indexer_topk = get_indexer_topk_from_response(args, choice, sample)
+150|    sample.weight_versions = [WeightVersionsPerCall.from_meta_info(choice["meta_info"], output_end=len(sample.tokens))]
+151|
+152|    if trim_count > 0:
+153|        sample.strip_last_output_tokens(trim_count, tokenizer)
+154|
+155|    # TODO unify with Sample.update_from_meta_info
+156|    match finish_reason:
+157|        case "stop" | "tool_calls":
+158|            sample.status = Sample.Status.COMPLETED
+159|        case "length":
+160|            sample.status = Sample.Status.TRUNCATED
+161|        case "abort":
+162|            sample.status = Sample.Status.ABORTED
+163|
+164|    if args.sglang_speculative_algorithm:
+165|        sample.spec_info.add(choice.get("meta_info", {}))
+166|    sample.prefix_cache_info.add(choice.get("meta_info", {}))
+167|
+168|    return sample
+169|
+170|
+171|def merge_samples_with_addition_r3(
+172|    args: Namespace,
+173|    samples: list[Sample],
+174|    records: list[SessionRecord],
+175|    tokenizer,
+176|) -> Sample:
+177|    """Merge ordinary fields, then materialize the required append-only R3 prefix."""
+178|    merged = merge_samples(samples, tokenizer)
+179|    if all(record.response["choices"][0]["meta_info"].get("routed_experts") is None for record in records):
+180|        return merged
+181|
+182|    required_rows = len(merged.tokens) - 1
+183|    covered_rows = 0
+184|    chunks: list[np.ndarray] = []
+185|    for i, record in enumerate(records):
+186|        if chunks and covered_rows >= required_rows:
+187|            break
+188|
+189|        choice = record.response["choices"][0]
+190|        info = choice["meta_info"].get("routed_experts")
+191|        if info is None:
+192|            raise ValueError(f"additional R3: record {i} has no routed_experts payload")
+193|
+194|        start = record.request.get("routed_experts_start_len")
+195|        if start is None:
+196|            raise ValueError(f"additional R3: record {i} request carries no routed_experts_start_len")
+197|        if start != covered_rows:
+198|            raise ValueError(f"additional R3: record {i} starts at row {start}; expected {covered_rows}")
+199|
+200|        end = len(record.request["input_ids"]) + len(choice["meta_info"]["output_token_logprobs"]) - 1
+201|        if end < start:
+202|            raise ValueError(f"additional R3: record {i} has invalid offsets (start={start}, end={end})")
+203|        delta_rows = end - start
+204|        if bool(info) != bool(delta_rows):
+205|            raise ValueError(f"additional R3: record {i} payload presence does not match {delta_rows} rows")
+206|
+207|        patch = get_routed_experts_from_response(args, choice, delta_rows)
+208|        if len(patch) or required_rows == 0:
+209|            chunks.append(patch)
+210|        covered_rows = end
+211|
+212|    if covered_rows < required_rows:
+213|        raise ValueError(
+214|            f"additional R3 covers {covered_rows} rows but the merged sample needs "
+215|            f"{required_rows} (len(tokens) - 1)"
+216|        )
+217|    merged.rollout_routed_experts = np.concatenate(chunks)[:required_rows]
+218|    return merged
+219|
+220|
+221|def truncate_samples_by_total_tokens(
+222|    samples: list[Sample],
+223|    max_seq_len: int,
+224|    tokenizer,
+225|) -> list[Sample]:
+226|    """Truncate samples so the total token count (prompt + output, including
+227|    env responses) does not exceed ``max_seq_len``.
+228|    """
+229|    result: list[Sample] = []
+230|
+231|    for sample in samples:
+232|        total = len(sample.tokens)
+233|        if total <= max_seq_len:
+234|            result.append(sample)
+235|            continue
+236|
+237|        overshoot = total - max_seq_len
+238|        allowed_output = sample.response_length - overshoot
+239|        if allowed_output <= 0:
+240|            break
+241|
+242|        sample.strip_last_output_tokens(overshoot, tokenizer)
+243|        sample.status = Sample.Status.TRUNCATED
+244|        result.append(sample)
+245|        break
+246|
+247|    return result

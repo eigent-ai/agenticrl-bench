@@ -1,0 +1,2500 @@
+"""Local broker for short-lived task sandboxes.
+
+A root daemon holds the cloud credentials and creates network-blocked sandboxes on
+request over a Unix socket; workloads use the clients in ``sandbox_broker.client``
+(or the Modal-shaped facade in ``sandbox_broker.compat``) and never see the credentials.
+"""
+__version__ = "0.1.0"
+
+from .client import AsyncBrokerClient, AsyncSandbox, BrokerClient, ExecResult, Sandbox  # noqa: E402
+from .protocol import (BackendFailure, BadRequest, BrokerError, BrokerUnavailable, PolicyDenied,  # noqa: E402
+                       QuotaExceeded, SandboxNotFound)
+
+__all__ = [
+    "AsyncBrokerClient", "AsyncSandbox", "BrokerClient", "ExecResult", "Sandbox",
+    "BackendFailure", "BadRequest", "BrokerError", "BrokerUnavailable", "PolicyDenied", "QuotaExceeded",
+    "SandboxNotFound", "__version__",
+]
+"""Command line: ``python -m sandbox_broker <command>`` (also installed as ``sandbox-broker``).
+
+  start          start the daemon as root (idempotent; suitable for a container healthcheck)
+  serve          run the daemon in the foreground
+  supervise      run the daemon and restart it if it crashes
+  status         ping the daemon and print usage
+  list           list sandboxes (``--all`` for every user, admin only)
+  shutdown       terminate all sandboxes and stop the daemon (admin only)
+  audit-summary  summarise an audit log
+  hash-context   print the allowlist hash of Docker build context directories
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(prog="sandbox-broker")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("start")
+    s.add_argument("--config")
+    s.add_argument("--wait", type=float, default=120.0)
+    s.add_argument("--backend", default="modal", choices=["modal", "local"])
+    s.add_argument("--quiet", action="store_true")
+
+    s = sub.add_parser("serve")
+    s.add_argument("--config")
+    s.add_argument("--backend", default="modal", choices=["modal", "local"])
+    s.add_argument("--dev", action="store_true", help="allow non-root and skip ownership checks (development only)")
+
+    s = sub.add_parser("supervise")
+    s.add_argument("--config")
+    s.add_argument("--backend", default="modal", choices=["modal", "local"])
+
+    for name in ("status", "list", "shutdown"):
+        s = sub.add_parser(name)
+        s.add_argument("--socket")
+        if name == "list":
+            s.add_argument("--all", action="store_true")
+        if name == "shutdown":
+            s.add_argument("--keep-running", action="store_true",
+                           help="terminate sandboxes and refuse new ones, but keep answering queries")
+
+    s = sub.add_parser("audit-summary")
+    s.add_argument("path", nargs="?", default="/var/log/sandbox-broker/audit.jsonl")
+
+    s = sub.add_parser("hash-context")
+    s.add_argument("dirs", nargs="+")
+
+    a = p.parse_args(argv)
+
+    if a.cmd == "start":
+        from .daemon import StartError, start
+
+        try:
+            status = start(a.config, wait_s=a.wait, backend_name=a.backend)
+        except StartError as exc:
+            print(f"sandbox-broker: {exc}", file=sys.stderr)
+            return 1
+        if not a.quiet:
+            print(json.dumps(status))
+        return 0
+    if a.cmd == "serve":
+        from .daemon import serve
+
+        return serve(a.config, dev=a.dev, backend_name=a.backend)
+    if a.cmd == "supervise":
+        from .daemon import supervise
+
+        return supervise(a.config, backend_name=a.backend)
+    if a.cmd in ("status", "list", "shutdown"):
+        from .client import BrokerClient
+        from .protocol import BrokerError
+
+        c = BrokerClient(a.socket)
+        try:
+            if a.cmd == "status":
+                out = {"ping": c.ping(), "usage": c.usage()}
+            elif a.cmd == "list":
+                out = c.list(all=a.all)
+            else:
+                out = c.shutdown(exit=not a.keep_running)
+        except BrokerError as exc:
+            print(f"sandbox-broker: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(out, indent=2))
+        return 0
+    if a.cmd == "audit-summary":
+        from .audit import summarize
+
+        print(json.dumps(summarize(a.path), indent=2, default=str))
+        return 0
+    if a.cmd == "hash-context":
+        from .policy import hash_context_dir
+
+        for d in a.dirs:
+            print(f"{hash_context_dir(d)}  {d}")
+        return 0
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+"""Append-only JSONL audit log of every request the broker handles."""
+from __future__ import annotations
+
+import datetime as _dt
+import json
+import os
+import threading
+from typing import Any
+
+
+def _now_iso() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="milliseconds")
+
+
+class AuditLog:
+    def __init__(self, path: str, mode: int = 0o644, fsync_every: int = 50):
+        self.path = path
+        os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, mode)
+        os.fchmod(fd, mode)
+        self._f = os.fdopen(fd, "a", buffering=1, encoding="utf-8")
+        self._lock = threading.Lock()
+        self._seq = self._last_seq()
+        self._fsync_every = fsync_every
+        self._since_sync = 0
+
+    def _last_seq(self) -> int:
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - 65536))
+                lines = f.read().splitlines()
+            for line in reversed(lines):
+                try:
+                    return int(json.loads(line)["seq"])
+                except Exception:
+                    continue
+        except OSError:
+            pass
+        return 0
+
+    def write(self, event: str, *, sync: bool = False, **fields: Any) -> None:
+        with self._lock:
+            self._seq += 1
+            rec = {"seq": self._seq, "ts": _now_iso(), "event": event, **fields}
+            self._f.write(json.dumps(rec, default=str, ensure_ascii=False) + "\n")
+            self._since_sync += 1
+            if sync or self._since_sync >= self._fsync_every:
+                self._f.flush()
+                os.fsync(self._f.fileno())
+                self._since_sync = 0
+
+    def close(self) -> None:
+        with self._lock:
+            try:
+                self._f.flush()
+                os.fsync(self._f.fileno())
+            finally:
+                self._f.close()
+
+
+def summarize(path: str) -> dict[str, Any]:
+    """Aggregate an audit log into counts that are easy to check after a run."""
+    ops: dict[str, dict[str, int]] = {}
+    denied: dict[str, int] = {}
+    images: dict[str, int] = {}
+    uids: dict[str, int] = {}
+    created = ended = 0
+    network_values: set[str] = set()
+    last_usage: dict[str, Any] | None = None
+    starts = 0
+    shutdown = None
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ev = rec.get("event")
+            if ev == "request":
+                op = rec.get("op", "?")
+                d = ops.setdefault(op, {"allowed": 0, "denied": 0, "failed": 0})
+                d[rec.get("outcome", "allowed")] = d.get(rec.get("outcome", "allowed"), 0) + 1
+                uid = str((rec.get("peer") or {}).get("uid"))
+                uids[uid] = uids.get(uid, 0) + 1
+                if rec.get("outcome") == "denied":
+                    reason = str(rec.get("error", ""))[:120]
+                    denied[reason] = denied.get(reason, 0) + 1
+                if op == "create" and rec.get("outcome") == "allowed":
+                    created += 1
+                    images[rec.get("image", "?")] = images.get(rec.get("image", "?"), 0) + 1
+                    network_values.add(str(rec.get("network")))
+            elif ev == "sandbox_ended":
+                ended += 1
+            elif ev == "usage":
+                last_usage = rec
+            elif ev == "start":
+                starts += 1
+            elif ev == "shutdown":
+                shutdown = rec
+    return {
+        "daemon_starts": starts,
+        "ops": ops,
+        "denied_reasons": denied,
+        "sandboxes_created": created,
+        "sandboxes_ended": ended,
+        "child_network_settings": sorted(network_values),
+        "images": images,
+        "requests_by_uid": uids,
+        "last_usage": last_usage,
+        "shutdown": shutdown,
+    }
+"""Clients for the sandbox broker (standard library only).
+
+Sync::
+
+    from sandbox_broker import BrokerClient
+    client = BrokerClient()
+    sb = client.create("hamishi740/swerl-tmax-v3:0123456789ab", cpu=1, memory_mb=2048, timeout_s=1800)
+    r = sb.exec("bash", "-c", "ls /app", timeout=60)
+    print(r.returncode, r.stdout)
+    sb.put_file("/tmp/x.txt", b"hello")
+    sb.terminate()
+
+Async: the same names on ``AsyncBrokerClient`` / ``AsyncSandbox``, awaited.
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import dataclasses
+import io
+import json
+import os
+import socket
+import tarfile
+import uuid
+from pathlib import Path
+from typing import Any, Awaitable, Callable
+
+from .policy import DEFAULT_SOCKET_PATH
+from .protocol import BrokerUnavailable, encode, error_from_reply
+
+OutputHandler = Callable[[str, "str | bytes"], Any]
+
+CREATE_REPLY_TIMEOUT = 1800.0
+EXEC_GRACE = 120.0
+FILE_REPLY_TIMEOUT = 600.0
+
+
+def default_socket_path() -> str:
+    return os.environ.get("SANDBOX_BROKER_SOCKET", DEFAULT_SOCKET_PATH)
+
+
+@dataclasses.dataclass
+class ExecResult:
+    returncode: int
+    stdout: str | bytes
+    stderr: str | bytes
+    timed_out: bool = False
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
+    duration_s: float = 0.0
+
+    @property
+    def exit_code(self) -> int:
+        return self.returncode
+
+    @property
+    def ok(self) -> bool:
+        return self.returncode == 0
+
+
+def _create_msg(image, build_context, cpu, memory_mb, timeout_s, idle_timeout_s, workdir, env, labels):
+    msg: dict[str, Any] = {"op": "create"}
+    if (image is None) == (build_context is None):
+        raise ValueError("give exactly one of image or build_context")
+    if image is not None:
+        msg["image"] = image
+    else:
+        msg["build_context_b64"] = base64.b64encode(pack_build_context(build_context)).decode()
+    for key, val in (("cpu", cpu), ("memory_mb", memory_mb), ("timeout_s", timeout_s),
+                     ("idle_timeout_s", idle_timeout_s), ("workdir", workdir), ("env", env), ("labels", labels)):
+        if val is not None:
+            msg[key] = val
+    return msg
+
+
+def _exec_msg(sid, argv, timeout, workdir, env, stdin, binary, stream):
+    if len(argv) == 1 and isinstance(argv[0], (list, tuple)):
+        argv = tuple(argv[0])
+    msg: dict[str, Any] = {"op": "exec", "id": sid, "argv": [str(a) for a in argv]}
+    if timeout is not None:
+        msg["timeout_s"] = int(timeout)
+    if workdir is not None:
+        msg["workdir"] = workdir
+    if env:
+        msg["env"] = {k: str(v) for k, v in env.items() if v is not None}
+    if stdin is not None:
+        data = stdin.encode() if isinstance(stdin, str) else bytes(stdin)
+        msg["stdin_b64"] = base64.b64encode(data).decode()
+    if binary:
+        msg["binary"] = True
+    if stream:
+        msg["stream"] = True
+    return msg
+
+
+def _exec_result(reply: dict, binary: bool, streamed: dict[str, list] | None) -> ExecResult:
+    if streamed is not None:
+        if binary:
+            out, err = b"".join(streamed["stdout"]), b"".join(streamed["stderr"])
+        else:
+            out, err = "".join(streamed["stdout"]), "".join(streamed["stderr"])
+    elif binary:
+        out = base64.b64decode(reply.get("stdout_b64", ""))
+        err = base64.b64decode(reply.get("stderr_b64", ""))
+    else:
+        out, err = reply.get("stdout", ""), reply.get("stderr", "")
+    return ExecResult(returncode=int(reply.get("rc", -1)), stdout=out, stderr=err,
+                      timed_out=bool(reply.get("timed_out")), stdout_truncated=bool(reply.get("stdout_truncated")),
+                      stderr_truncated=bool(reply.get("stderr_truncated")),
+                      duration_s=float(reply.get("duration_s", 0.0)))
+
+
+def _event_data(ev: dict, binary: bool):
+    return base64.b64decode(ev.get("data_b64", "")) if binary else ev.get("data", "")
+
+
+def pack_build_context(path: str | os.PathLike | bytes) -> bytes:
+    """tar.gz of a Docker build context directory (the Dockerfile must be at its root)."""
+    if isinstance(path, (bytes, bytearray)):
+        return bytes(path)
+    root = Path(path)
+    if not (root / "Dockerfile").is_file():
+        raise ValueError(f"{root} has no Dockerfile")
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for p in sorted(root.rglob("*")):
+            if p.is_symlink():
+                raise ValueError(f"symlinks are not supported in build contexts: {p}")
+            rel = p.relative_to(root).as_posix()
+            info = tf.gettarinfo(str(p), arcname=rel)
+            info.uid = info.gid = 0
+            info.uname = info.gname = ""
+            info.mtime = 0
+            if p.is_file():
+                with open(p, "rb") as f:
+                    tf.addfile(info, f)
+            elif p.is_dir():
+                tf.addfile(info)
+    return buf.getvalue()
+
+
+def _tar_dir(local_dir: str | os.PathLike) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        tf.add(str(local_dir), arcname=".")
+    return buf.getvalue()
+
+
+def _untar(data: bytes, dest: str | os.PathLike) -> None:
+    dest = Path(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tf:
+        try:
+            tf.extractall(dest, filter="data")
+        except TypeError:  # Python < 3.12 without extraction filters
+            for m in tf.getmembers():
+                target = (dest / m.name).resolve()
+                if not str(target).startswith(str(dest.resolve())) or m.issym() or m.islnk() or m.isdev():
+                    continue
+                tf.extract(m, dest)
+
+
+# ============================================================================ sync
+
+
+class BrokerClient:
+    def __init__(self, socket_path: str | None = None, connect_timeout: float = 30.0):
+        self.socket_path = socket_path or default_socket_path()
+        self.connect_timeout = connect_timeout
+
+    def _connect(self) -> socket.socket:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(self.connect_timeout)
+        try:
+            s.connect(self.socket_path)
+        except (FileNotFoundError, ConnectionRefusedError) as exc:
+            s.close()
+            raise BrokerUnavailable(f"sandbox broker is not running at {self.socket_path}") from exc
+        return s
+
+    def call(self, msg: dict, timeout: float | None = 300.0,
+             on_event: Callable[[dict], None] | None = None) -> dict:
+        s = self._connect()
+        try:
+            s.settimeout(timeout)
+            s.sendall(encode(msg))
+            f = s.makefile("rb")
+            while True:
+                line = f.readline()
+                if not line:
+                    raise BrokerUnavailable(f"broker closed the connection during {msg.get('op')}")
+                reply = json.loads(line)
+                if "event" in reply:
+                    if on_event:
+                        on_event(reply)
+                    continue
+                if not reply.get("ok", "error" not in reply):
+                    raise error_from_reply(reply)
+                return reply
+        except socket.timeout as exc:
+            raise TimeoutError(f"no reply from broker for {msg.get('op')} within {timeout}s") from exc
+        finally:
+            s.close()
+
+    def ping(self, timeout: float = 10.0) -> dict:
+        return self.call({"op": "ping"}, timeout=timeout)
+
+    def usage(self) -> dict:
+        return self.call({"op": "usage"})
+
+    def policy(self) -> dict:
+        return self.call({"op": "policy"})["policy"]
+
+    def list(self, all: bool = False) -> list[dict]:
+        return self.call({"op": "list", **({"all": True} if all else {})})["sandboxes"]
+
+    def shutdown(self, exit: bool = True) -> dict:
+        return self.call({"op": "shutdown", "exit": exit}, timeout=600)["summary"]
+
+    def create(self, image: str | None = None, *, build_context: str | os.PathLike | bytes | None = None,
+               cpu: float | None = None, memory_mb: int | None = None, timeout_s: int | None = None,
+               idle_timeout_s: int | None = None, workdir: str | None = None, env: dict | None = None,
+               labels: dict | None = None) -> "Sandbox":
+        msg = _create_msg(image, build_context, cpu, memory_mb, timeout_s, idle_timeout_s, workdir, env, labels)
+        reply = self.call(msg, timeout=CREATE_REPLY_TIMEOUT)
+        return Sandbox(self, reply["id"], reply.get("sandbox", {}))
+
+    def sandbox(self, sandbox_id: str) -> "Sandbox":
+        return Sandbox(self, sandbox_id, {})
+
+
+class Sandbox:
+    def __init__(self, client: BrokerClient, sandbox_id: str, info: dict):
+        self.client = client
+        self.id = sandbox_id
+        self.info = info
+
+    @property
+    def object_id(self) -> str:
+        return self.id
+
+    def exec(self, *argv: str, timeout: int | None = None, workdir: str | None = None, env: dict | None = None,
+             stdin: str | bytes | None = None, binary: bool = False,
+             on_output: OutputHandler | None = None) -> ExecResult:
+        stream = on_output is not None
+        msg = _exec_msg(self.id, argv, timeout, workdir, env, stdin, binary, stream)
+        streamed: dict[str, list] | None = {"stdout": [], "stderr": []} if stream else None
+
+        def on_event(ev: dict) -> None:
+            data = _event_data(ev, binary)
+            streamed[ev["fd"]].append(data)
+            on_output(ev["fd"], data)
+
+        reply = self.client.call(msg, timeout=(timeout or 1800) + EXEC_GRACE, on_event=on_event if stream else None)
+        return _exec_result(reply, binary, streamed)
+
+    run = exec
+
+    def put_file(self, path: str, data: str | bytes | os.PathLike, mode: int | None = None) -> None:
+        if isinstance(data, os.PathLike):
+            data = Path(data).read_bytes()
+        elif isinstance(data, str):
+            data = data.encode()
+        msg = {"op": "put_file", "id": self.id, "path": path, "data_b64": base64.b64encode(data).decode()}
+        if mode is not None:
+            msg["mode"] = mode
+        self.client.call(msg, timeout=FILE_REPLY_TIMEOUT)
+
+    def get_file(self, path: str) -> bytes:
+        reply = self.client.call({"op": "get_file", "id": self.id, "path": path}, timeout=FILE_REPLY_TIMEOUT)
+        return base64.b64decode(reply["data_b64"])
+
+    def upload_dir(self, local_dir: str | os.PathLike, remote_dir: str) -> None:
+        tmp = f"/tmp/.sandbox-broker-{uuid.uuid4().hex}.tar.gz"
+        self.put_file(tmp, _tar_dir(local_dir))
+        r = self.exec("sh", "-c", 'mkdir -p "$1" && tar -xzf "$2" -C "$1"; rc=$?; rm -f "$2"; exit $rc',
+                      "_", remote_dir, tmp, timeout=600)
+        if r.returncode != 0:
+            raise RuntimeError(f"upload_dir failed ({r.returncode}): {r.stderr}")
+
+    def download_dir(self, remote_dir: str, local_dir: str | os.PathLike) -> None:
+        tmp = f"/tmp/.sandbox-broker-{uuid.uuid4().hex}.tar.gz"
+        r = self.exec("tar", "-czf", tmp, "-C", remote_dir, ".", timeout=600)
+        if r.returncode != 0:
+            raise RuntimeError(f"download_dir failed ({r.returncode}): {r.stderr}")
+        try:
+            _untar(self.get_file(tmp), local_dir)
+        finally:
+            self.exec("rm", "-f", tmp, timeout=60)
+
+    def poll(self) -> int | None:
+        reply = self.client.call({"op": "poll", "id": self.id})
+        return None if reply["running"] else (reply.get("rc") if reply.get("rc") is not None else 0)
+
+    def terminate(self) -> None:
+        self.client.call({"op": "terminate", "id": self.id}, timeout=180)
+
+    def __enter__(self) -> "Sandbox":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        try:
+            self.terminate()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+# ============================================================================ async
+
+
+class AsyncBrokerClient:
+    def __init__(self, socket_path: str | None = None, connect_timeout: float = 30.0):
+        self.socket_path = socket_path or default_socket_path()
+        self.connect_timeout = connect_timeout
+
+    async def call(self, msg: dict, timeout: float | None = 300.0,
+                   on_event: Callable[[dict], Awaitable[None] | None] | None = None) -> dict:
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_unix_connection(self.socket_path, limit=1 << 30), self.connect_timeout)
+        except (FileNotFoundError, ConnectionRefusedError) as exc:
+            raise BrokerUnavailable(f"sandbox broker is not running at {self.socket_path}") from exc
+        try:
+            writer.write(encode(msg))
+            await writer.drain()
+
+            async def read_reply() -> dict:
+                while True:
+                    line = await reader.readline()
+                    if not line:
+                        raise BrokerUnavailable(f"broker closed the connection during {msg.get('op')}")
+                    reply = json.loads(line)
+                    if "event" in reply:
+                        if on_event:
+                            res = on_event(reply)
+                            if asyncio.iscoroutine(res):
+                                await res
+                        continue
+                    return reply
+
+            try:
+                reply = await asyncio.wait_for(read_reply(), timeout)
+            except asyncio.TimeoutError as exc:
+                raise TimeoutError(f"no reply from broker for {msg.get('op')} within {timeout}s") from exc
+        finally:
+            writer.close()
+        if not reply.get("ok", "error" not in reply):
+            raise error_from_reply(reply)
+        return reply
+
+    async def ping(self, timeout: float = 10.0) -> dict:
+        return await self.call({"op": "ping"}, timeout=timeout)
+
+    async def usage(self) -> dict:
+        return await self.call({"op": "usage"})
+
+    async def policy(self) -> dict:
+        return (await self.call({"op": "policy"}))["policy"]
+
+    async def list(self, all: bool = False) -> list[dict]:
+        return (await self.call({"op": "list", **({"all": True} if all else {})}))["sandboxes"]
+
+    async def shutdown(self, exit: bool = True) -> dict:
+        return (await self.call({"op": "shutdown", "exit": exit}, timeout=600))["summary"]
+
+    async def create(self, image: str | None = None, *, build_context: str | os.PathLike | bytes | None = None,
+                     cpu: float | None = None, memory_mb: int | None = None, timeout_s: int | None = None,
+                     idle_timeout_s: int | None = None, workdir: str | None = None, env: dict | None = None,
+                     labels: dict | None = None) -> "AsyncSandbox":
+        if build_context is not None and not isinstance(build_context, (bytes, bytearray)):
+            build_context = await asyncio.to_thread(pack_build_context, build_context)
+        msg = _create_msg(image, build_context, cpu, memory_mb, timeout_s, idle_timeout_s, workdir, env, labels)
+        reply = await self.call(msg, timeout=CREATE_REPLY_TIMEOUT)
+        return AsyncSandbox(self, reply["id"], reply.get("sandbox", {}))
+
+    def sandbox(self, sandbox_id: str) -> "AsyncSandbox":
+        return AsyncSandbox(self, sandbox_id, {})
+
+
+class AsyncSandbox:
+    def __init__(self, client: AsyncBrokerClient, sandbox_id: str, info: dict):
+        self.client = client
+        self.id = sandbox_id
+        self.info = info
+
+    @property
+    def object_id(self) -> str:
+        return self.id
+
+    async def exec(self, *argv: str, timeout: int | None = None, workdir: str | None = None,
+                   env: dict | None = None, stdin: str | bytes | None = None, binary: bool = False,
+                   on_output: OutputHandler | None = None) -> ExecResult:
+        stream = on_output is not None
+        msg = _exec_msg(self.id, argv, timeout, workdir, env, stdin, binary, stream)
+        streamed: dict[str, list] | None = {"stdout": [], "stderr": []} if stream else None
+
+        async def on_event(ev: dict) -> None:
+            data = _event_data(ev, binary)
+            streamed[ev["fd"]].append(data)
+            res = on_output(ev["fd"], data)
+            if asyncio.iscoroutine(res):
+                await res
+
+        reply = await self.client.call(msg, timeout=(timeout or 1800) + EXEC_GRACE,
+                                       on_event=on_event if stream else None)
+        return _exec_result(reply, binary, streamed)
+
+    run = exec
+
+    async def put_file(self, path: str, data: str | bytes | os.PathLike, mode: int | None = None) -> None:
+        if isinstance(data, os.PathLike):
+            data = await asyncio.to_thread(Path(data).read_bytes)
+        elif isinstance(data, str):
+            data = data.encode()
+        msg = {"op": "put_file", "id": self.id, "path": path, "data_b64": base64.b64encode(data).decode()}
+        if mode is not None:
+            msg["mode"] = mode
+        await self.client.call(msg, timeout=FILE_REPLY_TIMEOUT)
+
+    async def get_file(self, path: str) -> bytes:
+        reply = await self.client.call({"op": "get_file", "id": self.id, "path": path}, timeout=FILE_REPLY_TIMEOUT)
+        return base64.b64decode(reply["data_b64"])
+
+    async def upload_dir(self, local_dir: str | os.PathLike, remote_dir: str) -> None:
+        tmp = f"/tmp/.sandbox-broker-{uuid.uuid4().hex}.tar.gz"
+        await self.put_file(tmp, await asyncio.to_thread(_tar_dir, local_dir))
+        r = await self.exec("sh", "-c", 'mkdir -p "$1" && tar -xzf "$2" -C "$1"; rc=$?; rm -f "$2"; exit $rc',
+                            "_", remote_dir, tmp, timeout=600)
+        if r.returncode != 0:
+            raise RuntimeError(f"upload_dir failed ({r.returncode}): {r.stderr}")
+
+    async def download_dir(self, remote_dir: str, local_dir: str | os.PathLike) -> None:
+        tmp = f"/tmp/.sandbox-broker-{uuid.uuid4().hex}.tar.gz"
+        r = await self.exec("tar", "-czf", tmp, "-C", remote_dir, ".", timeout=600)
+        if r.returncode != 0:
+            raise RuntimeError(f"download_dir failed ({r.returncode}): {r.stderr}")
+        try:
+            await asyncio.to_thread(_untar, await self.get_file(tmp), local_dir)
+        finally:
+            await self.exec("rm", "-f", tmp, timeout=60)
+
+    async def poll(self) -> int | None:
+        reply = await self.client.call({"op": "poll", "id": self.id})
+        return None if reply["running"] else (reply.get("rc") if reply.get("rc") is not None else 0)
+
+    async def terminate(self) -> None:
+        await self.client.call({"op": "terminate", "id": self.id}, timeout=180)
+
+    async def __aenter__(self) -> "AsyncSandbox":
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        try:
+            await self.terminate()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+__all__ = ["AsyncBrokerClient", "AsyncSandbox", "BrokerClient", "ExecResult", "Sandbox",
+                          "default_socket_path", "pack_build_context"]
+"""A small ``modal``-shaped facade over the broker, for code written against Modal sandboxes.
+
+    from sandbox_broker import compat as modal
+
+    app = modal.App.lookup("terminal-agent-rl", create_if_missing=True)
+    sb = modal.Sandbox.create(app=app, image=modal.Image.from_registry(ref), cpu=1.0, memory=2048,
+                              timeout=1800, block_network=True, tags={"task_id": tid})
+    p = sb.exec("bash", "-c", cmd, timeout=60)
+    out, code = p.stdout.read(), p.wait()
+    sb.terminate()
+
+Sync calls and the ``.aio`` coroutine variants are both available (``await sb.exec.aio(...)``).
+
+Differences from Modal, by design of the broker:
+  * sandboxes never have network access; asking for any (allowlists, ports, tunnels) raises;
+  * no GPUs, volumes, secrets or custom entrypoints; images come from the broker's allowlist;
+  * a process runs when its output or exit code is first requested. Data written to
+    ``p.stdin`` before that is delivered in full; interactive stdin is not supported.
+"""
+from __future__ import annotations
+
+import asyncio
+import functools
+import os
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+from .client import AsyncBrokerClient, BrokerClient, ExecResult
+
+_UNSUPPORTED_CREATE = {
+    "secrets", "gpu", "volumes", "network_file_systems", "encrypted_ports", "h2_ports", "unencrypted_ports",
+    "outbound_domain_allowlist", "outbound_cidr_allowlist", "cidr_allowlist", "inbound_cidr_allowlist",
+    "custom_domain", "proxy", "cloud", "region", "include_oidc_identity_token", "_experimental_outbound_policy",
+    "experimental_options", "_experimental_enable_snapshot", "readiness_probe",
+}
+_IGNORED_CREATE = {"verbose", "runtime", "client", "environment_name"}
+
+_client_lock = threading.Lock()
+_sync_client: BrokerClient | None = None
+
+
+def _client() -> BrokerClient:
+    global _sync_client
+    with _client_lock:
+        if _sync_client is None:
+            _sync_client = BrokerClient()
+        return _sync_client
+
+
+def _aclient() -> AsyncBrokerClient:
+    return AsyncBrokerClient()
+
+
+class _Bound:
+    __slots__ = ("_sync", "aio")
+
+    def __init__(self, sync, aio):
+        self._sync = sync
+        self.aio = aio
+
+    def __call__(self, *args, **kwargs):
+        return self._sync(*args, **kwargs)
+
+
+class _dual:
+    """Method with a blocking form and an ``.aio`` coroutine form (bound to the instance,
+    or to the class when accessed on the class)."""
+
+    def __init__(self, sync_fn):
+        self.sync_fn = sync_fn
+        self.async_fn = None
+        functools.update_wrapper(self, sync_fn)
+
+    def aio(self, fn):
+        self.async_fn = fn
+        return self
+
+    def __get__(self, obj, owner):
+        target = obj if obj is not None else owner
+        return _Bound(functools.partial(self.sync_fn, target), functools.partial(self.async_fn, target))
+
+
+class UnsupportedFeature(NotImplementedError, AttributeError):
+    pass
+
+
+def _unsupported(what: str):
+    return UnsupportedFeature(f"{what} is not available for broker sandboxes")
+
+
+# ---------------------------------------------------------------------------- App / Image
+
+
+class App:
+    def __init__(self, name: str):
+        self.name = name
+        self.app_id = f"broker-app:{name}"
+
+    @_dual
+    def lookup(cls, name: str, *, create_if_missing: bool = False, client=None, environment_name=None):
+        return cls(name)
+
+    @lookup.aio
+    async def lookup(cls, name: str, *, create_if_missing: bool = False, client=None, environment_name=None):
+        return cls(name)
+
+
+class Image:
+    def __init__(self, *, ref: str | None = None, context_dir: str | None = None):
+        self.ref = ref
+        self.context_dir = context_dir
+
+    @staticmethod
+    def from_registry(tag: str, secret=None, *, setup_dockerfile_commands=(), add_python=None, **kwargs) -> "Image":
+        if secret is not None or setup_dockerfile_commands or add_python or kwargs:
+            raise _unsupported("customising registry images")
+        return Image(ref=tag)
+
+    @staticmethod
+    def from_dockerfile(path: str | os.PathLike, *, context_dir: str | os.PathLike | None = None,
+                        **kwargs) -> "Image":
+        path = Path(path)
+        ctx = Path(context_dir) if context_dir is not None else path.parent
+        if kwargs or path.name != "Dockerfile" or path.resolve().parent != ctx.resolve():
+            raise _unsupported("this Dockerfile layout (use <context>/Dockerfile with no build options)")
+        return Image(context_dir=str(ctx))
+
+    def __getattr__(self, name: str):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        raise _unsupported(f"Image.{name}")
+
+    def _create_kwargs(self) -> dict[str, Any]:
+        return {"image": self.ref} if self.ref else {"build_context": self.context_dir}
+
+
+# ---------------------------------------------------------------------------- processes
+
+
+class _StdinWriter:
+    def __init__(self):
+        self._buf = bytearray()
+        self.closed = False
+
+    def write(self, data: str | bytes) -> None:
+        if self.closed:
+            raise ValueError("stdin is closed")
+        self._buf.extend(data.encode() if isinstance(data, str) else data)
+
+    def write_eof(self) -> None:
+        self.closed = True
+
+    @_dual
+    def drain(self) -> None:
+        return None
+
+    @drain.aio
+    async def drain(self) -> None:
+        return None
+
+    def data(self) -> bytes | None:
+        return bytes(self._buf) if self._buf or self.closed else None
+
+
+class _StreamReader:
+    def __init__(self, proc: "ContainerProcess", fd: str):
+        self._proc = proc
+        self._fd = fd
+
+    @_dual
+    def read(self):
+        return getattr(self._proc._run(), self._fd)
+
+    @read.aio
+    async def read(self):
+        return getattr(await self._proc._arun(), self._fd)
+
+    def _chunks(self, data):
+        if isinstance(data, bytes):
+            return [data] if data else []
+        return data.splitlines(keepends=True)
+
+    def __iter__(self):
+        return iter(self._chunks(self.read()))
+
+    async def __aiter__(self):
+        for chunk in self._chunks(await self.read.aio()):
+            yield chunk
+
+
+class ContainerProcess:
+    def __init__(self, sandbox: "Sandbox", argv: tuple[str, ...], *, timeout, workdir, env, text: bool):
+        self._sandbox = sandbox
+        self._argv = argv
+        self._timeout = timeout
+        self._workdir = workdir
+        self._env = env
+        self._text = text
+        self._result: ExecResult | None = None
+        self._lock = threading.Lock()
+        self._alock: asyncio.Lock | None = None
+        self.stdin = _StdinWriter()
+        self.stdout = _StreamReader(self, "stdout")
+        self.stderr = _StreamReader(self, "stderr")
+
+    def _exec_kwargs(self) -> dict[str, Any]:
+        return {"timeout": self._timeout, "workdir": self._workdir, "env": self._env,
+                "stdin": self.stdin.data(), "binary": not self._text}
+
+    def _run(self) -> ExecResult:
+        with self._lock:
+            if self._result is None:
+                self._result = _client().sandbox(self._sandbox.object_id).exec(*self._argv, **self._exec_kwargs())
+            return self._result
+
+    async def _arun(self) -> ExecResult:
+        if self._alock is None:
+            self._alock = asyncio.Lock()
+        async with self._alock:
+            if self._result is None:
+                sb = _aclient().sandbox(self._sandbox.object_id)
+                self._result = await sb.exec(*self._argv, **self._exec_kwargs())
+            return self._result
+
+    @_dual
+    def wait(self) -> int:
+        return self._run().returncode
+
+    @wait.aio
+    async def wait(self) -> int:
+        return (await self._arun()).returncode
+
+    @_dual
+    def poll(self) -> int | None:
+        return self._run().returncode
+
+    @poll.aio
+    async def poll(self) -> int | None:
+        return (await self._arun()).returncode
+
+    @property
+    def returncode(self) -> int | None:
+        return self._result.returncode if self._result else None
+
+    @property
+    def result(self) -> ExecResult:
+        return self._run()
+
+
+# ---------------------------------------------------------------------------- filesystem
+
+
+class _Filesystem:
+    def __init__(self, sandbox: "Sandbox"):
+        self._id = sandbox.object_id
+
+    @_dual
+    def read_bytes(self, remote_path: str) -> bytes:
+        return _client().sandbox(self._id).get_file(remote_path)
+
+    @read_bytes.aio
+    async def read_bytes(self, remote_path: str) -> bytes:
+        return await _aclient().sandbox(self._id).get_file(remote_path)
+
+    @_dual
+    def read_text(self, remote_path: str) -> str:
+        return self.read_bytes(remote_path).decode()
+
+    @read_text.aio
+    async def read_text(self, remote_path: str) -> str:
+        return (await self.read_bytes.aio(remote_path)).decode()
+
+    @_dual
+    def write_bytes(self, data: bytes, remote_path: str) -> None:
+        _client().sandbox(self._id).put_file(remote_path, bytes(data))
+
+    @write_bytes.aio
+    async def write_bytes(self, data: bytes, remote_path: str) -> None:
+        await _aclient().sandbox(self._id).put_file(remote_path, bytes(data))
+
+    @_dual
+    def write_text(self, data: str, remote_path: str) -> None:
+        self.write_bytes(data.encode(), remote_path)
+
+    @write_text.aio
+    async def write_text(self, data: str, remote_path: str) -> None:
+        await self.write_bytes.aio(data.encode(), remote_path)
+
+    @_dual
+    def copy_from_local(self, local_path, remote_path: str) -> None:
+        _client().sandbox(self._id).put_file(remote_path, Path(local_path).read_bytes())
+
+    @copy_from_local.aio
+    async def copy_from_local(self, local_path, remote_path: str) -> None:
+        await _aclient().sandbox(self._id).put_file(remote_path, Path(local_path))
+
+    @_dual
+    def copy_to_local(self, remote_path: str, local_path) -> None:
+        Path(local_path).write_bytes(self.read_bytes(remote_path))
+
+    @copy_to_local.aio
+    async def copy_to_local(self, remote_path: str, local_path) -> None:
+        data = await self.read_bytes.aio(remote_path)
+        await asyncio.to_thread(Path(local_path).write_bytes, data)
+
+    @_dual
+    def make_directory(self, remote_path: str, *, create_parents: bool = True) -> None:
+        r = _client().sandbox(self._id).exec("mkdir", *(["-p"] if create_parents else []), remote_path, timeout=60)
+        if r.returncode:
+            raise OSError(r.stderr)
+
+    @make_directory.aio
+    async def make_directory(self, remote_path: str, *, create_parents: bool = True) -> None:
+        r = await _aclient().sandbox(self._id).exec("mkdir", *(["-p"] if create_parents else []), remote_path,
+                                                    timeout=60)
+        if r.returncode:
+            raise OSError(r.stderr)
+
+    @_dual
+    def remove(self, remote_path: str, *, recursive: bool = False) -> None:
+        r = _client().sandbox(self._id).exec("rm", "-rf" if recursive else "-f", remote_path, timeout=120)
+        if r.returncode:
+            raise OSError(r.stderr)
+
+    @remove.aio
+    async def remove(self, remote_path: str, *, recursive: bool = False) -> None:
+        r = await _aclient().sandbox(self._id).exec("rm", "-rf" if recursive else "-f", remote_path, timeout=120)
+        if r.returncode:
+            raise OSError(r.stderr)
+
+
+# ---------------------------------------------------------------------------- Sandbox
+
+
+def _limit(value):
+    if isinstance(value, tuple):
+        return value[1]
+    return value
+
+
+def _create_kwargs(args, app, image, name, tags, env, timeout, idle_timeout, workdir, cpu, memory,
+                   block_network, pty, extra) -> dict[str, Any]:
+    if args:
+        raise _unsupported("a custom sandbox command")
+    bad = sorted(k for k, v in extra.items() if k in _UNSUPPORTED_CREATE and v not in (None, [], (), {}, False))
+    unknown = sorted(k for k in extra if k not in _UNSUPPORTED_CREATE | _IGNORED_CREATE)
+    if bad:
+        raise _unsupported(", ".join(bad))
+    if unknown:
+        raise TypeError(f"unexpected argument(s): {', '.join(unknown)}")
+    if block_network is False:
+        raise _unsupported("network access")
+    if pty:
+        raise _unsupported("pty")
+    if not isinstance(image, Image):
+        raise TypeError("image must come from compat.Image.from_registry or Image.from_dockerfile")
+    labels = {str(k): str(v) for k, v in (tags or {}).items()}
+    if isinstance(app, App):
+        labels.setdefault("app", app.name)
+    if name:
+        labels.setdefault("name", str(name))
+    kwargs = image._create_kwargs()
+    kwargs.update(cpu=_limit(cpu), memory_mb=_limit(memory), timeout_s=timeout, idle_timeout_s=idle_timeout,
+                  workdir=workdir, env={k: v for k, v in (env or {}).items() if v is not None} or None,
+                  labels={k[:63]: v[:128] for k, v in labels.items()} or None)
+    return kwargs
+
+
+class Sandbox:
+    def __init__(self, sandbox_id: str, info: dict | None = None):
+        self.object_id = sandbox_id
+        self.info = info or {}
+        self._returncode: int | None = None
+
+    def __repr__(self) -> str:
+        return f"Sandbox({self.object_id})"
+
+    @_dual
+    def create(cls, *args, app=None, image=None, name=None, tags=None, env=None, timeout: int = 300,
+               idle_timeout=None, workdir=None, cpu=None, memory=None, block_network=None, pty=False, **extra):
+        kw = _create_kwargs(args, app, image, name, tags, env, timeout, idle_timeout, workdir, cpu, memory,
+                            block_network, pty, extra)
+        sb = _client().create(**kw)
+        return cls(sb.id, sb.info)
+
+    @create.aio
+    async def create(cls, *args, app=None, image=None, name=None, tags=None, env=None, timeout: int = 300,
+                     idle_timeout=None, workdir=None, cpu=None, memory=None, block_network=None, pty=False, **extra):
+        kw = _create_kwargs(args, app, image, name, tags, env, timeout, idle_timeout, workdir, cpu, memory,
+                            block_network, pty, extra)
+        sb = await _aclient().create(**kw)
+        return cls(sb.id, sb.info)
+
+    @_dual
+    def from_id(cls, sandbox_id: str, client=None):
+        return cls(sandbox_id)
+
+    @from_id.aio
+    async def from_id(cls, sandbox_id: str, client=None):
+        return cls(sandbox_id)
+
+    @staticmethod
+    def _matches(info: dict, tags: dict | None, app_id: str | None) -> bool:
+        labels = info.get("labels") or {}
+        if app_id and app_id.startswith("broker-app:") and labels.get("app") != app_id.split(":", 1)[1]:
+            return False
+        return all(labels.get(k) == str(v) for k, v in (tags or {}).items())
+
+    @_dual
+    def list(cls, *, app_id: str | None = None, tags: dict | None = None, client=None):
+        return [cls(i["id"], i) for i in _client().list() if i.get("running") and cls._matches(i, tags, app_id)]
+
+    @list.aio
+    async def list(cls, *, app_id: str | None = None, tags: dict | None = None, client=None):
+        return [cls(i["id"], i) for i in await _aclient().list() if i.get("running") and cls._matches(i, tags, app_id)]
+
+    def _process(self, args, timeout=None, workdir=None, env=None, secrets=None, text=True, bufsize=-1,
+                 pty=False, stdout=None, stderr=None) -> ContainerProcess:
+        if secrets:
+            raise _unsupported("secrets")
+        if pty:
+            raise _unsupported("pty")
+        env = {k: v for k, v in (env or {}).items() if v is not None} or None
+        return ContainerProcess(self, args, timeout=timeout, workdir=workdir, env=env, text=text)
+
+    @_dual
+    def exec(self, *args: str, **kwargs) -> ContainerProcess:
+        return self._process(args, **kwargs)
+
+    @exec.aio
+    async def exec(self, *args: str, **kwargs) -> ContainerProcess:
+        return self._process(args, **kwargs)
+
+    @property
+    def filesystem(self) -> _Filesystem:
+        return _Filesystem(self)
+
+    @_dual
+    def terminate(self, *, wait: bool = False):
+        _client().sandbox(self.object_id).terminate()
+
+    @terminate.aio
+    async def terminate(self, *, wait: bool = False):
+        await _aclient().sandbox(self.object_id).terminate()
+
+    @_dual
+    def poll(self) -> int | None:
+        self._returncode = _client().sandbox(self.object_id).poll()
+        return self._returncode
+
+    @poll.aio
+    async def poll(self) -> int | None:
+        self._returncode = await _aclient().sandbox(self.object_id).poll()
+        return self._returncode
+
+    @_dual
+    def wait(self, raise_on_termination: bool = True) -> None:
+        while self.poll() is None:
+            time.sleep(2)
+
+    @wait.aio
+    async def wait(self, raise_on_termination: bool = True) -> None:
+        while await self.poll.aio() is None:
+            await asyncio.sleep(2)
+
+    @property
+    def returncode(self) -> int | None:
+        return self._returncode
+
+    def __getattr__(self, name: str):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        raise _unsupported(f"Sandbox.{name}")
+"""Starting and supervising the broker daemon as root.
+
+``start`` is meant to run once as root when the container comes up (for example from a
+healthcheck). It moves the provider credentials from its environment into a root-only
+file, checks that nothing the daemon will import is writable by other users, launches a
+detached supervisor with a clean environment and waits until the socket answers.
+"""
+from __future__ import annotations
+
+import asyncio
+import ctypes
+import json
+import logging
+import os
+import resource
+import signal
+import stat
+import subprocess
+import sys
+import time
+from typing import Any
+
+from .policy import Policy, PolicyError, load_policy
+
+log = logging.getLogger("sandbox_broker.daemon")
+
+TOKEN_ENV = (("SANDBOX_BROKER_TOKEN_ID", "SANDBOX_BROKER_TOKEN_SECRET"), ("MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET"))
+ENVIRONMENT_ENV = ("SANDBOX_BROKER_MODAL_ENVIRONMENT", "MODAL_ENVIRONMENT")
+CLEAN_ENV = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8",
+             "HOME": "/root"}
+
+
+class StartError(RuntimeError):
+    pass
+
+
+def harden_process() -> None:
+    """No core dumps and no ptrace/proc access from other users, even after a uid change."""
+    try:
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    except (ValueError, OSError):
+        pass
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.prctl(4, 0, 0, 0, 0)  # PR_SET_DUMPABLE = 4
+    except (OSError, AttributeError):
+        pass
+
+
+# ---------------------------------------------------------------------------- credentials
+
+
+def credentials_from_env(env: dict[str, str]) -> dict[str, str] | None:
+    for id_var, secret_var in TOKEN_ENV:
+        if env.get(id_var) and env.get(secret_var):
+            creds = {"token_id": env[id_var], "token_secret": env[secret_var]}
+            for var in ENVIRONMENT_ENV:
+                if env.get(var):
+                    creds["environment"] = env[var]
+                    break
+            return creds
+    return None
+
+
+def write_credentials(path: str, creds: dict[str, Any]) -> None:
+    d = os.path.dirname(path)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    os.chmod(d, 0o700)
+    tmp = f"{path}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(creds, f)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def read_credentials(path: str, *, strict: bool) -> dict[str, Any]:
+    st = os.stat(path)
+    if strict and (st.st_uid != 0 or st.st_mode & 0o077):
+        raise StartError(f"{path} must be owned by root with mode 0600")
+    with open(path) as f:
+        return json.load(f)
+
+
+# ---------------------------------------------------------------------------- install checks
+
+
+def _unsafe(path: str) -> str | None:
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(st.st_mode):
+        return None
+    reasons = []
+    if st.st_uid != 0:
+        reasons.append(f"owned by uid {st.st_uid}")
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        reasons.append("writable by group/others")
+    return f"{path} is {' and '.join(reasons)}" if reasons else None
+
+
+def check_install_integrity(extra_paths: list[str] = ()) -> list[str]:
+    """Everything the daemon imports must be writable only by root.
+
+    Checks every directory on ``sys.path`` recursively, their parent directories, the
+    interpreter and any extra paths (policy files).
+    """
+    problems: list[str] = []
+    roots = [p for p in sys.path if p and os.path.isdir(p)]
+    checked: set[str] = set()
+    for root in roots + [os.path.dirname(os.path.realpath(sys.executable))]:
+        parent = os.path.dirname(os.path.abspath(root))
+        while parent not in checked:
+            checked.add(parent)
+            if (p := _unsafe(parent)):
+                problems.append(p)
+            if parent == os.path.dirname(parent):
+                break
+            parent = os.path.dirname(parent)
+    for path in [os.path.realpath(sys.executable), *extra_paths]:
+        if (p := _unsafe(path)):
+            problems.append(p)
+    for root in roots:
+        for dirpath, dirnames, filenames in os.walk(root):
+            if dirpath in checked:
+                continue
+            checked.add(dirpath)
+            if (p := _unsafe(dirpath)):
+                problems.append(p)
+            for name in filenames:
+                if (p := _unsafe(os.path.join(dirpath, name))):
+                    problems.append(p)
+            if len(problems) > 20:
+                return problems
+    return problems
+
+
+# ---------------------------------------------------------------------------- serve / supervise
+
+
+def serve(policy_path: str | None, *, dev: bool = False, backend_name: str = "modal") -> int:
+    from .audit import AuditLog
+    from .server import BrokerServer
+
+    if not dev and os.geteuid() != 0:
+        raise StartError("the broker daemon must run as root")
+    os.umask(0o022)
+    harden_process()
+    policy = load_policy(policy_path, strict=not dev)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    if policy.log_resolved_hosts:
+        _log_resolved_hosts()
+    if backend_name == "local":
+        from .backends.local import LocalBackend
+
+        backend = LocalBackend(os.path.join(policy.state_dir, "local"))
+        parent = ""
+    else:
+        from .backends.modal_backend import ModalBackend
+
+        creds = read_credentials(policy.credentials_path, strict=not dev)
+        parent = creds.get("parent_sandbox_id", "")
+        backend = ModalBackend(creds["token_id"], creds["token_secret"], policy.app_name,
+                               policy.modal_environment or creds.get("environment"),
+                               parent_sandbox_id=parent, network=policy.network)
+        creds.clear()
+    audit = AuditLog(policy.audit_log, policy.audit_log_mode)
+    server = BrokerServer(policy, backend, audit=audit, parent_id=parent)
+    asyncio.run(server.serve())
+    return 0
+
+
+def _log_resolved_hosts() -> None:
+    """Debug aid: log every hostname the daemon resolves (used to size network allowlists)."""
+    import socket
+
+    orig = socket.getaddrinfo
+    seen: set[str] = set()
+
+    def getaddrinfo(host, *args, **kwargs):
+        if host not in seen:
+            seen.add(host)
+            log.info("resolving host %s", host)
+        return orig(host, *args, **kwargs)
+
+    socket.getaddrinfo = getaddrinfo
+
+
+def supervise(policy_path: str | None, *, max_restarts: int = 20, backend_name: str = "modal") -> int:
+    harden_process()
+    cmd = [sys.executable, "-I", "-m", "sandbox_broker", "serve", "--backend", backend_name]
+    if policy_path:
+        cmd += ["--config", policy_path]
+    child: subprocess.Popen | None = None
+    stopping = False
+
+    def forward(sig, _frame):
+        nonlocal stopping
+        stopping = True
+        if child and child.poll() is None:
+            child.send_signal(sig)
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, forward)
+    restarts = 0
+    while True:
+        started = time.monotonic()
+        child = subprocess.Popen(cmd, env=dict(CLEAN_ENV), cwd="/", close_fds=True)
+        rc = child.wait()
+        if stopping or rc == 0:
+            return rc
+        restarts = 0 if time.monotonic() - started > 300 else restarts + 1
+        print(f"sandbox-broker: daemon exited with {rc}; restart {restarts}/{max_restarts}", file=sys.stderr, flush=True)
+        if restarts >= max_restarts:
+            return rc or 1
+        time.sleep(min(30, 2 ** restarts))
+
+
+# ---------------------------------------------------------------------------- start
+
+
+def _ping(socket_path: str, timeout: float = 5.0) -> dict | None:
+    from .client import BrokerClient
+
+    try:
+        return BrokerClient(socket_path, connect_timeout=timeout).ping(timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def start(policy_path: str | None, *, wait_s: float = 120.0, backend_name: str = "modal",
+          check_install: bool = True) -> dict:
+    """Idempotent: returns quickly when a healthy daemon is already serving."""
+    if os.geteuid() != 0:
+        raise StartError("start must run as root")
+    try:
+        policy: Policy = load_policy(policy_path, strict=True)
+    except PolicyError as exc:
+        raise StartError(str(exc)) from exc
+    status = _ping(policy.socket_path)
+    if status and status.get("ready") and status.get("euid") == 0:
+        return status
+    if check_install:
+        extra = [p for p in (policy.source_path,) if p]
+        problems = check_install_integrity(extra)
+        if problems:
+            raise StartError("refusing to start; unsafe install:\n  " + "\n  ".join(problems[:20]))
+    if backend_name == "modal":
+        creds = credentials_from_env(dict(os.environ))
+        if creds:
+            creds["parent_sandbox_id"] = os.environ.get("MODAL_SANDBOX_ID", "")
+            write_credentials(policy.credentials_path, creds)
+        elif not os.path.exists(policy.credentials_path):
+            raise StartError("no credentials: set SANDBOX_BROKER_TOKEN_ID and SANDBOX_BROKER_TOKEN_SECRET")
+    if status is None:
+        os.makedirs(policy.log_dir, mode=0o755, exist_ok=True)
+        logf = open(policy.daemon_log, "ab")
+        os.chmod(policy.daemon_log, 0o640)
+        cmd = [sys.executable, "-I", "-m", "sandbox_broker", "supervise", "--backend", backend_name]
+        if policy.source_path:
+            cmd += ["--config", policy.source_path]
+        subprocess.Popen(cmd, env=dict(CLEAN_ENV), cwd="/", stdin=subprocess.DEVNULL, stdout=logf,
+                         stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
+        logf.close()
+    deadline = time.monotonic() + wait_s
+    last = None
+    while time.monotonic() < deadline:
+        last = _ping(policy.socket_path)
+        if last and last.get("ready"):
+            return last
+        time.sleep(0.5)
+    tail = ""
+    try:
+        with open(policy.daemon_log, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 4000))
+            tail = f.read().decode("utf-8", "replace")
+    except OSError:
+        pass
+    raise StartError(f"broker did not become ready within {wait_s:.0f}s; last status: {last}\n{tail}")
+"""Harbor environment backed by the sandbox broker.
+
+Use it wherever Harbor would otherwise create Modal sandboxes itself::
+
+    EnvironmentConfig(import_path="sandbox_broker.harbor_env:BrokerEnvironment", kwargs={...})
+
+or on the command line: ``harbor run --environment-import-path sandbox_broker.harbor_env:BrokerEnvironment``.
+
+The task's image comes from ``[environment].docker_image`` when set, otherwise from its
+``environment/`` build context (the broker only builds contexts on its allowlist). CPU and
+memory follow the task config and Harbor's overrides. Task containers never have network
+access, whatever the task's ``network_mode`` says.
+
+For code that builds ``EnvironmentConfig(type=...)`` and cannot be changed, call
+``use_for_modal_environment_type()`` once in the process before trials start.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import shlex
+from pathlib import Path
+
+from harbor.environments.base import BaseEnvironment, ExecResult
+from harbor.environments.capabilities import EnvironmentCapabilities
+
+from .client import AsyncBrokerClient, AsyncSandbox, pack_build_context
+
+log = logging.getLogger("sandbox_broker.harbor")
+
+try:  # present in current Harbor releases
+    from harbor.environments.definition import parse_dockerfile_workdir
+except ImportError:  # pragma: no cover
+    def parse_dockerfile_workdir(path: Path) -> str | None:
+        workdir = None
+        try:
+            for line in Path(path).read_text().splitlines():
+                parts = line.strip().split(None, 1)
+                if len(parts) == 2 and parts[0].upper() == "WORKDIR":
+                    workdir = parts[1].strip()
+        except OSError:
+            return None
+        return workdir
+
+
+class BrokerEnvironment(BaseEnvironment):
+    """Runs each trial's task container as a broker sandbox."""
+
+    def __init__(self, environment_dir: Path, environment_name: str, session_id: str, trial_paths,
+                 task_env_config, *args, socket_path: str | None = None, sandbox_timeout_secs: int | None = None,
+                 idle_timeout_secs: int | None = None, **kwargs):
+        for unused in ("app_name", "secrets", "registry_secret", "volumes", "modal_sandbox_v2", "sandbox_idle_timeout_secs",
+                       "auto_labels", "labels", "region", "keepalive"):
+            kwargs.pop(unused, None)
+        self._client = AsyncBrokerClient(socket_path)
+        self._sandbox: AsyncSandbox | None = None
+        self._sandbox_timeout = sandbox_timeout_secs
+        self._idle_timeout = idle_timeout_secs
+        super().__init__(environment_dir=environment_dir, environment_name=environment_name, session_id=session_id,
+                         trial_paths=trial_paths, task_env_config=task_env_config, *args, **kwargs)
+        self._workdir = task_env_config.workdir or parse_dockerfile_workdir(self.environment_dir / "Dockerfile")
+
+    @staticmethod
+    def type() -> str:
+        return "sandbox-broker"
+
+    @property
+    def capabilities(self) -> EnvironmentCapabilities:
+        return EnvironmentCapabilities(disable_internet=True)
+
+    @classmethod
+    def preflight(cls) -> None:
+        return None
+
+    def _validate_definition(self) -> None:
+        if self.task_env_config.docker_image:
+            return
+        if not (self.environment_dir / "Dockerfile").is_file():
+            raise FileNotFoundError(f"{self.environment_dir / 'Dockerfile'} not found")
+
+    async def start(self, force_build: bool) -> None:
+        cfg = self.task_env_config
+        if getattr(self, "_network_is_public", False):
+            log.info("%s: task asks for network access; broker sandboxes run without it", self.environment_name)
+        source: dict = {}
+        if cfg.docker_image:
+            source["image"] = cfg.docker_image
+        else:
+            source["build_context"] = await asyncio.to_thread(pack_build_context, self.environment_dir)
+        cpus = getattr(self, "_effective_cpus", cfg.cpus)
+        memory = getattr(self, "_effective_memory_mb", cfg.memory_mb)
+        labels = {"session": self.session_id[:128], "environment": self.environment_name[:128]}
+        self._sandbox = await self._client.create(
+            **source, cpu=cpus, memory_mb=memory, timeout_s=self._sandbox_timeout,
+            idle_timeout_s=self._idle_timeout, labels=labels)
+        if cfg.workdir:
+            await self.exec(f"mkdir -p {shlex.quote(cfg.workdir)}", user="root")
+        if hasattr(self, "ensure_dirs") and hasattr(self, "_mount_targets"):
+            await self.ensure_dirs(self._mount_targets(writable_only=True))
+        if hasattr(self, "_upload_environment_dir_after_start"):
+            await self._upload_environment_dir_after_start()
+
+    async def stop(self, delete: bool) -> None:
+        if self._sandbox is not None:
+            try:
+                await self._sandbox.terminate()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("terminate failed: %s", exc)
+            self._sandbox = None
+
+    def _require(self) -> AsyncSandbox:
+        if self._sandbox is None:
+            raise RuntimeError("Sandbox not found. Please start the environment first.")
+        return self._sandbox
+
+    async def exec(self, command: str, cwd: str | None = None, env: dict[str, str] | None = None,
+                   timeout_sec: int | None = None, user: str | int | None = None) -> ExecResult:
+        sb = self._require()
+        user = self._resolve_user(user)
+        if user is not None:
+            if isinstance(user, int):
+                user_arg = f"$(getent passwd {user} | cut -d: -f1)"
+            else:
+                user_arg = shlex.quote(str(user))
+            command = f"su {user_arg} -s /bin/bash -c {shlex.quote(command)}"
+        r = await sb.exec("bash", "-c", command, timeout=timeout_sec, workdir=cwd or self._workdir,
+                          env=self._merge_env(env))
+        return ExecResult(stdout=r.stdout, stderr=r.stderr, return_code=r.returncode)
+
+    async def upload_file(self, source_path: Path | str, target_path: str) -> None:
+        await self._require().put_file(target_path, Path(source_path))
+
+    async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
+        await self._require().upload_dir(source_dir, target_dir)
+
+    async def download_file(self, source_path: str, target_path: Path | str) -> None:
+        data = await self._require().get_file(source_path)
+        target = Path(target_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(target.write_bytes, data)
+
+    async def download_dir(self, source_dir: str, target_dir: Path | str) -> None:
+        await self._require().download_dir(source_dir, target_dir)
+
+
+def use_for_modal_environment_type() -> None:
+    """Route Harbor's built-in ``modal`` environment type to the broker in this process."""
+    from harbor.environments import factory
+    from harbor.models.environment_type import EnvironmentType
+
+    factory._ENVIRONMENT_REGISTRY[EnvironmentType.MODAL] = factory._EnvEntry(
+        "sandbox_broker.harbor_env", "BrokerEnvironment", None)
+
+
+__all__ = ["BrokerEnvironment", "use_for_modal_environment_type"]
+"""Broker policy: resource limits, image rules and file locations.
+
+The policy file is owned by root and read once when the daemon starts. TOML is used
+when the interpreter has ``tomllib`` (3.11+) or ``tomli``; JSON works everywhere.
+"""
+from __future__ import annotations
+
+import dataclasses
+import fnmatch
+import hashlib
+import json
+import os
+import re
+import stat
+from pathlib import Path
+from typing import Any
+
+DEFAULT_POLICY_PATH = "/etc/sandbox-broker/policy.toml"
+DEFAULT_SOCKET_PATH = "/run/sandbox-broker.sock"
+
+_MiB = 1024 * 1024
+
+
+class PolicyError(ValueError):
+    """The policy file is missing, malformed or unsafe to load."""
+
+
+@dataclasses.dataclass
+class Limits:
+    max_concurrent: int = 32
+    max_total_creates: int = 0  # 0 = unlimited
+    default_cpu: float = 1.0
+    min_cpu: float = 0.125
+    max_cpu: float = 2.0
+    default_memory_mb: int = 2048
+    min_memory_mb: int = 128
+    max_memory_mb: int = 8192
+    default_timeout_s: int = 3600
+    max_timeout_s: int = 3600
+    idle_timeout_s: int = 900
+    max_idle_timeout_s: int = 3600
+    default_exec_timeout_s: int = 600
+    max_exec_timeout_s: int = 1800
+    budget_sandbox_seconds: float = 0.0  # 0 = unlimited
+    min_create_budget_s: int = 60
+    max_file_bytes: int = 64 * _MiB
+    max_output_bytes: int = 8 * _MiB
+    max_context_bytes: int = 64 * _MiB
+    # Modal uploads files of 4 MiB or more through blob storage hosts (S3/R2), which the
+    # container's network allowlist does not include; keep every context file below that.
+    max_context_file_bytes: int = 4 * _MiB - 1
+    max_inflight_execs: int = 512
+    create_timeout_s: int = 1200
+    reap_interval_s: float = 5.0
+    poll_interval_s: float = 30.0
+    usage_log_interval_s: float = 300.0
+
+
+@dataclasses.dataclass
+class ImageRules:
+    allow: list[str] = dataclasses.field(default_factory=list)
+    pins: dict[str, str] = dataclasses.field(default_factory=dict)
+    pins_file: str | None = None
+    require_pin: bool = False
+    build_contexts: list[str] = dataclasses.field(default_factory=list)
+    build_contexts_file: str | None = None
+    setup_commands: list[str] = dataclasses.field(default_factory=list)
+
+
+@dataclasses.dataclass
+class NetworkRules:
+    """Outbound rules of the container the broker runs in (not of the sandboxes it creates).
+
+    With ``manage_parent_allowlist`` the broker keeps this container's outbound allowlist at
+    ``parent_domains`` plus the exact command-router hosts it needs (this container's own, and one
+    per live sandbox) instead of a ``*.w.modal.host`` wildcard, which also covers every public
+    Modal tunnel. The container must start with the wildcard allowed (the broker uses it once to
+    reach its own router) and the credentials must be allowed to modify this container's sandbox.
+    """
+
+    manage_parent_allowlist: bool = False
+    parent_domains: list[str] = dataclasses.field(default_factory=lambda: ["api.modal.com"])
+    parent_cidrs: list[str] = dataclasses.field(default_factory=list)
+    refresh_interval_s: float = 60.0
+
+
+@dataclasses.dataclass
+class Policy:
+    socket_path: str = DEFAULT_SOCKET_PATH
+    socket_mode: int = 0o666
+    socket_group: str | None = None
+    allowed_uids: list[int] = dataclasses.field(default_factory=list)  # empty = any local user
+    admin_uids: list[int] = dataclasses.field(default_factory=lambda: [0])
+    state_dir: str = "/var/lib/sandbox-broker"
+    log_dir: str = "/var/log/sandbox-broker"
+    audit_log_mode: int = 0o644
+    app_name: str = "sandbox-broker"
+    modal_environment: str | None = None
+    log_resolved_hosts: bool = False
+    limits: Limits = dataclasses.field(default_factory=Limits)
+    images: ImageRules = dataclasses.field(default_factory=ImageRules)
+    network: NetworkRules = dataclasses.field(default_factory=NetworkRules)
+    source_path: str | None = None
+    source_sha256: str | None = None
+
+    @property
+    def audit_log(self) -> str:
+        return os.path.join(self.log_dir, "audit.jsonl")
+
+    @property
+    def daemon_log(self) -> str:
+        return os.path.join(self.log_dir, "daemon.log")
+
+    @property
+    def credentials_path(self) -> str:
+        return os.path.join(self.state_dir, "credentials.json")
+
+    @property
+    def state_path(self) -> str:
+        return os.path.join(self.state_dir, "state.json")
+
+    @property
+    def contexts_dir(self) -> str:
+        return os.path.join(self.state_dir, "contexts")
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "app_name": self.app_name,
+            "network": "blocked",
+            "limits": dataclasses.asdict(self.limits),
+            "images": {
+                "allow": list(self.images.allow),
+                "pinned_refs": len(self.images.pins),
+                "require_pin": self.images.require_pin,
+                "build_contexts": len(self.images.build_contexts),
+                "setup_commands": len(self.images.setup_commands),
+            },
+            "parent_network": dataclasses.asdict(self.network),
+            "policy_sha256": self.source_sha256,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Loading
+
+
+def _parse_mode(value: Any) -> int:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        return int(value, 8)
+    raise PolicyError(f"invalid file mode: {value!r}")
+
+
+def _fill(cls, data: dict[str, Any], where: str):
+    fields = {f.name for f in dataclasses.fields(cls)}
+    unknown = set(data) - fields
+    if unknown:
+        raise PolicyError(f"unknown key(s) in {where}: {', '.join(sorted(unknown))}")
+    return cls(**data)
+
+
+def _read_text_list(path: str) -> list[str]:
+    out = []
+    for line in Path(path).read_text().splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line:
+            out.append(line.split()[0])
+    return out
+
+
+def check_root_owned(path: str) -> None:
+    """Refuse files that a non-root user could have written."""
+    st = os.stat(path)
+    if st.st_uid != 0 or st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise PolicyError(f"{path} must be owned by root and not writable by group/others")
+
+
+def parse_policy(data: dict[str, Any]) -> Policy:
+    data = dict(data)
+    limits = _fill(Limits, dict(data.pop("limits", {}) or {}), "[limits]")
+    images = _fill(ImageRules, dict(data.pop("images", {}) or {}), "[images]")
+    network = _fill(NetworkRules, dict(data.pop("network", {}) or {}), "[network]")
+    for key in ("socket_mode", "audit_log_mode"):
+        if key in data:
+            data[key] = _parse_mode(data[key])
+    policy = _fill(Policy, data, "policy")
+    policy.limits = limits
+    policy.images = images
+    policy.network = network
+    return policy
+
+
+def load_policy(path: str | None = None, *, strict: bool = False) -> Policy:
+    path = path or os.environ.get("SANDBOX_BROKER_POLICY") or DEFAULT_POLICY_PATH
+    if not os.path.exists(path):
+        raise PolicyError(f"policy file not found: {path}")
+    if strict:
+        check_root_owned(path)
+    raw = Path(path).read_bytes()
+    if path.endswith(".json"):
+        data = json.loads(raw)
+    else:
+        try:
+            import tomllib  # type: ignore[import-not-found]
+        except ModuleNotFoundError:  # pragma: no cover - py<3.11
+            try:
+                import tomli as tomllib  # type: ignore[no-redef]
+            except ModuleNotFoundError as exc:
+                raise PolicyError("TOML policy needs Python 3.11+ or tomli; use a .json policy") from exc
+        data = tomllib.loads(raw.decode())
+    policy = parse_policy(data)
+    policy.source_path = path
+    policy.source_sha256 = hashlib.sha256(raw).hexdigest()
+    base = os.path.dirname(os.path.abspath(path))
+    rules = policy.images
+    if rules.pins_file:
+        pins_path = os.path.join(base, rules.pins_file)
+        if strict:
+            check_root_owned(pins_path)
+        rules.pins.update(json.loads(Path(pins_path).read_text()))
+    if rules.build_contexts_file:
+        ctx_path = os.path.join(base, rules.build_contexts_file)
+        if strict:
+            check_root_owned(ctx_path)
+        rules.build_contexts.extend(_read_text_list(ctx_path))
+    rules.pins = {normalize_ref(k).name_tag: _check_digest(v) for k, v in rules.pins.items()}
+    rules.build_contexts = sorted({c.lower() for c in rules.build_contexts})
+    for c in rules.build_contexts:
+        if not re.fullmatch(r"[0-9a-f]{64}", c):
+            raise PolicyError(f"build context hash must be 64 hex chars: {c!r}")
+    return policy
+
+
+# ---------------------------------------------------------------------------
+# Image references
+
+_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-/:@]{0,511}$")
+_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def _check_digest(d: str) -> str:
+    if not _DIGEST_RE.match(d):
+        raise PolicyError(f"invalid image digest: {d!r}")
+    return d
+
+
+@dataclasses.dataclass(frozen=True)
+class ImageRef:
+    registry: str
+    repository: str
+    tag: str | None
+    digest: str | None
+
+    @property
+    def name(self) -> str:
+        return f"{self.registry}/{self.repository}"
+
+    @property
+    def name_tag(self) -> str:
+        return f"{self.name}:{self.tag}" if self.tag else self.name
+
+    @property
+    def match_key(self) -> str:
+        return self.name_tag if self.tag else f"{self.name}@{self.digest}"
+
+    def pull_ref(self, digest: str | None = None) -> str:
+        """Reference string handed to the image puller (short form for Docker Hub)."""
+        name = self.name
+        if self.registry == "docker.io":
+            name = self.repository[len("library/"):] if self.repository.startswith("library/") else self.repository
+        digest = digest or self.digest
+        if digest:
+            return f"{name}@{digest}"
+        return f"{name}:{self.tag}"
+
+
+def normalize_ref(ref: str) -> ImageRef:
+    ref = ref.strip()
+    if not _REF_RE.match(ref) or ".." in ref or "//" in ref:
+        raise ValueError(f"malformed image reference: {ref!r}")
+    digest = None
+    if "@" in ref:
+        ref, digest = ref.split("@", 1)
+        _check_digest(digest)
+    tag = None
+    slash = ref.rfind("/")
+    colon = ref.rfind(":")
+    if colon > slash:
+        ref, tag = ref[:colon], ref[colon + 1:]
+        if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.\-]{0,127}", tag):
+            raise ValueError(f"malformed image tag: {tag!r}")
+    parts = ref.split("/")
+    if len(parts) > 1 and ("." in parts[0] or ":" in parts[0] or parts[0] == "localhost"):
+        registry, repo = parts[0], "/".join(parts[1:])
+    else:
+        registry, repo = "docker.io", ref
+    if registry in ("index.docker.io", "registry-1.docker.io"):
+        registry = "docker.io"
+    if registry == "docker.io" and "/" not in repo:
+        repo = f"library/{repo}"
+    if repo != repo.lower():
+        raise ValueError(f"repository names must be lowercase: {repo!r}")
+    if tag is None and digest is None:
+        tag = "latest"
+    return ImageRef(registry, repo, tag, digest)
+
+
+def normalize_pattern(pattern: str) -> str:
+    pattern = pattern.strip()
+    first = pattern.split("/", 1)[0]
+    if "/" in pattern and ("." in first or ":" in first or first == "localhost"):
+        return pattern
+    if "/" not in pattern.split(":", 1)[0].split("@", 1)[0]:
+        pattern = f"library/{pattern}"
+    return f"docker.io/{pattern}"
+
+
+@dataclasses.dataclass(frozen=True)
+class ResolvedImage:
+    kind: str  # "registry" | "context"
+    display: str
+    pull_ref: str | None = None
+    context_sha256: str | None = None
+
+
+def resolve_registry_image(rules: ImageRules, ref: str) -> ResolvedImage:
+    """Map a requested image to the exact reference to pull, or raise PermissionError."""
+    try:
+        parsed = normalize_ref(ref)
+    except ValueError as exc:
+        raise PermissionError(str(exc)) from exc
+    patterns = [normalize_pattern(p) for p in rules.allow]
+    if not any(fnmatch.fnmatchcase(parsed.match_key, p) for p in patterns):
+        raise PermissionError(f"image {ref!r} is not in the allowed image list")
+    pin = rules.pins.get(parsed.name_tag) if parsed.tag else None
+    if pin and parsed.digest and parsed.digest != pin:
+        raise PermissionError(f"image {ref!r} does not match its pinned digest")
+    digest = parsed.digest or pin
+    if rules.require_pin and not digest:
+        raise PermissionError(f"image {ref!r} has no pinned digest")
+    return ResolvedImage("registry", parsed.match_key, pull_ref=parsed.pull_ref(digest))
+
+
+# ---------------------------------------------------------------------------
+# Build contexts
+
+
+def hash_context_dir(root: str | os.PathLike) -> str:
+    """Content hash of a Docker build context (paths, exec bits and file contents)."""
+    root = os.fspath(root)
+    h = hashlib.sha256(b"sandbox-broker-context-v1\n")
+    entries = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        for name in filenames + [d for d in dirnames if os.path.islink(os.path.join(dirpath, d))]:
+            full = os.path.join(dirpath, name)
+            rel = os.path.relpath(full, root).replace(os.sep, "/")
+            entries.append((rel, full))
+    for rel, full in sorted(entries):
+        st = os.lstat(full)
+        if stat.S_ISLNK(st.st_mode):
+            h.update(f"L {rel} {os.readlink(full)}\n".encode())
+        elif stat.S_ISREG(st.st_mode):
+            fh = hashlib.sha256()
+            with open(full, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    fh.update(chunk)
+            x = "x" if st.st_mode & 0o111 else "-"
+            h.update(f"F {rel} {x} {fh.hexdigest()}\n".encode())
+    return h.hexdigest()
+"""Wire format between clients and the broker daemon.
+
+One JSON object per line over a Unix stream socket. A request is a single line with an
+``op`` field; the reply is a single line, preceded by ``{"event": ...}`` lines when the
+client asked an ``exec`` to stream its output. Binary data travels base64-encoded.
+
+Requests (optional fields in brackets):
+  ping
+  create     image | build_context_b64, [cpu, memory_mb, timeout_s, idle_timeout_s,
+             workdir, env, labels]                                     -> id, ...
+  exec       id, argv, [timeout_s, workdir, env, stdin_b64, stream, binary]
+                                                                       -> rc, stdout, stderr, timed_out
+  put_file   id, path, data_b64, [mode]                               (alias: put)
+  get_file   id, path                                                  -> data_b64 (alias: get)
+  terminate  id
+  poll       id                                                        -> running, rc
+  list       [all]                                                     -> sandboxes
+  usage                                                                -> budget and counters
+  policy                                                               -> effective limits
+  shutdown   [exit]                                                    (admin only)
+
+Successful replies carry ``"ok": true``. Errors are ``{"ok": false, "error": <message>,
+"error_type": <kind>}``.
+"""
+from __future__ import annotations
+
+import json
+from typing import Any
+
+PROTOCOL_VERSION = 1
+
+COMMON_FIELDS = {"op", "request_id"}
+
+REQUEST_FIELDS: dict[str, set[str]] = {
+    "ping": set(),
+    "create": {"image", "build_context_b64", "cpu", "memory_mb", "timeout_s", "idle_timeout_s",
+               "workdir", "env", "labels"},
+    "exec": {"id", "argv", "timeout_s", "workdir", "env", "stdin_b64", "stream", "binary"},
+    "put_file": {"id", "path", "data_b64", "mode"},
+    "get_file": {"id", "path"},
+    "terminate": {"id"},
+    "poll": {"id"},
+    "list": {"all"},
+    "usage": set(),
+    "policy": set(),
+    "shutdown": {"exit"},
+}
+
+ALIASES = {"put": "put_file", "get": "get_file", "status": "usage"}
+
+ADMIN_OPS = {"shutdown"}
+
+
+class BrokerError(Exception):
+    """An error reported to the client. ``kind`` is a stable machine-readable category."""
+
+    kind = "error"
+
+    def __init__(self, message: str, kind: str | None = None):
+        super().__init__(message)
+        if kind:
+            self.kind = kind
+
+
+class BadRequest(BrokerError):
+    kind = "bad_request"
+
+
+class PolicyDenied(BrokerError):
+    kind = "denied"
+
+
+class QuotaExceeded(BrokerError):
+    kind = "quota"
+
+
+class SandboxNotFound(BrokerError):
+    kind = "not_found"
+
+
+class BackendFailure(BrokerError):
+    kind = "backend"
+
+
+class BrokerUnavailable(BrokerError):
+    kind = "unavailable"
+
+
+ERROR_TYPES = {cls.kind: cls for cls in (BadRequest, PolicyDenied, QuotaExceeded, SandboxNotFound,
+                                         BackendFailure, BrokerUnavailable)}
+
+
+def error_from_reply(reply: dict[str, Any]) -> BrokerError:
+    cls = ERROR_TYPES.get(reply.get("error_type", ""), BrokerError)
+    return cls(str(reply.get("error", "unknown error")), reply.get("error_type"))
+
+
+def encode(obj: dict[str, Any]) -> bytes:
+    return (json.dumps(obj, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
+
+
+def decode(line: bytes) -> dict[str, Any]:
+    obj = json.loads(line)
+    if not isinstance(obj, dict):
+        raise BadRequest("request must be a JSON object")
+    return obj
+
+
+def validate_request(req: dict[str, Any]) -> str:
+    op = req.get("op")
+    if not isinstance(op, str):
+        raise BadRequest("missing 'op'")
+    op = ALIASES.get(op, op)
+    if op not in REQUEST_FIELDS:
+        raise BadRequest(f"unknown op {op!r}")
+    unknown = set(req) - COMMON_FIELDS - REQUEST_FIELDS[op]
+    if unknown:
+        raise BadRequest(f"unsupported field(s) for {op}: {', '.join(sorted(unknown))}")
+    return op
+"""The broker daemon: a Unix-socket API in front of a sandbox backend.
+
+The daemon owns the provider credentials. Clients only see the operations in
+``protocol.py``; every limit is enforced here, whatever the client sends.
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import binascii
+import codecs
+import dataclasses
+import io
+import json
+import logging
+import os
+import re
+import shutil
+import signal
+import socket
+import stat
+import struct
+import tarfile
+import time
+import uuid
+from typing import Any
+
+from . import __version__
+from .audit import AuditLog
+from .backends.base import Backend, CreateSpec, FileTooLarge, ImageSpec
+from .policy import Policy, hash_context_dir, resolve_registry_image
+from .protocol import (ADMIN_OPS, PROTOCOL_VERSION, BackendFailure, BadRequest, BrokerError,
+                       BrokerUnavailable, PolicyDenied, QuotaExceeded, SandboxNotFound, decode, encode,
+                       validate_request)
+
+log = logging.getLogger("sandbox_broker.server")
+
+_LABEL_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,62}$")
+_ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+_QUIET_OPS = {"ping", "usage", "policy", "poll", "list"}
+_ENDED_KEEP = 2000
+
+
+@dataclasses.dataclass
+class Peer:
+    pid: int
+    uid: int
+    gid: int
+
+    def as_dict(self) -> dict[str, int]:
+        return {"pid": self.pid, "uid": self.uid, "gid": self.gid}
+
+
+@dataclasses.dataclass
+class SandboxRecord:
+    id: str
+    owner_uid: int
+    image: str
+    cpu: float
+    memory_mb: int
+    timeout_s: int
+    idle_timeout_s: int | None
+    created_at: float
+    deadline: float
+    labels: dict[str, str] = dataclasses.field(default_factory=dict)
+    meta: dict[str, Any] = dataclasses.field(default_factory=dict)
+    execs: int = 0
+    ended_at: float | None = None
+    end_reason: str | None = None
+    returncode: int | None = None
+
+    def lifetime(self, now: float) -> float:
+        return max(0.0, (self.ended_at or now) - self.created_at)
+
+    def public(self, now: float) -> dict[str, Any]:
+        d = dataclasses.asdict(self)
+        d.pop("meta", None)
+        d["running"] = self.ended_at is None
+        d["lifetime_s"] = round(self.lifetime(now), 1)
+        d["network"] = "blocked"
+        return d
+
+
+def _b64(data: bytes) -> str:
+    return base64.b64encode(data).decode("ascii")
+
+
+def _unb64(value: Any, field: str) -> bytes:
+    if not isinstance(value, str):
+        raise BadRequest(f"{field} must be a base64 string")
+    try:
+        return base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise BadRequest(f"{field} is not valid base64") from exc
+
+
+def _abs_path(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value.startswith("/") or "\0" in value or len(value) > 4096:
+        raise BadRequest(f"{field} must be an absolute path")
+    return value
+
+
+def _str_map(value: Any, field: str, *, key_re: re.Pattern, max_items: int, max_value: int) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict) or len(value) > max_items:
+        raise BadRequest(f"{field} must be an object with at most {max_items} entries")
+    out = {}
+    for k, v in value.items():
+        if not isinstance(k, str) or not key_re.match(k):
+            raise BadRequest(f"invalid key in {field}: {k!r}")
+        if not isinstance(v, str) or len(v) > max_value or "\0" in v:
+            raise BadRequest(f"invalid value in {field} for {k!r}")
+        out[k] = v
+    return out
+
+
+def _number(req: dict, key: str, default, lo, hi, kind=float):
+    v = req.get(key)
+    if v is None:
+        return kind(default)
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        raise BadRequest(f"{key} must be a number")
+    if v < lo or v > hi:
+        raise PolicyDenied(f"{key}={v} is outside the allowed range [{lo}, {hi}]")
+    return kind(v)
+
+
+def _timeout(req: dict, key: str, default: int, hi: int) -> int:
+    v = req.get(key)
+    if v is None:
+        v = default
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
+        raise BadRequest(f"{key} must be a positive number")
+    return int(min(max(1, int(v)), hi))
+
+
+def _short_argv(argv: list[str], limit: int = 2000) -> str:
+    text = json.dumps(argv, ensure_ascii=False)
+    return text if len(text) <= limit else text[:limit] + f"...(+{len(text) - limit} chars)"
+
+
+def safe_extract_context(data: bytes, dest: str, max_bytes: int, max_members: int = 10000,
+                         max_file_bytes: int | None = None) -> None:
+    """Extract a tar(.gz) build context, refusing links, devices and paths that escape ``dest``."""
+    total = 0
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tf:
+        members = tf.getmembers()
+        if len(members) > max_members:
+            raise BadRequest("build context has too many files")
+        for m in members:
+            name = m.name
+            while name.startswith("./"):
+                name = name[2:]
+            if not name or name == ".":
+                continue
+            parts = name.split("/")
+            if name.startswith("/") or ".." in parts:
+                raise BadRequest(f"unsafe path in build context: {m.name!r}")
+            target = os.path.join(dest, *parts)
+            if m.isdir():
+                os.makedirs(target, mode=0o755, exist_ok=True)
+            elif m.isreg():
+                if max_file_bytes is not None and m.size > max_file_bytes:
+                    raise PolicyDenied(f"build context file {name!r} is {m.size} bytes; the limit per file is "
+                                       f"{max_file_bytes} (bake large files into a prebuilt image instead)")
+                total += m.size
+                if total > max_bytes * 4:
+                    raise BadRequest("build context is too large when unpacked")
+                os.makedirs(os.path.dirname(target), mode=0o755, exist_ok=True)
+                src = tf.extractfile(m)
+                with open(target, "wb") as out:
+                    shutil.copyfileobj(src, out)
+                os.chmod(target, 0o755 if m.mode & 0o111 else 0o644)
+            else:
+                raise BadRequest(f"build context may only contain regular files and directories: {m.name!r}")
+    if not os.path.isfile(os.path.join(dest, "Dockerfile")):
+        raise BadRequest("build context has no Dockerfile at its root")
+
+
+class BrokerServer:
+    def __init__(self, policy: Policy, backend: Backend, *, audit: AuditLog | None = None,
+                 parent_id: str | None = None, clock=time.time):
+        self.policy = policy
+        self.limits = policy.limits
+        self.backend = backend
+        self.audit = audit or AuditLog(policy.audit_log, policy.audit_log_mode)
+        self.clock = clock
+        self.parent_id = parent_id or ""
+        self.session_id = uuid.uuid4().hex[:12]
+        self.started_at = clock()
+        self.records: dict[str, SandboxRecord] = {}
+        self.pending_creates = 0
+        self.creates_total = 0
+        self.failed_creates = 0
+        self.denied_total = 0
+        self.closed_seconds = 0.0
+        self.peak_live = 0
+        self.ready = False
+        self.backend_error: str | None = None
+        self.shutting_down = False
+        self.budget_exhausted = False
+        self._lock = asyncio.Lock()
+        self._exec_sem = asyncio.Semaphore(self.limits.max_inflight_execs)
+        self._stop = asyncio.Event()
+        self._server: asyncio.AbstractServer | None = None
+        self._tasks: list[asyncio.Task] = []
+        self._last_usage_log = 0.0
+        self._last_maintain = 0.0
+        self._forget_later: set[str] = set()
+
+    # ------------------------------------------------------------------ accounting
+
+    def live(self) -> list[SandboxRecord]:
+        return [r for r in self.records.values() if r.ended_at is None]
+
+    def used_seconds(self, now: float | None = None) -> float:
+        now = self.clock() if now is None else now
+        return self.closed_seconds + sum(r.lifetime(now) for r in self.live())
+
+    def budget_remaining(self, now: float | None = None) -> float | None:
+        budget = self.limits.budget_sandbox_seconds
+        if not budget:
+            return None
+        return max(0.0, budget - self.used_seconds(now))
+
+    def usage(self) -> dict[str, Any]:
+        now = self.clock()
+        rem = self.budget_remaining(now)
+        return {
+            "session": self.session_id,
+            "live": len(self.live()),
+            "pending": self.pending_creates,
+            "peak_live": self.peak_live,
+            "max_concurrent": self.limits.max_concurrent,
+            "creates_total": self.creates_total,
+            "failed_creates": self.failed_creates,
+            "denied_total": self.denied_total,
+            "used_sandbox_seconds": round(self.used_seconds(now), 1),
+            "budget_sandbox_seconds": self.limits.budget_sandbox_seconds or None,
+            "remaining_sandbox_seconds": None if rem is None else round(rem, 1),
+            "budget_exhausted": self.budget_exhausted,
+            "uptime_s": round(now - self.started_at, 1),
+        }
+
+    def _end(self, rec: SandboxRecord, reason: str, rc: int | None = None) -> None:
+        if rec.ended_at is not None:
+            return
+        rec.ended_at = self.clock()
+        rec.end_reason = reason
+        rec.returncode = rc
+        self.closed_seconds += rec.lifetime(rec.ended_at)
+        self._forget_later.add(rec.id)
+        self.audit.write("sandbox_ended", sandbox_id=rec.id, reason=reason, returncode=rc,
+                         lifetime_s=round(rec.lifetime(rec.ended_at), 1), execs=rec.execs, owner_uid=rec.owner_uid)
+        ended = [r for r in self.records.values() if r.ended_at is not None]
+        if len(ended) > _ENDED_KEEP:
+            for r in sorted(ended, key=lambda r: r.ended_at)[: len(ended) - _ENDED_KEEP]:
+                self.records.pop(r.id, None)
+
+    async def _terminate_rec(self, rec: SandboxRecord, reason: str) -> None:
+        if rec.ended_at is not None:
+            return
+        try:
+            await asyncio.wait_for(self.backend.terminate(rec.id), 120)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("terminate %s failed: %s", rec.id, exc)
+        self._end(rec, reason)
+        await self._flush_forgets()
+
+    async def _flush_forgets(self) -> None:
+        while self._forget_later:
+            sid = self._forget_later.pop()
+            try:
+                await self.backend.forget(sid)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("forget %s failed: %s", sid, exc)
+
+    # ------------------------------------------------------------------ state
+
+    def save_state(self) -> None:
+        state = {
+            "session_id": self.session_id,
+            "started_at": self.started_at,
+            "creates_total": self.creates_total,
+            "failed_creates": self.failed_creates,
+            "denied_total": self.denied_total,
+            "closed_seconds": self.closed_seconds,
+            "peak_live": self.peak_live,
+            "budget_exhausted": self.budget_exhausted,
+            "live": [dataclasses.asdict(r) for r in self.live()],
+        }
+        path = self.policy.state_path
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        tmp = f"{path}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, path)
+
+    async def load_state(self) -> None:
+        path = self.policy.state_path
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path) as f:
+                state = json.load(f)
+        except (OSError, ValueError) as exc:
+            log.warning("ignoring unreadable state file: %s", exc)
+            return
+        self.session_id = state.get("session_id", self.session_id)
+        self.started_at = state.get("started_at", self.started_at)
+        self.creates_total = state.get("creates_total", 0)
+        self.failed_creates = state.get("failed_creates", 0)
+        self.denied_total = state.get("denied_total", 0)
+        self.closed_seconds = state.get("closed_seconds", 0.0)
+        self.peak_live = state.get("peak_live", 0)
+        self.budget_exhausted = state.get("budget_exhausted", False)
+        for d in state.get("live", []):
+            rec = SandboxRecord(**d)
+            self.records[rec.id] = rec
+            if not await self.backend.attach(rec.id, rec.meta):
+                self._end(rec, "lost")
+        await self._flush_forgets()
+        self.audit.write("state_restored", live=len(self.live()), used_sandbox_seconds=round(self.used_seconds(), 1))
+
+    # ------------------------------------------------------------------ connection handling
+
+    @staticmethod
+    def _peer(writer: asyncio.StreamWriter) -> Peer:
+        sock = writer.get_extra_info("socket")
+        try:
+            raw = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+            pid, uid, gid = struct.unpack("3i", raw)
+            return Peer(pid, uid, gid)
+        except (AttributeError, OSError):
+            return Peer(-1, -1, -1)
+
+    async def handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        peer = self._peer(writer)
+        try:
+            while True:
+                try:
+                    line = await reader.readline()
+                except (ValueError, asyncio.LimitOverrunError):
+                    writer.write(encode({"ok": False, "error": "request is too large", "error_type": "bad_request"}))
+                    await writer.drain()
+                    break
+                if not line:
+                    break
+                if not line.strip():
+                    continue
+                reply = await self.process(line, peer, writer)
+                writer.write(encode(reply))
+                await writer.drain()
+        except (ConnectionError, BrokenPipeError):
+            pass
+        finally:
+            try:
+                writer.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def process(self, line: bytes, peer: Peer, writer: asyncio.StreamWriter | None = None) -> dict[str, Any]:
+        t0 = time.monotonic()
+        op = "?"
+        req: dict[str, Any] = {}
+        fields: dict[str, Any] = {}
+        outcome = "allowed"
+        try:
+            try:
+                req = decode(line)
+            except (ValueError, UnicodeDecodeError) as exc:
+                raise BadRequest(f"malformed request: {exc}") from exc
+            if isinstance(req.get("op"), str):
+                op = req["op"][:32]
+            op = validate_request(req)
+            self._authorize(peer, op)
+            handler = getattr(self, f"_op_{op}")
+            result = await handler(req, peer, writer, fields)
+            reply = {"ok": True, **result}
+        except BrokerError as exc:
+            outcome = "denied" if exc.kind in ("denied", "quota", "bad_request") else "failed"
+            reply = {"ok": False, "error": str(exc), "error_type": exc.kind}
+        except Exception as exc:  # noqa: BLE001
+            log.exception("unexpected error in %s", op)
+            outcome = "failed"
+            reply = {"ok": False, "error": f"internal error: {type(exc).__name__}: {exc}", "error_type": "backend"}
+        if outcome == "denied":
+            self.denied_total += 1
+        if "request_id" in req:
+            reply["request_id"] = req["request_id"]
+        if op not in _QUIET_OPS or outcome != "allowed":
+            extra = {"error": reply["error"]} if not reply["ok"] else {}
+            self.audit.write("request", op=op, peer=peer.as_dict(), outcome=outcome,
+                             duration_ms=int((time.monotonic() - t0) * 1000), **fields, **extra)
+        return reply
+
+    def _authorize(self, peer: Peer, op: str) -> None:
+        admins = self.policy.admin_uids
+        allowed = self.policy.allowed_uids
+        if allowed and peer.uid not in allowed and peer.uid not in admins and op != "ping":

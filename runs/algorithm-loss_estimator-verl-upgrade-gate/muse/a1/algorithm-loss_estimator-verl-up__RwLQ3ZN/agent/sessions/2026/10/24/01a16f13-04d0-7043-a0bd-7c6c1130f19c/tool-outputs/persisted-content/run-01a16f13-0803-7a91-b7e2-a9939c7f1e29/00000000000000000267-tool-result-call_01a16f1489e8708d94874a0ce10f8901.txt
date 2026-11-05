@@ -1,0 +1,283 @@
+Read text file `/opt/verl/verl/trainer/ppo/ray_trainer.py`.
+(69 line(s) above)
+70|from verl.utils.skip.skip_manager import SkipManager
+71|from verl.utils.torch_functional import masked_mean
+72|from verl.utils.tracking import ValidationGenerationsLogger
+73|from verl.workers.config import DistillationConfig, EngineConfig
+74|from verl.workers.rollout.llm_server import LLMServerManager
+75|from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+76|
+77|
+78|def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
+79|    """Apply KL penalty to the token-level rewards.
+80|
+81|    This function computes the KL divergence between the reference policy and current policy,
+82|    then applies a penalty to the token-level rewards based on this divergence.
+83|
+84|    Args:
+85|        data (DataProto): The data containing batched model outputs and inputs.
+86|        kl_ctrl (core_algos.AdaptiveKLController): Controller for adaptive KL penalty.
+87|        kl_penalty (str, optional): Type of KL penalty to apply. Defaults to "kl".
+88|
+89|    Returns:
+90|        tuple: A tuple containing:
+91|            - The updated data with token-level rewards adjusted by KL penalty
+92|            - A dictionary of metrics related to the KL penalty
+93|    """
+94|    response_mask = data.batch["response_mask"]
+95|    token_level_scores = data.batch["token_level_scores"]
+96|    batch_size = data.batch.batch_size[0]
+97|
+98|    # compute kl between ref_policy and current policy
+99|    # When apply_kl_penalty, algorithm.use_kl_in_reward=True, so the reference model has been enabled.
+100|    kld = core_algos.kl_penalty(
+101|        data.batch["old_log_probs"], data.batch["ref_log_prob"], kl_penalty=kl_penalty
+102|    )  # (batch_size, response_length)
+103|    kld = kld * response_mask
+104|    beta = kl_ctrl.value
+105|
+106|    token_level_rewards = token_level_scores - beta * kld
+107|
+108|    current_kl = masked_mean(kld, mask=response_mask, axis=-1)  # average over sequence
+109|    current_kl = torch.mean(current_kl, dim=0).item()
+110|
+111|    # according to https://github.com/huggingface/trl/blob/951ca1841f29114b969b57b26c7d3e80a39f75a0/trl/trainer/ppo_trainer.py#L837
+112|    kl_ctrl.update(current_kl=current_kl, n_steps=batch_size)
+113|    data.batch["token_level_rewards"] = token_level_rewards
+114|
+115|    metrics = {"actor/reward_kl_penalty": current_kl, "actor/reward_kl_penalty_coeff": beta}
+116|
+117|    return data, metrics
+118|
+119|
+120|def compute_response_mask(data: DataProto):
+121|    """Compute the attention mask for the response part of the sequence.
+122|
+123|    This function extracts the portion of the attention mask that corresponds to the model's response,
+124|    which is used for masking computations that should only apply to response tokens.
+125|
+126|    Args:
+127|        data (DataProto): The data containing batched model outputs and inputs.
+128|
+129|    Returns:
+130|        torch.Tensor: The attention mask for the response tokens.
+131|    """
+132|    responses = data.batch["responses"]
+133|    response_length = responses.size(1)
+134|    attention_mask = data.batch["attention_mask"]
+135|    return attention_mask[:, -response_length:]
+136|
+137|
+138|def compute_spec_decode_metrics(
+139|    spec_drafts,
+140|    spec_accepts,
+141|    spec_verifies,
+142|    non_padding_mask=None,
+143|) -> dict:
+144|    """Aggregate per-request speculative decoding stats.
+145|
+146|    Ratios are computed per request and then averaged, so long and short
+147|    responses have equal metric weight.
+148|
+149|    The three inputs come from the rollout engine (vLLM request spec-decode
+150|    stats or sglang ``meta_info["spec_*"]`` keys). Either all three are ``None``
+151|    (caller didn't fetch them, e.g. spec rollout disabled) and the function
+152|    is a no-op, or all three are populated; mixed state is a programmer error.
+153|
+154|    ``non_padding_mask`` is a numpy bool array used by sync PPO to drop padded
+155|    placeholder samples; pass ``None`` for async PPO.
+156|    """
+157|    if spec_drafts is None and spec_accepts is None and spec_verifies is None:
+158|        return {}
+159|    assert spec_drafts is not None and spec_accepts is not None and spec_verifies is not None, (
+160|        "spec_decode metrics require all three of spec_num_draft_tokens / "
+161|        "spec_num_accepted_tokens / spec_num_verify_steps; got partial inputs"
+162|    )
+163|
+164|    drafts = spec_drafts.tolist() if hasattr(spec_drafts, "tolist") else list(spec_drafts)
+165|    accepts = spec_accepts.tolist() if hasattr(spec_accepts, "tolist") else list(spec_accepts)
+166|    verifies = spec_verifies.tolist() if hasattr(spec_verifies, "tolist") else list(spec_verifies)
+167|
+168|    if non_padding_mask is not None:
+169|        drafts = [d for d, keep in zip(drafts, non_padding_mask, strict=True) if keep]
+170|        accepts = [a for a, keep in zip(accepts, non_padding_mask, strict=True) if keep]
+171|        verifies = [v for v, keep in zip(verifies, non_padding_mask, strict=True) if keep]
+172|
+173|    if len(drafts) == 0:
+174|        return {}
+175|
+176|    # Treat zero-denominator samples as 0.0 and keep them in the mean.
+177|    per_sample_accept_rate = [(a / d) if d > 0 else 0.0 for a, d in zip(accepts, drafts, strict=True)]
+178|    per_sample_accept_length = [(1.0 + a / v) if v > 0 else 0.0 for a, v in zip(accepts, verifies, strict=True)]
+179|
+180|    n = len(drafts)
+181|    return {
+182|        "rollout/spec_accept_rate": float(sum(per_sample_accept_rate) / n),
+183|        "rollout/spec_accept_length": float(sum(per_sample_accept_length) / n),
+184|    }
+185|
+186|
+187|def compute_advantage(
+188|    data: DataProto,
+189|    adv_estimator: AdvantageEstimator,
+190|    gamma: float = 1.0,
+191|    lam: float = 1.0,
+192|    num_repeat: int = 1,
+193|    norm_adv_by_std_in_grpo: bool = True,
+194|    config: Optional[AlgoConfig] = None,
+195|) -> DataProto:
+196|    """Compute advantage estimates for policy optimization.
+197|
+198|    This function computes advantage estimates using various estimators like GAE, GRPO, REINFORCE++, etc.
+199|    The advantage estimates are used to guide policy optimization in RL algorithms.
+200|
+201|    Args:
+202|        data (DataProto): The data containing batched model outputs and inputs.
+203|        adv_estimator (AdvantageEstimator): The advantage estimator to use (e.g., GAE, GRPO, REINFORCE++).
+204|        gamma (float, optional): Discount factor for future rewards. Defaults to 1.0.
+205|        lam (float, optional): Lambda parameter for GAE. Defaults to 1.0.
+206|        num_repeat (int, optional): Number of times to repeat the computation. Defaults to 1.
+207|        norm_adv_by_std_in_grpo (bool, optional): Whether to normalize advantages by standard deviation in
+208|            GRPO. Defaults to True.
+209|        config (dict, optional): Configuration dictionary for algorithm settings. Defaults to None.
+210|
+211|    Returns:
+212|        DataProto: The updated data with computed advantages and returns.
+213|    """
+214|    # Back-compatible with trainers that do not compute response mask in fit
+215|    if "response_mask" not in data.batch.keys():
+216|        data.batch["response_mask"] = compute_response_mask(data)
+217|    # prepare response group
+218|    if adv_estimator == AdvantageEstimator.GAE:
+219|        # Compute advantages and returns using Generalized Advantage Estimation (GAE)
+220|        advantages, returns = core_algos.compute_gae_advantage_return(
+221|            token_level_rewards=data.batch["token_level_rewards"],
+222|            values=data.batch["values"],
+223|            response_mask=data.batch["response_mask"],
+224|            gamma=gamma,
+225|            lam=lam,
+226|        )
+227|        data.batch["advantages"] = advantages
+228|        data.batch["returns"] = returns
+229|        if config.get("use_pf_ppo", False):
+230|            data = core_algos.compute_pf_ppo_reweight_data(
+231|                data,
+232|                config.pf_ppo.get("reweight_method"),
+233|                config.pf_ppo.get("weight_pow"),
+234|            )
+235|    elif adv_estimator == AdvantageEstimator.GRPO:
+236|        # Initialize the mask for GRPO calculation
+237|        grpo_calculation_mask = data.batch["response_mask"]
+238|
+239|        # Call compute_grpo_outcome_advantage with parameters matching its definition
+240|        advantages, returns = core_algos.compute_grpo_outcome_advantage(
+241|            token_level_rewards=data.batch["token_level_rewards"],
+242|            response_mask=grpo_calculation_mask,
+243|            index=data.non_tensor_batch["uid"],
+244|            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+245|        )
+246|        data.batch["advantages"] = advantages
+247|        data.batch["returns"] = returns
+248|    else:
+249|        # handle all other adv estimator type other than GAE and GRPO
+250|        adv_estimator_fn = core_algos.get_adv_estimator_fn(adv_estimator)
+251|        adv_kwargs = {
+252|            "token_level_rewards": data.batch["token_level_rewards"],
+253|            "response_mask": data.batch["response_mask"],
+254|            "config": config,
+255|        }
+256|        if "uid" in data.non_tensor_batch:  # optional
+257|            adv_kwargs["index"] = data.non_tensor_batch["uid"]
+258|        if "reward_baselines" in data.batch:  # optional
+259|            adv_kwargs["reward_baselines"] = data.batch["reward_baselines"]
+260|        # GDPO: pass raw data for per-dimension reward extraction
+261|        if adv_estimator in (AdvantageEstimator.GDPO, "gdpo"):
+262|            adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
+263|            adv_kwargs["batch"] = data.batch
+264|        # Add sum_pi_squared for Optimal Token Baseline
+265|        if adv_estimator in (AdvantageEstimator.OPTIMAL_TOKEN_BASELINE, AdvantageEstimator.TIR_OPTIMAL_TOKEN_BASELINE):
+266|            # Check if sum_pi_squared is available
+267|            assert "sum_pi_squared" in data.batch, (
+268|                "Step-dependent optimal baseline requires sum_pi_squared from actor. "
+269|                "Please set actor.calculate_sum_pi_squared=True in config."
+270|            )
+271|            adv_kwargs["sum_pi_squared"] = data.batch["sum_pi_squared"]
+272|            # old_log_probs needed for path-variance proxy: w_t = 1 - 2*exp(old_log_probs) + sum_pi_squared
+273|            adv_kwargs["old_log_probs"] = data.batch["old_log_probs"]
+274|            # Get pre-computed rollout IS weights if available
+275|            rollout_is_weights = data.batch.get("rollout_is_weights", None)
+276|            adv_kwargs["rollout_is_weights"] = rollout_is_weights
+277|
+278|        # calculate advantage estimator
+279|        advantages, returns = adv_estimator_fn(**adv_kwargs)
+280|        data.batch["advantages"] = advantages
+281|        data.batch["returns"] = returns
+282|    return data
+283|
+284|
+285|@deprecated("Legacy trainer is deprecated, and wil be removed in v0.9.0. Please use `trainer.use_v1=True` instead.")
+286|class RayPPOTrainer:
+287|    """Distributed PPO trainer using Ray for scalable reinforcement learning.
+288|
+289|    This trainer orchestrates distributed PPO training across multiple nodes and GPUs,
+290|    managing actor rollouts, critic training, and reward computation with Ray backend.
+291|    Supports various model architectures including FSDP, Megatron, vLLM, and SGLang integration.
+292|    """
+293|
+294|    # TODO: support each role have individual ray_worker_group_cls,
+295|    # i.e., support different backend of different role
+296|    def __init__(
+297|        self,
+298|        config,
+299|        tokenizer,
+300|        role_worker_mapping: dict[Role, WorkerType],
+301|        resource_pool_manager: ResourcePoolManager,
+302|        ray_worker_group_cls: type[RayWorkerGroup] = RayWorkerGroup,
+303|        processor=None,
+304|        train_dataset: Optional[Dataset] = None,
+305|        val_dataset: Optional[Dataset] = None,
+306|        collate_fn=None,
+307|        train_sampler: Optional[Sampler] = None,
+308|        device_name=None,
+309|    ):
+310|        """
+311|        Initialize distributed PPO trainer with Ray backend.
+312|        Note that this trainer runs on the driver process on a single CPU/GPU node.
+313|
+314|        Args:
+315|            config: Configuration object containing training parameters.
+316|            tokenizer: Tokenizer used for encoding and decoding text.
+317|            role_worker_mapping (dict[Role, WorkerType]): Mapping from roles to worker classes.
+318|            resource_pool_manager (ResourcePoolManager): Manager for Ray resource pools.
+319|            ray_worker_group_cls (RayWorkerGroup, optional): Class for Ray worker groups. Defaults to RayWorkerGroup.
+320|            processor: Optional data processor, used for multimodal data
+321|            train_dataset (Optional[Dataset], optional): Training dataset. Defaults to None.
+322|            val_dataset (Optional[Dataset], optional): Validation dataset. Defaults to None.
+323|            collate_fn: Function to collate data samples into batches.
+324|            train_sampler (Optional[Sampler], optional): Sampler for the training dataset. Defaults to None.
+325|            device_name (str, optional): Device name for training (e.g., "cuda", "cpu"). Defaults to None.
+326|        """
+327|
+328|        # Store the tokenizer for text processing
+329|        self.tokenizer = tokenizer
+330|        self.processor = processor
+331|        self.config = config
+332|
+333|        self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
+334|        assert self.hybrid_engine, "Currently, only support hybrid engine"
+335|
+336|        if self.hybrid_engine:
+337|            assert Role.ActorRollout in role_worker_mapping or Role.ActorRolloutRef in role_worker_mapping, (
+338|                f"{role_worker_mapping.keys()=}"
+339|            )
+340|
+341|        self.role_worker_mapping = role_worker_mapping
+342|        self.resource_pool_manager = resource_pool_manager
+343|        self.use_reference_policy = need_reference_policy(self.config)
+344|        self.use_teacher_policy = need_teacher_policy(self.config)
+345|
+346|        self.use_rm = need_reward_model(self.config)
+347|
+348|        self.use_critic = need_critic(self.config)
+349|        self.ray_worker_group_cls = ray_worker_group_cls
+(more lines below)

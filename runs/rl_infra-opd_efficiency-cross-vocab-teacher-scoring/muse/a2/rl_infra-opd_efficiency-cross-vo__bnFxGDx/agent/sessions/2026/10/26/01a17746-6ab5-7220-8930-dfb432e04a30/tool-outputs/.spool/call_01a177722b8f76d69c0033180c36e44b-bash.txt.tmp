@@ -1,0 +1,159 @@
+[build-system]
+requires = [
+    "packaging",
+    "setuptools >= 49.4.0",
+    "wheel",
+]
+build-backend = "setuptools.build_meta"
+
+[tool.isort]
+profile = "black"  # black-compatible
+line_length = 119  # should match black parameters
+ignore_whitespace = true  # ignore whitespace for compatibility with the initial style
+py_version = 310  # python 3.10 as a target version
+sections = ["FUTURE", "STDLIB", "THIRDPARTY", "FIRSTPARTY", "LOCALFOLDER"]
+default_section = "THIRDPARTY"
+extend_skip = ["setup.py", "docs/source/conf.py"]
+known_first_party = ["miles", "miles_plugins"]
+known_third_party = ["megatron", "wandb", "ray", "transformers"]
+src_paths = ["miles", "miles_plugins"]
+
+
+[tool.black]
+line_length = 119
+
+[tool.ruff]
+line-length = 320  # TODO
+select = [
+    "E",      # Pycodestyle Errors (Structural/Fundamental Errors like bad indentation)
+    "F",      # Pyflakes (Core Errors: Unused imports, undefined names)
+    "B",      # Flake8-Bugbear (Logic Bugs: Variable shadowing, dangerous default arguments)
+    "UP",     # pyupgrade (Modernization and compatibility issues)
+]
+ignore = [
+    "E402", # module-import-not-at-top-of-file
+    "E501", # Line too long # TODO handle it later
+]
+
+
+[tool.pytest.ini_options]
+# durations=0 will display all tests execution time, sorted in ascending order starting from from the slowest one.
+# -vv will also display tests with duration = 0.00s
+addopts = "--verbose --pyargs --durations=0 --strict-markers"  # always add these arguments to pytest
+testpaths = ["./tests"]  # must be an explicit path to avoid importing another "tests" module
+# directories to ignore when discovering tests
+norecursedirs = [
+    "external",
+    "snapshots",
+    "examples",
+    "docs",
+    "scripts",
+    "tools",
+    "tutorials",
+    "*.egg",
+    ".*",
+    "_darcs",
+    "build",
+    "CVS",
+    "dist",
+    "venv",
+    "{arch}",
+]
+asyncio_mode = "auto"
+# NOTE: we do not use pytest markers currently. tests are mainly separated by folders, i.e. tests/fast vs tests/e2e
+default_language_version:
+  python: python3
+
+# The vendored upstream module stays byte-diffable against its source; keep
+# formatters and linters away so upstream-tracking diffs remain minimal.
+exclude: '^miles/utils/chat_template_utils/templates/encoding_dsv32\.py$'
+
+ci:
+  autofix_prs: true
+  autoupdate_commit_msg: '[pre-commit.ci] pre-commit suggestions'
+  autoupdate_schedule: quarterly
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: check-yaml
+        args: ['--allow-multiple-documents']
+        exclude: '^charts/.*/templates/'
+      - id: check-case-conflict
+      - id: detect-private-key
+      - id: check-added-large-files
+        args: ['--maxkb=1000']
+      - id: requirements-txt-fixer
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.7
+    hooks:
+      - id: ruff-check
+        args: [ --fix ]
+
+  - repo: https://github.com/PyCQA/autoflake
+    rev: v2.0.2
+    hooks:
+      - id: autoflake
+        args: [--remove-all-unused-imports, --in-place]
+
+  - repo: https://github.com/pycqa/isort
+    rev: 5.13.2          # 选一个稳定版本
+    hooks:
+      - id: isort
+        args:
+          - "--profile=black"        # 常见：与 Black 对齐风格
+          - "--filter-files"         # 忽略已在 .gitignore 的文件
+        additional_dependencies: []  # 需要插件时在这里加
+
+  - repo: https://github.com/psf/black
+    rev: 24.3.0
+    hooks:
+      - id: black
+        name: Format code
+        additional_dependencies: ['click==8.0.2']
+
+  - repo: local
+    hooks:
+      - id: sync-example-docs
+        name: Mirror examples/ READMEs into the docs site
+        language: system
+        entry: python3 scripts/tools/sync_example_docs.py
+        files: '^(examples/.*README\.md|docs/examples/.*|docs/docs\.json|scripts/tools/sync_example_docs\.py)$'
+        pass_filenames: false
+
+      - id: ban-docs-nav-group-root
+        name: Ban group `root` in docs navigation (put the landing page first in `pages` with `sidebarTitle Overview` instead; see docs/README.md)
+        language: pygrep
+        entry: '"root":'
+        files: ^docs/docs\.json$
+
+      - id: helm-lint
+        name: helm lint every chart
+        language: system
+        entry: python3 tools/kubernetes/lint_charts.py
+        pass_filenames: false
+        files: '^charts/'
+
+      - id: ban-mpu-get
+        name: Ban direct mpu.get_* calls (use ParallelState)
+        language: pygrep
+        entry: 'mpu\.get_'
+        types: [python]
+        exclude: '(backends/megatron_utils/parallel\.py|tools/convert_to_hf\.py|miles_plugins/|examples/)'
+
+      - id: ban-bare-auto-loaders
+        name: Ban bare Auto{Config,Tokenizer}.from_pretrained (use load_hf_config / load_tokenizer)
+        language: pygrep
+        entry: '(AutoConfig|AutoTokenizer)\.from_pretrained'
+        types: [python]
+        exclude: '(miles/utils/hf_utils/config\.py|miles/utils/processing_utils\.py|tests/|test_utils/|miles_plugins/|examples/)'
+
+      - id: ban-huggingface-cli
+        name: Ban deprecated huggingface-cli (use hf)
+        language: pygrep
+        entry: 'huggingface-cli'
+        types: [python]
+error: Failed to fetch: `https://pypi.org/simple/ruff/`
+  Caused by: Request failed after 3 retries

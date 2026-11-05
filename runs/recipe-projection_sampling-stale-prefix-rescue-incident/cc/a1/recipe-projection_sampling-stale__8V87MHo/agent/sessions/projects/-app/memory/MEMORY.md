@@ -1,0 +1,2 @@
+- [Rescue experiment findings (Oct 2026)](rescue-experiment-2026-10.md) — in-place cache staleness, SGLang decode-tracking bug, rescue vs plain GRPO
+- [Evaluating SQL-agent runs](rescue-eval-method.md) — checkpoint eval + paired pass rate; in-run eval too noisy

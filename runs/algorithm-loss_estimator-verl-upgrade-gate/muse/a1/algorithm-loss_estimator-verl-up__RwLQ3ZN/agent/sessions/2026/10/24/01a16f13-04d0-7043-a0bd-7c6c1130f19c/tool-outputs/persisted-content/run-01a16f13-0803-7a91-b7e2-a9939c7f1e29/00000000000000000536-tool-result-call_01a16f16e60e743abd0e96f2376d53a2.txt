@@ -1,0 +1,258 @@
+Read text file `/opt/verl/verl/trainer/ppo/v1/agent_loop_tq.py`.
+1|# Copyright 2024 Bytedance Ltd. and/or its affiliates
+2|#
+3|# Licensed under the Apache License, Version 2.0 (the "License");
+4|# you may not use this file except in compliance with the License.
+5|# You may obtain a copy of the License at
+6|#
+7|#     http://www.apache.org/licenses/LICENSE-2.0
+8|#
+9|# Unless required by applicable law or agreed to in writing, software
+10|# distributed under the License is distributed on an "AS IS" BASIS,
+11|# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+12|# See the License for the specific language governing permissions and
+13|# limitations under the License.
+14|
+15|# TODO: move this file to verl.experimental.agent_loop after V1 is stable
+16|"""TransferQueue adapter for AgentLoopManager and AgentLoopWorker"""
+17|
+18|import asyncio
+19|import logging
+20|import os
+21|from typing import Any
+22|
+23|import ray
+24|import torch
+25|import transfer_queue as tq
+26|from tensordict import NonTensorData, NonTensorStack, TensorDict
+27|
+28|from verl.experimental.agent_loop import (
+29|    AgentLoopManager,
+30|    AgentLoopOutput,
+31|    AgentLoopWorker,
+32|    get_trajectory_info,
+33|)
+34|from verl.utils.ray_utils import auto_await
+35|from verl.utils.tensordict_utils import list_of_dict_to_tensordict
+36|
+37|logger = logging.getLogger(__name__)
+38|logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+39|
+40|
+41|def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
+42|    params["top_p"] = 1.0
+43|    params["top_k"] = -1
+44|    params["temperature"] = 0
+45|
+46|
+47|async def _settle_session_tasks(tasks: list[asyncio.Task[Any]]) -> list[BaseException]:
+48|    results = await asyncio.gather(*tasks, return_exceptions=True)
+49|    return [result for result in results if isinstance(result, BaseException)]
+50|
+51|
+52|@ray.remote
+53|class AgentLoopWorkerTQ(AgentLoopWorker):
+54|    def __init__(self, *args, **kwargs):
+55|        super().__init__(*args, **kwargs)
+56|        tq.init()
+57|        self.background_tasks = set()
+58|
+59|    async def generate_sequences(self, batch: TensorDict) -> None:
+60|        """Spawn agent loop for each sample in the batch without waiting for the results."""
+61|        validate = batch["validate"] if "validate" in batch else False
+62|        batch.pop("validate", None)
+63|        config = self.config.actor_rollout_ref.rollout
+64|        sampling_params = dict(
+65|            temperature=config.temperature,
+66|            top_p=config.top_p,
+67|            top_k=config.top_k,
+68|            repetition_penalty=1.0,
+69|            logprobs=config.calculate_log_probs,
+70|        )
+71|
+72|        # override sampling params for validation
+73|        if validate:
+74|            sampling_params["top_p"] = config.val_kwargs.top_p
+75|            sampling_params["top_k"] = config.val_kwargs.top_k
+76|            sampling_params["temperature"] = config.val_kwargs.temperature
+77|
+78|        # by default, we assume it's a single turn agent
+79|        if "agent_name" not in batch:
+80|            default_agent_loop = config.agent.default_agent_loop
+81|            batch["agent_name"] = NonTensorData(default_agent_loop)
+82|
+83|        trajectory_info = await get_trajectory_info(batch["global_steps"], batch["index"], validate)
+84|
+85|        # create background tasks for each sample in the batch
+86|        for i in range(len(batch)):
+87|            # TODO(wuxibin): add trace support
+88|            trace_this_sample = False
+89|            prompt = {}
+90|            for k, v in batch.items():
+91|                if isinstance(v, torch.Tensor):
+92|                    prompt[k] = v[i]
+93|                elif isinstance(v, NonTensorStack):
+94|                    prompt[k] = v[i].data
+95|                elif isinstance(v, NonTensorData):
+96|                    prompt[k] = v.data
+97|                else:
+98|                    logger.exception(f"Unsupported type {type(v)} for key {k}")
+99|
+100|            # “fire-and-forget” background tasks
+101|            task = asyncio.create_task(
+102|                self._run_prompt(prompt, sampling_params, trajectory=trajectory_info[i], trace=trace_this_sample)
+103|            )
+104|            self.background_tasks.add(task)
+105|            task.add_done_callback(self.background_tasks.discard)
+106|
+107|    async def _run_prompt(self, prompt: dict, sampling_params: dict, trajectory: dict, trace: bool = False) -> None:
+108|        """Spawn multiple agent loops in parallel according to rollout.n or rollout.val_kwargs.n."""
+109|        uid, partition_id = prompt["uid"], "train" if not trajectory["validate"] else "val"
+110|        await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "running"})
+111|        tasks = []
+112|        try:
+113|            # NOTE: user can dynamically adjust n for each sample here, e.g according to task difficulty.
+114|            config = self.config.actor_rollout_ref.rollout
+115|            n = prompt.pop("__rollout_n__", config.n if not trajectory["validate"] else config.val_kwargs.n)
+116|            do_sample = prompt.pop("__do_sample__", True)
+117|
+118|            run_sampling_params = dict(sampling_params)
+119|            if not trajectory["validate"] and not do_sample:
+120|                apply_greedy_sampling_params(run_sampling_params)
+121|
+122|            tasks = []
+123|            for i in range(n):
+124|                task = asyncio.create_task(
+125|                    self._run_agent_loop(
+126|                        run_sampling_params, trajectory=trajectory, trace=trace, session_id=i, **prompt
+127|                    )
+128|                )
+129|                tasks.append(task)
+130|
+131|            # Publish a terminal status only after every session settles, so no sibling can write after
+132|            # ReplayBuffer clears a failed group.
+133|            session_errors = await _settle_session_tasks(tasks)
+134|            if session_errors:
+135|                for error in session_errors:
+136|                    logger.error(
+137|                        f"Error in _run_prompt for uid={uid}",
+138|                        exc_info=(type(error), error, error.__traceback__),
+139|                    )
+140|                status = "failure"
+141|            else:
+142|                status = "finished"
+143|            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": status})
+144|        except Exception as e:
+145|            logger.exception(f"Error in _run_prompt: {e}")
+146|            if tasks:
+147|                await _settle_session_tasks(tasks)
+148|            await tq.async_kv_put(key=uid, partition_id=partition_id, tag={"status": "failure"})
+149|
+150|    async def _agent_loop_postprocess(
+151|        self, output: AgentLoopOutput | list[AgentLoopOutput], validate, **kwargs
+152|    ) -> None:
+153|        """Put agent loop outputs into TransferQueue."""
+154|        uid, session_id = kwargs["uid"], kwargs["session_id"]
+155|        outputs = output if isinstance(output, list) else [output]
+156|        if not outputs:
+157|            logger.warning(f"Empty output for prompt {uid}_{session_id}")
+158|            return
+159|
+160|        await self._compute_score(outputs, kwargs=kwargs)
+161|
+162|        final_output = outputs[-1]
+163|        # TODO: Support output:list[AgentLoopOutput]
+164|        await self._compute_teacher_logprobs(
+165|            final_output,
+166|            prompt_ids=final_output.prompt_ids,
+167|            response_ids=final_output.response_ids,
+168|            validate=validate,
+169|            sample_kwargs=kwargs,
+170|        )
+171|
+172|        if final_output.reward_score is not None:
+173|            for output in outputs[:-1]:
+174|                output.reward_score = final_output.reward_score
+175|                output.extra_fields["reward_extra_info"] = final_output.extra_fields["reward_extra_info"]
+176|
+177|        # NOTE: agent loop may has multiple outputs, put each output into TransferQueue.
+178|        # key format: {uid}_{session_id}_{index}
+179|        # - uid: raw prompt uid from dataset
+180|        # - session_id: session id for rollout.n sampling
+181|        # - index: index of agent loop output
+182|        keys, fields, tags = [], [], []
+183|        for i, output in enumerate(outputs):
+184|            prompts = torch.tensor(output.prompt_ids, dtype=torch.int64)
+185|            responses = torch.tensor(output.response_ids, dtype=torch.int64)
+186|            input_ids = torch.cat([prompts, responses], dim=0)
+187|            attention_mask = torch.ones_like(input_ids, dtype=torch.int64)
+188|            multi_modal_inputs = self._compute_multi_modal_inputs(output, input_ids)
+189|            position_ids = self._compute_position_ids(
+190|                input_ids.unsqueeze(0), attention_mask.unsqueeze(0), multi_modal_inputs
+191|            ).squeeze(0)
+192|
+193|            keys.append(f"{uid}_{session_id}_{i}")
+194|            field = output.as_dict()
+195|            field.update(kwargs)
+196|            # do not store raw image/video
+197|            field.pop("multi_modal_data", None)
+198|            # TODO: uniform response_mask and loss_mask
+199|            field["loss_mask"] = field["response_mask"]
+200|            field["input_ids"] = input_ids
+201|            field["position_ids"] = position_ids
+202|            field["multi_modal_inputs"] = multi_modal_inputs
+203|            fields.append(field)
+204|            prompt_len, response_len = field["prompts"].size(0), field["responses"].size(0)
+205|            tags.append(
+206|                {
+207|                    "status": "success",
+208|                    "prompt_len": prompt_len,
+209|                    "response_len": response_len,
+210|                    "seq_len": prompt_len + response_len,
+211|                    # These tags are used for off-policy staleness control, if a trajectory
+212|                    # spans too many global steps, we need to filter it out.
+213|                    # global_steps: which global steps this sample is from dataloader
+214|                    "global_steps": kwargs["global_steps"],
+215|                    # min_global_steps: start generation model weights version of this trajectory
+216|                    "min_global_steps": field["extra_fields"].get("min_global_steps"),
+217|                    # max_global_steps: end generation model weights version of this trajectory
+218|                    "max_global_steps": field["extra_fields"].get("max_global_steps"),
+219|                }
+220|            )
+221|
+222|        await tq.async_kv_batch_put(
+223|            keys=keys,
+224|            fields=list_of_dict_to_tensordict(fields),
+225|            tags=tags,
+226|            partition_id="train" if not validate else "val",
+227|        )
+228|
+229|
+230|class AgentLoopManagerTQ(AgentLoopManager):
+231|    def __init__(self, *args, **kwargs):
+232|        self.agent_loop_workers_class = AgentLoopWorkerTQ
+233|        super().__init__(*args, **kwargs)
+234|
+235|    @classmethod
+236|    @auto_await
+237|    async def create(cls, *args, **kwargs):
+238|        """Create agent loop manager."""
+239|        instance = cls(*args, **kwargs)
+240|        await instance._init_agent_loop_workers()
+241|        return instance
+242|
+243|    def generate_sequences(self, prompts: TensorDict) -> None:
+244|        """
+245|        Dispatch input batch to agent loop workers without blocking. Workers should put agent loop outputs
+246|        into TransferQueue once an agent loop finished.
+247|
+248|        Args:
+249|            prompts (TensorDict): Input batch from train or validation dataset.
+250|        """
+251|        chunkes = prompts.chunk(len(self.agent_loop_workers))
+252|        ray.get(
+253|            [
+254|                worker.generate_sequences.remote(chunk)
+255|                for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=False)
+256|            ]
+257|        )

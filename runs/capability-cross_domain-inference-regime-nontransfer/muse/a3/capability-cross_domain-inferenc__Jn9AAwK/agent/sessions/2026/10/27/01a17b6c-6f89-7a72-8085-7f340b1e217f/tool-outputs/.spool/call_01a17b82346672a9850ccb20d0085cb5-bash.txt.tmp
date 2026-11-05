@@ -1,0 +1,56 @@
+  0%|          | 0/36 [00:00<?, ?it/s]Capturing batches (bs=256 avail_mem=15.60 GB):   0%|          | 0/36 [00:00<?, ?it/s]  0%|          | 0/36 [00:00<?, ?it/s]Capturing batches (bs=256 avail_mem=15.60 GB):   0%|          | 0/36 [00:00<?, ?it/s]2026-10-27 03:51:50,007 - CUTE_DSL - WARNING - [handle_import_error] - Unexpected error during package walk: cutlass.cute.experimental
+[2026-10-27 03:51:50 DP0] Unexpected error during package walk: cutlass.cute.experimental
+2026-10-27 03:51:50,007 - CUTE_DSL - WARNING - [handle_import_error] - Unexpected error during package walk: cutlass.cute.experimental
+[2026-10-27 03:51:50 DP1] Unexpected error during package walk: cutlass.cute.experimental
+  return self.create_error_response(str(e))
+                    image_tokens=total_image_tokens,
+                    audio_tokens=total_audio_tokens,
+                    video_tokens=total_video_tokens,
+                )
+                usage_chunk = ChatCompletionStreamResponse(
+                    id=content["meta_info"]["id"],
+                    created=int(time.time()),
+                    choices=[],  # Empty choices array as per OpenAI spec
+                    model=request.model,
+                    usage=usage,
+                )
+                yield f"data: {usage_chunk.model_dump_json()}\n\n"
+
+        except ValueError as e:
+            if not stream_started:
+                raise
+            error = self.create_streaming_error_response(str(e))
+            yield f"data: {error}\n\n"
+
+        yield "data: [DONE]\n\n"
+
+    async def _handle_non_streaming_request(
+        self,
+        adapted_request: GenerateReqInput,
+        request: ChatCompletionRequest,
+        raw_request: Request,
+    ) -> Union[ChatCompletionResponse, ErrorResponse, ORJSONResponse]:
+        """Handle non-streaming chat completion request"""
+        try:
+            ret = await self.tokenizer_manager.generate_request(
+                adapted_request, raw_request
+            ).__anext__()
+        except ValueError as e:
+            return self.create_error_response(str(e))
+
+        if not isinstance(ret, list):
+            ret = [ret]
+
+        response = self._build_chat_response(
+            request,
+            ret,
+            int(time.time()),
+        )
+
+        return response
+
+    def _build_chat_response(
+        self,
+        request: ChatCompletionRequest,
+        ret: List[Dict[str, Any]],
+        created: int,

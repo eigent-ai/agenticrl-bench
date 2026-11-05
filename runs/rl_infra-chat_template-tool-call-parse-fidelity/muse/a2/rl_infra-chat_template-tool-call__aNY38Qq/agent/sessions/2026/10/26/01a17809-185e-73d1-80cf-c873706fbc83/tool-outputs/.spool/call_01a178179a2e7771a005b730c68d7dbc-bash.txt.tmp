@@ -1,0 +1,41 @@
+470:def detect_reasoning_pattern(
+471-    template: Optional[str],
+472-) -> Tuple[bool, Optional[ReasoningToggleConfig]]:
+473-    """Detect if the chat template contains reasoning/thinking patterns."""
+474-    if template is None:
+475-        return False, None
+476-
+477-    ctx = TemplateDetectionContext(
+478-        template=template,
+479-        reasoning_config=None,
+480-        force_reasoning=False,
+481-        vocab=set(),
+482-    )
+483-    for rule in REASONING_MODE_RULES:
+484-        if rule.predicate(ctx):
+485-            return rule.value.always_on, rule.value
+486-
+487-    return False, None
+488-
+489-
+490-def detect_reasoning_parser(
+491-    template: Optional[str],
+492-    tokenizer,
+493-    reasoning_config: Optional[ReasoningToggleConfig] = None,
+494-    force_reasoning: bool = False,
+495-) -> Optional[str]:
+496-    """Auto-detect which reasoning parser to use from the chat template."""
+497-    ctx = build_detection_context(
+498-        template, tokenizer, reasoning_config, force_reasoning
+499-    )
+500-    if ctx is None:
+501-        return None
+502-    return match_rules(ctx, REASONING_PARSER_RULES, "reasoning parser")
+503-
+504-
+505-def detect_tool_call_parser(
+506-    template: Optional[str],
+507-    tokenizer,
+508-    reasoning_config: Optional[ReasoningToggleConfig] = None,
+509-    force_reasoning: bool = False,
+510-) -> Optional[str]:

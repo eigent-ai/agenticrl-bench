@@ -1,0 +1,191 @@
+    def _process_messages(
+        self, request: ChatCompletionRequest, is_multimodal: bool
+    ) -> MessageProcessingResult:
+        """Process chat messages and apply chat template"""
+        # GptOss model needs to keep special tokens for harmony parsing
+        if self.is_gpt_oss or self.is_gemma4:
+            request.skip_special_tokens = False
+
+        self._patch_reasoning_skip_special_tokens(request)
+
+        thinking_mode = self._get_reasoning_from_request(request)
+        # SGLang's ReasonerGrammarBackend owns the reasoning prefix
+        # when --reasoning-parser is configured, so builtin xgrammar
+        # tags must describe only the post-reasoning tool-call suffix.
+        xgrammar_reasoning = thinking_mode and (
+            self.tokenizer_manager.server_args.reasoning_parser is None
+        )
+        tool_call_constraint = None
+
+        # Apply chat template and its stop strings
+        tools = None
+        if request.tools and request.tool_choice != "none":
+            request.skip_special_tokens = False
+            if not isinstance(request.tool_choice, str):
+                tools = [
+                    item.model_dump()
+                    for item in request.tools
+                    if item.function.name == request.tool_choice.function.name
+                ]
+            else:
+                tools = [item.model_dump() for item in request.tools]
+            if self.tool_call_parser:
+                parser = FunctionCallParser(
+                    request.tools,
+                    self.tool_call_parser,
+                    tokenizer=self.tokenizer_manager.tokenizer,
+                )
+                tool_call_constraint = parser.get_structure_constraint(
+                    request.tool_choice,
+                    parallel_tool_calls=request.parallel_tool_calls,
+                    thinking_mode=xgrammar_reasoning,
+                )
+            # Fallback: use generic JSON schema for required/named tool choice
+            # only when no parser-specific constraint was set
+            if tool_call_constraint is None and (
+                request.tool_choice == "required"
+                or isinstance(request.tool_choice, ToolChoice)
+            ):
+                json_schema = get_json_schema_constraint(
+                    request.tools,
+                    request.tool_choice,
+                    parallel_tool_calls=request.parallel_tool_calls,
+                )
+                tool_call_constraint = ("json_schema", json_schema)
+
+        # When input_ids are provided, skip template tokenization entirely;
+        # only stop tokens and tool_call_constraint are needed.
+        if request.input_ids is not None:
+            result = MessageProcessingResult(
+                prompt="",
+                prompt_ids=request.input_ids,
+                image_data=None,
+                audio_data=None,
+                video_data=None,
+                modalities=[],
+                stop=request.stop or [],
+            )
+        elif self.template_manager.chat_template_name is None:
+            result = self._apply_jinja_template(request, tools, is_multimodal)
+        else:
+            result = self._apply_conversation_template(request, is_multimodal)
+
+        result.tool_call_constraint = tool_call_constraint
+        return result
+
+    def _apply_jinja_template(
+        self,
+        request: ChatCompletionRequest,
+        tools: Optional[List[Dict]],
+        is_multimodal: bool,
+    ) -> MessageProcessingResult:
+        """Apply Jinja chat template"""
+        prompt = ""
+        prompt_ids = []
+        openai_compatible_messages = []
+        image_data = []
+        video_data = []
+        audio_data = []
+        modalities = []
+
+        template_content_format = self.template_manager.jinja_template_content_format
+
+        # Try custom encoding first (override in subclass for custom renderers)
+        thinking_requested = (request.chat_template_kwargs or {}).get(
+            "thinking", envs.SGLANG_DEFAULT_THINKING.get()
+        )
+        thinking_mode = (
+            ThinkingMode.THINKING if thinking_requested else ThinkingMode.CHAT
+        )
+        messages = [msg.model_dump() for msg in request.messages]
+        for message in messages:
+            normalize_assistant_tool_call_arguments(message)
+
+        prompt_ids = self._encode_messages(
+            copy.deepcopy(messages), request, thinking_mode
+        )
+
+        if prompt_ids is not None:
+            # Custom encoding handled it - no further processing needed
+            pass
+        elif self.chat_encoding_spec is not None:
+            # dsv4/dsv32 encoding path
+            messages = copy.deepcopy(messages)
+
+            # dsv4/dsv32 are text-only and consume string content; flatten
+            # OpenAI parts-list content here so the encoder sees a plain string.
+            for i, msg in enumerate(messages):
+                if isinstance(msg.get("content"), list):
+                    messages[i] = process_content_for_template_format(
+                        msg, "string", [], [], [], []
+            request.continue_final_message
+            and request.messages
+            and request.messages[-1].role == "assistant"
+        ):
+            # Remove the auto-added blank assistant turn, if present.
+            if conv.messages and conv.messages[-1][1] is None:
+                conv.messages.pop()
+            # Rebuild the prompt from the conversation.
+            prompt = conv.get_prompt()
+            # Strip trailing stop tokens or separators that indicate end-of-assistant.
+            if isinstance(conv.stop_str, list):
+                for stop_token in conv.stop_str:
+                    if prompt.endswith(stop_token):
+                        prompt = prompt[: -len(stop_token)]
+            elif isinstance(conv.stop_str, str) and prompt.endswith(conv.stop_str):
+                prompt = prompt[: -len(conv.stop_str)]
+            if conv.sep and prompt.endswith(conv.sep):
+                prompt = prompt[: -len(conv.sep)]
+            if getattr(conv, "sep2", None) and prompt.endswith(conv.sep2):
+                prompt = prompt[: -len(conv.sep2)]
+        else:
+            prompt = conv.get_prompt()
+            if self._get_reasoning_from_request(request) and (
+                self._reasoning_detector is None
+                or not self._reasoning_detector.thinks_internally
+            ):
+                # Models with thinks_internally=True think without a leading <think> token
+                prompt += "<think>"  # Note(Xinyuan): hard code thinking token
+
+        image_data = conv.image_data if conv.image_data else None
+        video_data = conv.video_data if conv.video_data else None
+        audio_data = conv.audio_data if conv.audio_data else None
+        modalities = conv.modalities if conv.modalities else []
+        stop = copy.copy(conv.stop_str or [] if not request.ignore_eos else [])
+
+        if request.stop:
+            if isinstance(request.stop, str):
+                stop.append(request.stop)
+            else:
+                stop.extend(request.stop)
+
+        if not is_multimodal:
+            prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt)
+
+        return MessageProcessingResult(
+            prompt=prompt,
+            prompt_ids=prompt_ids,
+            image_data=image_data,
+            video_data=video_data,
+            audio_data=audio_data,
+            modalities=modalities,
+            stop=stop,
+        )
+
+    async def _handle_streaming_request(
+        self,
+        adapted_request: GenerateReqInput,
+        request: ChatCompletionRequest,
+        raw_request: Request,
+    ) -> Union[StreamingResponse, ErrorResponse]:
+        """Handle streaming chat completion request"""
+        generator = self._generate_chat_stream(adapted_request, request, raw_request)
+
+        # Kick-start the generator to trigger validation before HTTP 200 is sent.
+        # If validation fails (e.g., context length exceeded), we can still return
+        # a proper HTTP 400 error response instead of streaming it as SSE payload.
+        try:
+            first_chunk = await generator.__anext__()
+        except ValueError as e:
+            return self.create_error_response(str(e))
+

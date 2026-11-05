@@ -1,0 +1,123 @@
+Read text file `/app/reference/harbor-0.23.0/harbor/trial/trial.py`.
+(1419 line(s) above)
+1420|        await self._artifact_handler.download_artifacts(
+1421|            self.agent_environment,
+1422|            artifacts_dir,
+1423|            source_artifacts_dir=self.agent_env_paths.artifacts_dir,
+1424|            artifacts=step_artifacts,
+1425|            services=sidecars,
+1426|        )
+1427|
+1428|    def _init_timeouts(self) -> None:
+1429|        self._agent_timeout_sec = self._compute_agent_timeout_sec()
+1430|        self._verifier_timeout_sec = self._compute_verifier_timeout_sec()
+1431|        self._agent_setup_timeout_sec = self._compute_agent_setup_timeout_sec()
+1432|        self._environment_build_timeout_sec = (
+1433|            self._compute_environment_build_timeout_sec()
+1434|        )
+1435|
+1436|    def _compute_agent_timeout_sec(self) -> float | None:
+1437|        base_timeout_sec = (
+1438|            self.config.agent.override_timeout_sec or self.task.config.agent.timeout_sec
+1439|        )
+1440|        if base_timeout_sec is None:
+1441|            return None
+1442|
+1443|        return self._resolve_timeout_sec(
+1444|            base_sec=base_timeout_sec,
+1445|            max_sec=self.config.agent.max_timeout_sec,
+1446|            multiplier=self.config.agent_timeout_multiplier,
+1447|        )
+1448|
+1449|    def _compute_verifier_timeout_sec(self) -> float:
+1450|        return self._resolve_timeout_sec(
+1451|            base_sec=(
+1452|                self.config.verifier.override_timeout_sec
+1453|                or self.task.config.verifier.timeout_sec
+1454|            ),
+1455|            max_sec=self.config.verifier.max_timeout_sec,
+1456|            multiplier=self.config.verifier_timeout_multiplier,
+1457|        )
+1458|
+1459|    def _compute_agent_setup_timeout_sec(self) -> float:
+1460|        base_timeout_sec = (
+1461|            self.config.agent.override_setup_timeout_sec
+1462|            if self.config.agent.override_setup_timeout_sec is not None
+1463|            else self._AGENT_SETUP_TIMEOUT_SEC
+1464|        )
+1465|        return self._resolve_timeout_sec(
+1466|            base_sec=base_timeout_sec,
+1467|            multiplier=self.config.agent_setup_timeout_multiplier,
+1468|        )
+1469|
+1470|    def _compute_environment_build_timeout_sec(self) -> float:
+1471|        return self._resolve_timeout_sec(
+1472|            base_sec=self.task.config.environment.build_timeout_sec,
+1473|            multiplier=self.config.environment_build_timeout_multiplier,
+1474|        )
+1475|
+1476|    def _resolve_injected_skills(self) -> list[ResolvedSkill]:
+1477|        if not self.config.agent.skills:
+1478|            return []
+1479|        return resolve_skills(self.config.agent.skills)
+1480|
+1481|    @staticmethod
+1482|    def _resolve_agent_skills(config: TrialConfig) -> None:
+1483|        """Resolve any string entries in ``skills`` to local paths.
+1484|
+1485|        Mirrors :meth:`Job._resolve_agent_skills` for the standalone-trial
+1486|        path (``harbor trial run``).
+1487|        """
+1488|        agent = config.agent
+1489|        str_sources = [s for s in agent.skills if isinstance(s, str)]
+1490|        if str_sources:
+1491|            resolved = resolve_skill_sources(str_sources)
+1492|            agent.skills = [str(s) for s in resolved]
+1493|
+1494|    def _resolve_effective_skills_dir(self) -> str | None:
+1495|        task_skills_dir = self.task.config.environment.skills_dir
+1496|        if task_skills_dir:
+1497|            if (
+1498|                self._injected_skills
+1499|                and not PurePosixPath(task_skills_dir).is_absolute()
+1500|            ):
+1501|                raise ValueError(
+1502|                    "Injected skills require environment.skills_dir to be absolute; "
+1503|                    f"got {task_skills_dir!r}. Use an absolute path like '/skills' "
+1504|                    "or omit environment.skills_dir to use /harbor/skills."
+1505|                )
+1506|            return task_skills_dir
+1507|        if self._injected_skills:
+1508|            return self.agent_env_paths.default_skills_dir.as_posix()
+1509|        return None
+1510|
+1511|    async def _upload_injected_skills(self) -> None:
+1512|        if not self._injected_skills:
+1513|            return
+1514|        effective_skills_dir = self._effective_skills_dir
+1515|        if effective_skills_dir is None:
+1516|            return
+1517|
+1518|        skills_root = PurePosixPath(effective_skills_dir)
+1519|        target_dirs = [skills_root / skill.name for skill in self._injected_skills]
+1520|        await self.agent_environment.empty_dirs(target_dirs, chmod=False)
+1521|
+1522|        for skill, target_dir in zip(self._injected_skills, target_dirs, strict=True):
+1523|            await self.agent_environment.upload_dir(
+1524|                source_dir=skill.source,
+1525|                target_dir=target_dir.as_posix(),
+1526|            )
+1527|
+1528|        if self.task.config.environment.os != TaskOS.WINDOWS:
+1529|            chmod_targets = " ".join(
+1530|                quote_shell_arg(target_dir, self.task.config.environment.os)
+1531|                for target_dir in target_dirs
+1532|            )
+1533|            await self.agent_environment.exec(
+1534|                f"chmod -R a+rX {chmod_targets}",
+1535|                user="root",
+1536|            )
+1537|
+1538|    async def _setup_agent_environment(self) -> None:
+1539|        await self._emit(TrialEvent.ENVIRONMENT_START)
+(more lines below)

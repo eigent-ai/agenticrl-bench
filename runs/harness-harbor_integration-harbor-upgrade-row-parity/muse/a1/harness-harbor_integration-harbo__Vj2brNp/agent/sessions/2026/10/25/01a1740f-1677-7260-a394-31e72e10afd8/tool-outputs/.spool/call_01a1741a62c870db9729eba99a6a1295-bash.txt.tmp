@@ -1,0 +1,176 @@
+    async def _run_collect_hooks(
+        self,
+        hooks: Sequence[VerifierCollectConfig],
+    ) -> None:
+        """Run collect hooks best-effort; failures never abort the trial."""
+        for hook in hooks:
+            self.logger.debug(
+                f"Running collect hook in service '{hook.service}': {hook.command!r}"
+            )
+            try:
+                result = await self.agent_environment.service_exec(
+                    hook.command,
+                    service=hook.service,
+                    timeout_sec=int(hook.timeout_sec),
+                    user=hook.user,
+                )
+                if result.return_code != 0:
+                    self.logger.warning(
+                        f"Collect hook in service '{hook.service}' exited with "
+                        f"code {result.return_code}: {hook.command!r}. "
+                        f"stdout: {result.stdout} stderr: {result.stderr}"
+                    )
+                else:
+                    self.logger.debug(
+                        f"Collect hook in service '{hook.service}' completed"
+                    )
+            except Exception as exc:
+                self.logger.warning(
+                    f"Collect hook in service '{hook.service}' failed "
+                    f"({hook.command!r}): {exc}"
+                )
+
+    async def _collect_artifacts_phased(
+        self,
+        *,
+        artifacts_dir: Path,
+        step_cfg: StepConfig | None = None,
+        step_artifacts: Sequence[str | ArtifactConfig] | None = None,
+        stop_main_before_sidecars: bool = False,
+    ) -> None:
+        """Collect artifacts in two passes: main first, then sidecar services.
+
+        Sidecar evidence is collected over a channel the agent cannot write
+        to (each service's own filesystem). When *stop_main_before_sidecars*
+        is set (separate verifier mode, last use of the agent env), the main
+        service is stopped before the sidecar pass so leftover agent
+        processes cannot interfere with collection.
+        """
+        hooks = self._collect_hooks_for(step_cfg)
+        main_hooks = [hook for hook in hooks if hook.service == MAIN_SERVICE_NAME]
+        sidecar_hooks = [hook for hook in hooks if hook.service != MAIN_SERVICE_NAME]
+
+        # Claims dedupe within this pass only; prior steps' host paths were
+        # archived away, so their claims must not skip this pass's entries.
+        self._artifact_handler.begin_collection()
+
+        self.logger.debug("Collecting main service artifacts")
+        await self._run_collect_hooks(main_hooks)
+        await self._artifact_handler.download_artifacts(
+            self.agent_environment,
+            artifacts_dir,
+            source_artifacts_dir=self.agent_env_paths.artifacts_dir,
+            artifacts=step_artifacts,
+            services={MAIN_SERVICE_NAME},
+        )
+
+        sidecars = self._artifact_handler.sidecar_services(step_artifacts)
+        sidecars |= {hook.service for hook in sidecar_hooks}
+        if not sidecars:
+            return
+
+        if stop_main_before_sidecars:
+            self.logger.debug(
+                "Stopping main service before sidecar evidence collection"
+            )
+            try:
+                await self.agent_environment.stop_service(MAIN_SERVICE_NAME)
+                self.logger.debug("Main service stopped")
+            except Exception as exc:
+                self.logger.warning(
+                    f"Failed to stop main service before sidecar collection: {exc}"
+                )
+
+        self.logger.debug(
+            f"Collecting sidecar artifacts from services: {sorted(sidecars)}"
+        )
+        await self._run_collect_hooks(sidecar_hooks)
+        await self._artifact_handler.download_artifacts(
+            self.agent_environment,
+            artifacts_dir,
+            source_artifacts_dir=self.agent_env_paths.artifacts_dir,
+            artifacts=step_artifacts,
+            services=sidecars,
+        )
+
+    def _init_timeouts(self) -> None:
+        self._agent_timeout_sec = self._compute_agent_timeout_sec()
+    async def _download_agent_logs(self) -> None:
+        if self._are_agent_logs_downloaded:
+            return
+
+        if self.agent_environment.capabilities.mounted:
+            await self.agent_environment.prepare_logs_for_host()
+            self._are_agent_logs_downloaded = True
+            return
+
+        await self._download_role_logs(
+            agent_config=self.config.agent,
+            source_dir=self.agent_env_paths.agent_dir,
+            target_dir=self.paths.agent_dir,
+        )
+        if self.user_agent is not None and self.config.user_agent is not None:
+            await self._download_role_logs(
+                agent_config=self.config.user_agent,
+                source_dir=self.agent_env_paths.user_agent_dir,
+                target_dir=self.paths.user_agent_dir,
+            )
+
+        self._are_agent_logs_downloaded = True
+
+    async def _download_role_logs(
+        self,
+        *,
+        agent_config: AgentConfig,
+        source_dir: PurePosixPath,
+        target_dir: Path,
+    ) -> None:
+        try:
+            if agent_config.include_logs or agent_config.exclude_logs:
+                await self.agent_environment.download_dir_filtered(
+                    source_dir=source_dir.as_posix(),
+                    target_dir=target_dir,
+                    include=agent_config.include_logs or None,
+                    exclude=agent_config.exclude_logs or None,
+                )
+            else:
+                await self.agent_environment.download_dir(
+                    source_dir=source_dir.as_posix(),
+                    target_dir=target_dir,
+                )
+        except Exception as e:
+            self.logger.error(
+                f"Failed to download logs to {target_dir}: {e}",
+                exc_info=True,
+            )
+
+    async def _upload_agent_logs(self) -> None:
+        """Upload locally-generated agent logs back to non-mounted environments."""
+        if self.agent_environment.capabilities.mounted:
+            return
+
+        await self._upload_role_logs(
+            source_dir=self.paths.agent_dir,
+            target_dir=self.agent_env_paths.agent_dir,
+        )
+        if self.user_agent is not None:
+            await self._upload_role_logs(
+                source_dir=self.paths.user_agent_dir,
+                target_dir=self.agent_env_paths.user_agent_dir,
+            )
+
+    async def _upload_role_logs(
+        self, *, source_dir: Path, target_dir: PurePosixPath
+    ) -> None:
+        try:
+            await self.agent_environment.upload_dir(
+                source_dir=source_dir,
+                target_dir=target_dir.as_posix(),
+            )
+        except Exception as e:
+            self.logger.error(
+                f"Failed to upload {source_dir.name} logs back to environment: {e}",
+                exc_info=True,
+            )
+
+    async def _run_step_verifier(

@@ -1,0 +1,2 @@
+- [Agent proxy rewrite](agent-proxy-rewrite.md) — 2026-10-24 SGLang-faithful proxy redesign, open decisions, verification tools
+- [Live run tool](live-run-tool.md) — /opt/live/run.sh keeps runs per exact tree hash; ports 30000/31000 are taken

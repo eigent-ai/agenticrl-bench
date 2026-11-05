@@ -1,0 +1,83 @@
+Read text file `/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/agents/terminus_2/terminus_2.py`.
+(639 line(s) above)
+640|                "This will trigger your solution to be graded and you won't be able to "
+641|                "make any further corrections. If so, include "
+642|                "<task_complete>true</task_complete> again."
+643|            )
+644|        else:
+645|            raise ValueError(
+646|                f"Unknown parser_name: {self.options.parser_name}. Use 'json' or 'xml'."
+647|            )
+648|
+649|    def _count_total_tokens(self, chat: Chat) -> int:
+650|        """Count total tokens across all messages in the chat."""
+651|        from litellm.utils import token_counter
+652|
+653|        return token_counter(model=self._model_name, messages=chat.messages)
+654|
+655|    def _limit_output_length(self, output: str, max_bytes: int = 10000) -> str:
+656|        """
+657|        Limit output to specified byte length, keeping first and last portions.
+658|
+659|        Args:
+660|            output: The terminal output to potentially truncate
+661|            max_bytes: Maximum allowed bytes (default 10000)
+662|
+663|        Returns:
+664|            str: Original output if under limit, or truncated with middle omitted
+665|        """
+666|        if len(output.encode("utf-8")) <= max_bytes:
+667|            return output
+668|
+669|        # Calculate portions (half each for first and last)
+670|        portion_size = max_bytes // 2
+671|
+672|        # Convert to bytes for accurate splitting
+673|        output_bytes = output.encode("utf-8")
+674|
+675|        # Get first portion
+676|        first_portion = output_bytes[:portion_size].decode("utf-8", errors="ignore")
+677|
+678|        # Get last portion
+679|        last_portion = output_bytes[-portion_size:].decode("utf-8", errors="ignore")
+680|
+681|        # Calculate omitted bytes
+682|        omitted_bytes = (
+683|            len(output_bytes)
+684|            - len(first_portion.encode("utf-8"))
+685|            - len(last_portion.encode("utf-8"))
+686|        )
+687|
+688|        return (
+689|            f"{first_portion}\n[... output limited to {max_bytes} bytes; "
+690|            f"{omitted_bytes} interior bytes omitted ...]\n{last_portion}"
+691|        )
+692|
+693|    def _unwind_messages_to_free_tokens(
+694|        self, chat: Chat, target_free_tokens: int = 4000
+695|    ) -> None:
+696|        """Remove recent messages until we have enough free tokens."""
+697|        context_limit = self._llm.get_model_context_limit()
+698|
+699|        while len(chat.messages) > 1:  # Keep at least the first message
+700|            current_tokens = self._count_total_tokens(chat)
+701|            free_tokens = context_limit - current_tokens
+702|
+703|            if free_tokens >= target_free_tokens:
+704|                break
+705|
+706|            # Remove the most recent pair of messages (user + assistant)
+707|            if len(chat.messages) >= 2:
+708|                chat._messages = chat.messages[:-2]
+709|            else:
+710|                break
+711|
+712|        chat.reset_response_chain()
+713|        free_tokens = context_limit - self._count_total_tokens(chat)
+714|        self.logger.debug(
+715|            f"Unwound messages. Remaining messages: {len(chat.messages)}, "
+716|            f"Free tokens: approximately {free_tokens}"
+717|        )
+718|
+719|    def _collect_subagent_rollout_detail(self, response: LLMResponse) -> None:
+(more lines below)

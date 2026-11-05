@@ -1,0 +1,303 @@
+Read text file `/opt/verl/verl/trainer/ppo/v1/trainer_base.py`.
+(1699 line(s) above)
+1700|            # "perf/mfu/actor_infer": old_log_prob_mfu,
+1701|        }
+1702|        metrics.update(old_log_prob_metrics)
+1703|
+1704|        # 4. calculate rollout vs actor logprobs diff
+1705|        if self.config.actor_rollout_ref.rollout.calculate_log_probs:
+1706|            metrics.update(calculate_debug_metrics(data))
+1707|
+1708|        return batch
+1709|
+1710|    def _compute_ref_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+1711|        """Compute the reference log prob of the batch."""
+1712|        # 1. compute log probs
+1713|        metadata = {
+1714|            "calculate_entropy": False,
+1715|            "compute_loss": False,
+1716|            "temperature": self.config.actor_rollout_ref.rollout.temperature,
+1717|        }
+1718|        if self.ref_in_actor:
+1719|            metadata["no_lora_adapter"] = True
+1720|        batch.extra_info.update(metadata)
+1721|        if self.ref_in_actor:
+1722|            output = self.actor_rollout_wg.compute_log_prob(batch)
+1723|        else:
+1724|            output = self.ref_policy_wg.compute_ref_log_prob(batch)
+1725|        assert len(output) == len(batch)
+1726|
+1727|        # 2. write ref_log_prob and entropy back to TransferQueue
+1728|        data = tq.kv_batch_get(
+1729|            keys=batch.keys, partition_id=batch.partition_id, select_fields=["log_probs", "response_mask"]
+1730|        )
+1731|        data["ref_log_prob"] = response_from_nested(data.pop("log_probs"), data["response_mask"])
+1732|        tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data.select("ref_log_prob"))
+1733|
+1734|        return batch
+1735|
+1736|    def _compute_values(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+1737|        """Compute the values of the batch."""
+1738|        # 1. compute value
+1739|        batch.extra_info.update(
+1740|            {
+1741|                "compute_loss": False,
+1742|                "temperature": self.config.actor_rollout_ref.rollout.temperature,
+1743|            }
+1744|        )
+1745|        output = self.critic_wg.infer_batch(batch)
+1746|        # TODO: DataProtoFuture support KVBatchMeta
+1747|        ray.get(output.futures)
+1748|
+1749|        # 2. write value back to TransferQueue
+1750|        data = tq.kv_batch_get(
+1751|            keys=batch.keys, partition_id=batch.partition_id, select_fields=["values", "response_mask"]
+1752|        )
+1753|        data["values"] = response_from_nested(data.pop("values"), data["response_mask"])
+1754|        tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data.select("values"))
+1755|
+1756|        return batch
+1757|
+1758|    def _compute_advantage(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+1759|        """Compute the advantage of the batch."""
+1760|        fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
+1761|        data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+1762|
+1763|        response_mask = data["response_mask"]
+1764|        data = DataProto(batch=data.to_padded_tensor())
+1765|        data.batch["token_level_scores"] = data.batch["rm_scores"]
+1766|        data.non_tensor_batch["uid"] = np.array(data.batch.pop("uid").tolist(), dtype=object)
+1767|
+1768|        # 1. apply kl penalty to rewards
+1769|        if self.config.algorithm.use_kl_in_reward:
+1770|            data, kl_metrics = apply_kl_penalty(
+1771|                data, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
+1772|            )
+1773|            metrics.update(kl_metrics)
+1774|        else:
+1775|            data.batch["token_level_rewards"] = data.batch["token_level_scores"]
+1776|
+1777|        # 2. Compute rollout correction: IS weights, rejection sampling, and metrics
+1778|        # Only runs in decoupled mode (computes once per batch using stable π_old)
+1779|        # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
+1780|        rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+1781|        bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+1782|        rollout_correction = (
+1783|            rollout_corr_config is not None and "rollout_log_probs" in data.batch and not bypass_recomputing_logprobs
+1784|        )
+1785|        if rollout_correction:
+1786|            data, is_metrics = compute_rollout_correction_and_add_to_batch(data, rollout_corr_config)
+1787|            metrics.update(is_metrics)
+1788|
+1789|        # 3. compute advantages
+1790|        data = compute_advantage_for_multi_trajectories(
+1791|            data,
+1792|            batch_keys=batch.keys,
+1793|            adv_estimator=self.config.algorithm.adv_estimator,
+1794|            gamma=self.config.algorithm.gamma,
+1795|            lam=self.config.algorithm.lam,
+1796|            num_repeat=self.config.actor_rollout_ref.rollout.n,
+1797|            norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
+1798|            config=self.config.algorithm,
+1799|        )
+1800|
+1801|        # 4. write nested advantages and returns back to TransferQueue
+1802|        fields = ["advantages", "returns"]
+1803|        if self.config.algorithm.use_kl_in_reward:
+1804|            fields.append("token_level_rewards")
+1805|        if rollout_correction:
+1806|            fields.append("response_mask")
+1807|            if "rollout_is_weights" in data.batch:
+1808|                fields.append("rollout_is_weights")
+1809|
+1810|        output = {}
+1811|        for field in fields:
+1812|            output[field] = response_to_nested(data.batch[field], response_mask)
+1813|        output = TensorDict(output, batch_size=len(batch))
+1814|
+1815|        batch = tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=output)
+1816|
+1817|        return batch
+1818|
+1819|    def _update_critic(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+1820|        """Update the critic network."""
+1821|        ppo_mini_batch_size = self.config.critic.ppo_mini_batch_size
+1822|        ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+1823|        extra_info = {
+1824|            "global_batch_size": ppo_mini_batch_size,
+1825|            "mini_batch_size": ppo_mini_batch_size,
+1826|            "epochs": self.config.critic.ppo_epochs,
+1827|            "seed": self.config.critic.data_loader_seed,
+1828|            "dataloader_kwargs": {"shuffle": self.config.critic.shuffle},
+1829|            "temperature": self.config.actor_rollout_ref.rollout.temperature,
+1830|        }
+1831|        batch.extra_info.update(extra_info)
+1832|
+1833|        output: DataProtoFuture = self.critic_wg.train_mini_batch(batch)
+1834|        output: TensorDict = output.get()
+1835|        output = rename_dict(output["metrics"], "critic/")
+1836|        output["perf/mfu/critic"] = output.pop("critic/mfu")
+1837|        critic_metrics = reduce_metrics(output)
+1838|        metrics.update(critic_metrics)
+1839|
+1840|        return batch
+1841|
+1842|    def _update_actor(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+1843|        """Update the actor network."""
+1844|        ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+1845|        ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+1846|        calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
+1847|            self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
+1848|        )
+1849|        distillation_use_topk = (
+1850|            self.distillation_config.distillation_loss.loss_settings.use_topk
+1851|            if is_distillation_enabled(self.config.get("distillation"))
+1852|            else False
+1853|        )
+1854|        distillation_only = False  # distillation_only flag means we can skip policy loss and reduce mem footprint
+1855|        if is_distillation_enabled(self.config.get("distillation")):
+1856|            distillation_loss_cfg = self.distillation_config.distillation_loss
+1857|            distillation_only = (
+1858|                distillation_use_topk
+1859|                and not distillation_loss_cfg.use_task_rewards
+1860|                and not distillation_loss_cfg.use_policy_gradient
+1861|            )
+1862|        extra_info = {
+1863|            "calculate_entropy": calculate_entropy,
+1864|            "distillation_use_topk": distillation_use_topk,
+1865|            "distillation_only": distillation_only,
+1866|            "global_batch_size": ppo_mini_batch_size,
+1867|            "mini_batch_size": ppo_mini_batch_size,
+1868|            "epochs": self.config.actor_rollout_ref.actor.ppo_epochs,
+1869|            "seed": self.config.actor_rollout_ref.actor.data_loader_seed,
+1870|            "dataloader_kwargs": {"shuffle": self.config.actor_rollout_ref.actor.shuffle},
+1871|            "temperature": self.config.actor_rollout_ref.rollout.temperature,
+1872|        }
+1873|        batch.extra_info.update(extra_info)
+1874|
+1875|        output: TensorDict = self.actor_rollout_wg.update_actor(batch)
+1876|        output = rename_dict(output["metrics"], "actor/")
+1877|        output["perf/mfu/actor"] = output.pop("actor/mfu")
+1878|        actor_metrics = reduce_metrics(output)
+1879|        metrics.update(actor_metrics)
+1880|
+1881|        return batch
+1882|
+1883|    def _compute_metrics(self, batch: KVBatchMeta, metrics, timing_raw, global_steps, epoch):
+1884|        # 1. collect necessary fields from TransferQueue for computing metrics
+1885|        non_padding_mask = np.array([not tag.get("is_padding", False) for tag in batch.tags], dtype=bool)
+1886|        fields = [
+1887|            "prompts",
+1888|            "responses",
+1889|            "response_mask",
+1890|            "values",
+1891|            "advantages",
+1892|            "returns",
+1893|            "rm_scores",
+1894|            "token_level_rewards",
+1895|            "num_turns",
+1896|        ]
+1897|        moe_lb_metrics_interval = self.config.actor_rollout_ref.rollout.get("moe_load_balance_metrics_interval", 0)
+1898|        data = get_metric_data_with_optional_routed_experts(
+1899|            keys=batch.keys,
+1900|            partition_id=batch.partition_id,
+1901|            fields=fields,
+1902|            moe_lb_metrics_interval=moe_lb_metrics_interval,
+1903|            global_steps=global_steps,
+1904|            accumulator=self._rollout_moe_lb_metrics_accumulator,
+1905|            kv_batch_get=tq.kv_batch_get,
+1906|        )
+1907|
+1908|        num_turns = np.array(data.pop("num_turns").tolist())
+1909|        prompt_length = data["prompts"].offsets().diff()
+1910|        response_length = data["responses"].offsets().diff()
+1911|        global_token_num = (prompt_length + response_length).tolist()
+1912|        min_global_steps = np.array([tag["min_global_steps"] for tag in batch.tags], dtype=int)[non_padding_mask]
+1913|        max_global_steps = np.array([tag["max_global_steps"] for tag in batch.tags], dtype=int)[non_padding_mask]
+1914|
+1915|        # Only fetch speculative decoding stats when rollout writes them.
+1916|        spec_drafts = spec_accepts = spec_verifies = None
+1917|        mtp_config = getattr(self.config.actor_rollout_ref.model, "mtp", None)
+1918|        if mtp_config is not None and mtp_config.enable and mtp_config.enable_rollout:
+1919|            spec_data = tq.kv_batch_get(
+1920|                keys=batch.keys,
+1921|                partition_id=batch.partition_id,
+1922|                select_fields=["extra_fields"],
+1923|            )
+1924|            extra_fields = spec_data.pop("extra_fields").tolist()
+1925|            # The rollout omits the spec_* stats when the backend does not report
+1926|            # per-request spec-decode stats; leave all three as None in that case.
+1927|            if extra_fields and all(
+1928|                isinstance(extra_field, dict) and "spec_num_draft_tokens" in extra_field for extra_field in extra_fields
+1929|            ):
+1930|                spec_drafts = [extra_field["spec_num_draft_tokens"] for extra_field in extra_fields]
+1931|                spec_accepts = [extra_field["spec_num_accepted_tokens"] for extra_field in extra_fields]
+1932|                spec_verifies = [extra_field["spec_num_verify_steps"] for extra_field in extra_fields]
+1933|
+1934|        data = data.to_padded_tensor()
+1935|        data["token_level_scores"] = data["rm_scores"]
+1936|        if "token_level_rewards" not in data:
+1937|            data["token_level_rewards"] = data["rm_scores"]
+1938|        data["prompt_length"] = prompt_length.float()
+1939|        data["response_length"] = response_length.float()
+1940|        batch = DataProto(batch=data, meta_info={"global_token_num": global_token_num})
+1941|        metrics_batch = batch.select_idxs(non_padding_mask) if non_padding_mask.any() else batch
+1942|        # Expose per-row turn counts under the V0 schema (agent_loop writes
+1943|        # ``__num_turns__`` into the non-tensor batch) so compute_data_metrics
+1944|        # emits the V0-compatible ``num_turns/{mean,max,min}`` tags in addition
+1945|        # to the ``training/num_turns/*`` names computed below.
+1946|        num_turns_for_metrics = num_turns[non_padding_mask] if non_padding_mask.any() else num_turns
+1947|        metrics_batch.non_tensor_batch["__num_turns__"] = np.asarray(num_turns_for_metrics, dtype=np.int32)
+1948|
+1949|        # 2. compute metrics
+1950|        metrics.update({"training/global_step": global_steps, "training/epoch": epoch})
+1951|        metrics.update(
+1952|            compute_moe_lb_metrics(
+1953|                metrics_batch=metrics_batch,
+1954|                moe_lb_metrics_interval=moe_lb_metrics_interval,
+1955|                global_steps=global_steps,
+1956|                accumulator=self._rollout_moe_lb_metrics_accumulator,
+1957|            )
+1958|        )
+1959|        metrics.update(compute_data_metrics(batch=metrics_batch, use_critic=self.use_critic))
+1960|        metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+1961|        n_gpus = self._get_n_gpus_for_throughput()
+1962|        metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+1963|        gradient_norm = metrics.get("actor/grad_norm", None)
+1964|        metrics.update(compute_variance_proxy_metrics(batch=metrics_batch, gradient_norm=gradient_norm))
+1965|
+1966|        # 3. other auxiliary metrics
+1967|        if non_padding_mask.any():
+1968|            num_turns = num_turns[non_padding_mask]
+1969|        metrics.update(
+1970|            {
+1971|                "training/num_turns/mean": num_turns.mean(),
+1972|                "training/num_turns/max": num_turns.max(),
+1973|                "training/num_turns/min": num_turns.min(),
+1974|            }
+1975|        )
+1976|
+1977|        # 4. per-request speculative-decoding aggregation (same metrics async PPO logs;
+1978|        # see compute_spec_decode_metrics in verl/trainer/ppo/ray_trainer.py).
+1979|        metrics.update(compute_spec_decode_metrics(spec_drafts, spec_accepts, spec_verifies, non_padding_mask))
+1980|
+1981|        # 5. off-policy staleness metrics
+1982|        #   global_steps is the model weight version (one update_weights per global_step), and
+1983|        #   min/max_global_steps are the versions a trajectory was generated across, so all quantities
+1984|        #   below are already in model-version units.
+1985|        #   - trajectory_spans: how many distinct model versions a single trajectory was
+1986|        #     generated across (1 == fully generated on a single version). This captures the
+1987|        #     within-trajectory policy inconsistency caused by partial rollout / continuation.
+1988|        #   - trajectory_staleness: how many model versions the trajectory lags behind the
+1989|        #     *current* policy. A trajectory spans versions [min_global_steps, max_global_steps],
+1990|        #     so the lag is a range: the freshest weights used give the lower bound
+1991|        #     (global_steps - max_global_steps) and the oldest weights the worst case
+1992|        #     (global_steps - min_global_steps). We log the lower bound as the primary metric.
+1993|        trajectory_spans = max_global_steps - min_global_steps + 1
+1994|        trajectory_staleness = (global_steps - 1) - max_global_steps
+1995|        trajectory_staleness_worst = (global_steps - 1) - min_global_steps
+1996|        metrics.update(
+1997|            {
+1998|                "training/off_policy/trajectory_spans/mean": trajectory_spans.mean(),
+1999|                "training/off_policy/trajectory_spans/max": trajectory_spans.max(),
+(more lines below)

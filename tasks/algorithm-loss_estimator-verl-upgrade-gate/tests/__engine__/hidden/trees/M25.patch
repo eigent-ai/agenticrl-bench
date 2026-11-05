@@ -1,0 +1,27 @@
+diff -ruN '--exclude=__pycache__' base/verl/utils/fsdp_utils.py M25/verl/utils/fsdp_utils.py
+--- base/verl/utils/fsdp_utils.py	2026-10-12 11:39:31.000000000 +0000
++++ M25/verl/utils/fsdp_utils.py	2026-10-12 12:10:27.000000000 +0000
+@@ -628,17 +628,20 @@
+ 
+ def fsdp2_clip_grad_norm_(parameters, max_norm, norm_type=2.0, error_if_nonfinite=False, foreach=None):
+     """torch.nn.utils.clip_grad_norm_ cann't run on cpu parameter DTensor"""
+-    from torch.nn.utils.clip_grad import _clip_grads_with_norm_, _get_total_norm
++    from torch.nn.utils.clip_grad import _get_total_norm
+ 
+     if isinstance(parameters, torch.Tensor):
+         parameters = [parameters]
+     else:
+         # prevent generators from being exhausted
+         parameters = list(parameters)
+-    grads = [p.grad for p in parameters if p.grad is not None]
++    # norm and scaling on the local shards: plain tensors, no DTensor dispatch per parameter (also for CPU-offloaded grads)
++    grads = [p.grad.to_local() if isinstance(p.grad, DTensor) else p.grad for p in parameters if p.grad is not None]
+     total_norm = _get_total_norm(grads, norm_type, error_if_nonfinite, foreach)
+     total_norm = total_norm.to(get_device_id(), non_blocking=True)
+-    _clip_grads_with_norm_(parameters, max_norm, total_norm, foreach)
++    clip_coef = torch.clamp(max_norm / (total_norm + 1e-6), max=1.0)
++    for g in grads:
++        g.mul_(clip_coef.to(g.device))
+     return total_norm
+ 
+ 

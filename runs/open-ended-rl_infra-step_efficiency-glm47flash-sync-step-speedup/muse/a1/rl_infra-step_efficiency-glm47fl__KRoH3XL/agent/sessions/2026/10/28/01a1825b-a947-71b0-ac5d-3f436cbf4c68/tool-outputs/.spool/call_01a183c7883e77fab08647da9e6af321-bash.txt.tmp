@@ -1,0 +1,138 @@
+diff --git a/miles/backends/megatron_utils/actor.py b/miles/backends/megatron_utils/actor.py
+index 344133858..2274a364c 100644
+--- a/miles/backends/megatron_utils/actor.py
++++ b/miles/backends/megatron_utils/actor.py
+@@ -667,6 +667,10 @@ class MegatronTrainRayActor(TrainRayActor):
+         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
+         num_optimizer_steps = len(num_microbatches)
+         skip_actor_forward_only = self.args.skip_actor_forward_only
++        if skip_actor_forward_only:
++            from miles.backends.training_utils.loss.hub.losses import TRAIN_LOG_PROBS_COLLECTOR
++
++            TRAIN_LOG_PROBS_COLLECTOR.clear()
+         if skip_actor_forward_only:
+             option = "--skip-actor-forward-only"
+             assert num_optimizer_steps == 1, f"{option} requires 1 optimizer step, got {num_optimizer_steps}"
+@@ -777,6 +781,20 @@ class MegatronTrainRayActor(TrainRayActor):
+ 
+             self.prof.step(rollout_id=rollout_id)
+ 
++            if skip_actor_forward_only:
++                from miles.backends.training_utils.loss.hub.losses import TRAIN_LOG_PROBS_COLLECTOR
++
++                collected = [lp for mb in TRAIN_LOG_PROBS_COLLECTOR for lp in mb]
++                TRAIN_LOG_PROBS_COLLECTOR.clear()
++                n_samples = len(rollout_data["total_lengths"])
++                indices = getattr(data_iterator[0], "micro_batch_indices", None)
++                if len(collected) == n_samples and indices is not None:
++                    restored: list = [None] * n_samples
++                    for value, origin_index in zip(collected, sum(indices, []), strict=False):
++                        restored[origin_index] = value
++                    if all(v is not None for v in restored):
++                        rollout_data["log_probs"] = restored
++
+         train_dump.save_debug_train_data(self.args, rollout_id=rollout_id, rollout_data=rollout_data)
+ 
+         for m in all_replay_managers:
+diff --git a/miles/backends/megatron_utils/model.py b/miles/backends/megatron_utils/model.py
+index ae613d244..0b780d46c 100644
+--- a/miles/backends/megatron_utils/model.py
++++ b/miles/backends/megatron_utils/model.py
+@@ -589,9 +589,11 @@ def train_one_step(
+         custom_before_train_step_hook = load_function(args.custom_megatron_before_train_step_hook_path)
+         custom_before_train_step_hook(args, rollout_id, step_id, model, optimizer, opt_param_scheduler)
+ 
++    _t0 = __import__("time").perf_counter()
+     losses_reduced = run_forward_backward_pass(
+         args, dumper_phase_util, data_iterator, model, num_microbatches, num_rollouts
+     )
++    logger.info(f"OE_TIMER forward_backward_s={__import__('time').perf_counter() - _t0:.2f}")
+ 
+     outcome = TrainStepOutcome.NORMAL
+     grad_norm = 0.0
+@@ -637,7 +639,9 @@ def train_one_step(
+         dumper_phase_util.finalize(model)
+ 
+     if not disable_optimizer and valid_step:
++        _t1 = __import__("time").perf_counter()
+         update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
++        logger.info(f"OE_TIMER optimizer_step_s={__import__('time').perf_counter() - _t1:.2f}")
+         assert update_successful
+         opt_param_scheduler.step(increment=num_rollouts)
+ 
+diff --git a/miles/backends/training_utils/loss/hub/losses.py b/miles/backends/training_utils/loss/hub/losses.py
+index b48b7ab76..6f9156897 100644
+--- a/miles/backends/training_utils/loss/hub/losses.py
++++ b/miles/backends/training_utils/loss/hub/losses.py
+@@ -24,6 +24,13 @@ from miles.backends.training_utils.parallel import get_parallel_state
+ from miles.utils.function_registry import load_function
+ from miles.utils.types import RolloutBatch
+ 
++# Detached per-microbatch training log-probs collected when
++# --skip-actor-forward-only is set, so the actor can restore them (in sample
++# order) into rollout_data["log_probs"] for the debug train dump. These are
++# the genuine trainer-scores at the pre-update weights, exactly what the
++# skipped forward-only pass would have recomputed.
++TRAIN_LOG_PROBS_COLLECTOR: list[list[torch.Tensor]] = []
++
+ 
+ class LossFunction(Protocol):
+     """Common signature of the per-loss-type functions dispatched by `get_loss_function`."""
+@@ -140,6 +147,8 @@ def policy_loss_function(
+         old_log_probs = trainer_scored_log_probs
+     train_log_probs_list = log_probs
+     old_log_probs_list = old_log_probs
++    if args.skip_actor_forward_only:
++        TRAIN_LOG_PROBS_COLLECTOR.append([t.detach().to(device="cpu", copy=True) for t in train_log_probs_list])
+ 
+     # Pre-gather log probs if needed by OPSM or GSPO to avoid duplicate gathering
+     need_full_log_probs = args.use_opsm or args.advantage_estimator == "gspo"
+@@ -315,7 +324,8 @@ def policy_loss_function(
+         else:
+             entropy_loss = entropy_loss.detach()
+ 
+-    if args.use_kl_loss:
++    kl_loss = None
++    if args.use_kl_loss and reference_log_probs is not None:
+         assert reference_log_probs is not None, "ref_log_probs must be provided when --use-kl-loss is set"
+         ref_log_probs = torch.cat(reference_log_probs, dim=0)
+         importance_ratio = None
+@@ -381,7 +391,7 @@ def policy_loss_function(
+     if train_rollout_kl is not None:
+         reported_loss["train_rollout_kl"] = train_rollout_kl.clone().detach()
+ 
+-    if args.use_kl_loss:
++    if args.use_kl_loss and kl_loss is not None:
+         reported_loss["kl_loss"] = kl_loss.clone().detach()
+ 
+     if args.get_mismatch_metrics or args.use_tis:
+diff --git a/miles/ray/specs/train.py b/miles/ray/specs/train.py
+index 53b23952f..ccecd08d2 100644
+--- a/miles/ray/specs/train.py
++++ b/miles/ray/specs/train.py
+@@ -56,7 +56,8 @@ def specs_trainer_controller(args) -> list[ServeWorkerSpec]:
+             _compute_spec_trainer_controller(
+                 args,
+                 config=config,
+-                with_ref=(config.role != CRITIC_ROLE) and (trainer_args.kl_coef != 0 or trainer_args.use_kl_loss),
++                with_ref=(config.role != CRITIC_ROLE)
++                and (trainer_args.kl_coef != 0 or (trainer_args.use_kl_loss and trainer_args.kl_loss_coef != 0)),
+                 with_opd_teacher=(config.role != CRITIC_ROLE)
+                 and trainer_args.use_opd
+                 and trainer_args.opd_type == "megatron",
+diff --git a/miles/utils/arguments.py b/miles/utils/arguments.py
+index cfe892653..4a51f130d 100644
+--- a/miles/utils/arguments.py
++++ b/miles/utils/arguments.py
+@@ -3972,7 +3972,10 @@ def validate_skip_actor_forward_only(args) -> None:
+                 "--dumper-source-patcher-config-train",
+                 args.dumper_source_patcher_config_train is not None,
+             ),
+-            ("--save-debug-train-data", args.save_debug_train_data is not None and args.dump_details is None),
++            # --save-debug-train-data is compatible: the actor restores the
++            # training-forward log-probs into rollout_data["log_probs"] for the
++            # dump (TRAIN_LOG_PROBS_COLLECTOR in loss/hub/losses.py).
++            ("--save-debug-train-data", False),
+             (
+                 "--use-routing-replay",
+                 args.use_routing_replay and not args.use_rollout_routing_replay,

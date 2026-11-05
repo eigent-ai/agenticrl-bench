@@ -1,0 +1,98 @@
+2355:def _select_tokenizer(model: str, custom_tokenizer: CustomHuggingfaceTokenizer | None = None):
+2356-    if custom_tokenizer is not None:
+2357-        return _select_custom_tokenizer_helper(
+2358-            identifier=custom_tokenizer["identifier"],
+2359-            revision=custom_tokenizer["revision"],
+2360-            auth_token=custom_tokenizer["auth_token"],
+2361-            backend=_huggingface_tokenizer_backend(),
+2362-        )
+2363-    return _select_tokenizer_helper(model=model)
+2364-
+2365-
+2366-def _huggingface_tokenizer_backend() -> Decision:
+2367-    """The backend `tokenizer_dispatch.from_str` / `from_pretrained` will select right now.
+2368-
+2369-    Cached HuggingFace tokenizers are keyed on it, so flipping `LITELLM_RUST` or
+2370-    `litellm.rust(...)` reaches a fresh object instead of the other backend's."""
+2371-    return decision(tokenizer_dispatch.HUGGINGFACE_CONTEXT)
+2372-
+2373-
+2374-@lru_cache(maxsize=DEFAULT_MAX_LRU_CACHE_SIZE)
+2375-def _select_custom_tokenizer_helper(
+2376-    identifier: str, revision: str, auth_token: str | None, backend: Decision
+2377-) -> SelectTokenizerResponse:
+2378-    verbose_logger.debug("Loading custom HuggingFace tokenizer %s (revision %s)", identifier, revision)
+2379-    return create_pretrained_tokenizer(identifier=identifier, revision=revision, auth_token=auth_token)
+2380-
+2381-
+2382:def _select_tokenizer_helper(model: str) -> SelectTokenizerResponse:
+2383-    if litellm.disable_hf_tokenizer_download is True:
+2384-        return _return_openai_tokenizer(model)
+2385-
+2386-    try:
+2387-        result: Final = _return_huggingface_tokenizer(model)
+2388-        if result is not None:
+2389-            return result
+2390-    except Exception as e:
+2391-        from litellm.rust_bridge.fork_guard import ForkedAfterNativeRuntimeStarted, ProcessReservedForForking
+2392-
+2393-        if isinstance(e, (ForkedAfterNativeRuntimeStarted, ProcessReservedForForking)):
+2394-            raise
+2395-        verbose_logger.debug("Error selecting tokenizer: %s", e)
+2396-
+2397-    # default - tiktoken
+2398-    return _return_openai_tokenizer(model)
+2399-
+2400-
+2401-def _return_openai_tokenizer(model: str) -> SelectTokenizerResponse:
+2402-    return {"type": "openai_tokenizer", "tokenizer": _get_default_encoding()}
+2403-
+2404-
+2405-def uses_anthropic_tokenizer(model: str) -> bool:
+2406-    return model in litellm.anthropic_models and "claude-3" not in model
+2407-
+2408-
+2409-HuggingFaceTokenizerKind = Literal["cohere", "anthropic", "llama2", "llama3"]
+2410-
+2411-
+2412-def huggingface_tokenizer_kind(model: str) -> HuggingFaceTokenizerKind | None:
+2413-    """Which HuggingFace tokenizer `token_counter` selects for a model; `None` means tiktoken."""
+2414-    if model in litellm.cohere_models and "command-r" in model:
+2415-        return "cohere"
+2416-    if uses_anthropic_tokenizer(model):
+2417-        return "anthropic"
+2418-    if "llama-2" in model.lower() or "replicate" in model.lower():
+2419-        return "llama2"
+2420-    if "llama-3" in model.lower():
+2421-        return "llama3"
+2422-    return None
+2423-
+2424-
+2425-def _return_huggingface_tokenizer(model: str) -> SelectTokenizerResponse | None:
+2426-    kind: Final = huggingface_tokenizer_kind(model)
+2427-    if kind is None:
+2428-        return None
+2429-    return {
+2430-        "type": "huggingface_tokenizer",
+2431-        "tokenizer": _load_huggingface_tokenizer(kind, _huggingface_tokenizer_backend()),
+2432-    }
+2433-
+2434-
+2435-@lru_cache(maxsize=DEFAULT_MAX_LRU_CACHE_SIZE)
+2436-def _load_huggingface_tokenizer(kind: HuggingFaceTokenizerKind, backend: Decision) -> HuggingFace:
+2437-    """One tokenizer per kind and backend; `backend` is the cache key, the dispatch re-derives it."""
+2438-    match kind:
+2439-        case "cohere":
+2440-            return tokenizer_dispatch.from_pretrained("Xenova/c4ai-command-r-v01-tokenizer")
+2441-        case "anthropic":
+2442-            return tokenizer_dispatch.anthropic()
+2443-        case "llama2":
+2444-            return tokenizer_dispatch.from_pretrained("hf-internal-testing/llama-tokenizer")
+2445-        case "llama3":
+2446-            return tokenizer_dispatch.from_pretrained("Xenova/llama-3-tokenizer")
+2447-        case _:
+2448-            assert_never(kind)
+2449-
+2450-
+2451-def encode(model="", text="", custom_tokenizer: dict | None = None):
+2452-    """

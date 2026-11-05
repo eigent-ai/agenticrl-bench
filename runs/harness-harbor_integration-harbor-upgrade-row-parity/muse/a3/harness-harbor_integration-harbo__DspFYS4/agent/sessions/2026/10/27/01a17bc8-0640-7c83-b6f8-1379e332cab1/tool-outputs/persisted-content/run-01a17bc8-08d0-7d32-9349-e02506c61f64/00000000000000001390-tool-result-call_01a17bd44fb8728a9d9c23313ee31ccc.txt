@@ -1,0 +1,502 @@
+Read text file `/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/agents/terminus_2/terminus_xml_plain_parser.py`.
+1|import re
+2|from dataclasses import dataclass
+3|from typing import Any
+4|
+5|
+6|@dataclass
+7|class ParsedCommand:
+8|    keystrokes: str
+9|    duration: float
+10|
+11|
+12|@dataclass
+13|class ParseResult:
+14|    commands: list[ParsedCommand]
+15|    is_task_complete: bool
+16|    error: str
+17|    warning: str
+18|    analysis: str = ""
+19|    plan: str = ""
+20|
+21|
+22|class TerminusXMLPlainParser:
+23|    """Parser for terminus XML plain response format."""
+24|
+25|    def __init__(self):
+26|        self.required_sections = ["analysis", "plan", "commands"]
+27|
+28|    def parse_response(self, response: str) -> ParseResult:
+29|        """
+30|        Parse a terminus XML plain response and extract commands.
+31|
+32|        Args:
+33|            response: The full LLM response string
+34|
+35|        Returns:
+36|            ParseResult with commands, completion status, errors and warnings
+37|        """
+38|        # Try normal parsing first
+39|        result = self._try_parse_response(response)
+40|
+41|        if result.error:
+42|            # Try auto-fixes in order until one works
+43|            for fix_name, fix_function in self._get_auto_fixes():
+44|                corrected_response, was_fixed = fix_function(response, result.error)
+45|                if was_fixed:
+46|                    corrected_result = self._try_parse_response(corrected_response)
+47|
+48|                    if corrected_result.error == "":
+49|                        # Success! Add auto-correction warning
+50|                        auto_warning = (
+51|                            f"AUTO-CORRECTED: {fix_name} - "
+52|                            "please fix this in future responses"
+53|                        )
+54|                        corrected_result.warning = self._combine_warnings(
+55|                            auto_warning, corrected_result.warning
+56|                        )
+57|                        return corrected_result
+58|
+59|        # Return original result if no fix worked
+60|        return result
+61|
+62|    def _try_parse_response(self, response: str) -> ParseResult:
+63|        """
+64|        Try to parse a terminus XML plain response.
+65|
+66|        Args:
+67|            response: The full LLM response string
+68|
+69|        Returns:
+70|            ParseResult with commands, completion status, errors and warnings
+71|        """
+72|        warnings = []
+73|
+74|        # Check for extra text before/after <response> tags
+75|        self._check_extra_text(response, warnings)
+76|
+77|        # Extract <response> content
+78|        response_content = self._extract_response_content(response)
+79|        if not response_content:
+80|            return ParseResult(
+81|                [],
+82|                False,
+83|                "No <response> tag found",
+84|                "- " + "\n- ".join(warnings) if warnings else "",
+85|                "",
+86|                "",
+87|            )
+88|
+89|        # Check if task is complete first
+90|        is_complete = self._check_task_complete(response_content)
+91|
+92|        # Check for required sections and extract content
+93|        sections = self._extract_sections(response_content, warnings)
+94|
+95|        # Extract analysis and plan for reasoning content
+96|        analysis = sections.get("analysis", "")
+97|        plan = sections.get("plan", "")
+98|
+99|        # Extract commands section
+100|        commands_content = sections.get("commands", "")
+101|        if not commands_content:
+102|            if "commands" in sections:
+103|                # Commands section exists but is empty
+104|                if not is_complete:
+105|                    warnings.append(
+106|                        "Commands section is empty; not taking any action. "
+107|                        "If you want to wait a specific amount of time please use "
+108|                        "`sleep`, but if you're waiting for a command to finish then "
+109|                        "continue to wait."
+110|                    )
+111|                return ParseResult(
+112|                    [],
+113|                    is_complete,
+114|                    "",
+115|                    "- " + "\n- ".join(warnings) if warnings else "",
+116|                    analysis,
+117|                    plan,
+118|                )
+119|            else:
+120|                # Commands section is missing entirely
+121|                if is_complete:
+122|                    return ParseResult(
+123|                        [],
+124|                        True,
+125|                        "",
+126|                        "- " + "\n- ".join(warnings) if warnings else "",
+127|                        analysis,
+128|                        plan,
+129|                    )
+130|                return ParseResult(
+131|                    [],
+132|                    False,
+133|                    "Missing <commands> section",
+134|                    "- " + "\n- ".join(warnings) if warnings else "",
+135|                    analysis,
+136|                    plan,
+137|                )
+138|
+139|        # Parse commands directly from XML (no code blocks in plain format)
+140|        commands, parse_error = self._parse_xml_commands(commands_content, warnings)
+141|        if parse_error:
+142|            # If task is complete, parse errors are just warnings
+143|            if is_complete:
+144|                warnings.append(parse_error)
+145|                return ParseResult(
+146|                    [],
+147|                    True,
+148|                    "",
+149|                    "- " + "\n- ".join(warnings) if warnings else "",
+150|                    analysis,
+151|                    plan,
+152|                )
+153|            return ParseResult(
+154|                [],
+155|                False,
+156|                parse_error,
+157|                "- " + "\n- ".join(warnings) if warnings else "",
+158|                analysis,
+159|                plan,
+160|            )
+161|
+162|        return ParseResult(
+163|            commands,
+164|            is_complete,
+165|            "",
+166|            "- " + "\n- ".join(warnings) if warnings else "",
+167|            analysis,
+168|            plan,
+169|        )
+170|
+171|    def _get_auto_fixes(self):
+172|        """Return list of auto-fix functions to try in order."""
+173|        return [
+174|            (
+175|                "Missing </response> tag was automatically inserted",
+176|                self._fix_missing_response_tag,
+177|            ),
+178|        ]
+179|
+180|    def _combine_warnings(self, auto_warning: str, existing_warning: str) -> str:
+181|        """Combine auto-correction warning with existing warnings."""
+182|        if existing_warning:
+183|            return f"- {auto_warning}\n{existing_warning}"
+184|        else:
+185|            return f"- {auto_warning}"
+186|
+187|    def _fix_missing_response_tag(self, response: str, error: str) -> tuple[str, bool]:
+188|        """Fix missing </response> closing tag by appending it."""
+189|        if "Missing </response> closing tag" not in error:
+190|            return response, False
+191|
+192|        # Simply append </response> at the end
+193|        corrected = response.rstrip() + "\n</response>"
+194|        return corrected, True
+195|
+196|    def _check_extra_text(self, response: str, warnings: list[str]) -> None:
+197|        """Check for extra text before/after <response> tags."""
+198|        # Find response tag positions
+199|        start_pos = response.find("<response>")
+200|        end_pos = response.find("</response>")
+201|
+202|        if start_pos == -1:
+203|            return  # Will be handled as error later
+204|
+205|        # Check text before <response>
+206|        before_text = response[:start_pos].strip()
+207|        if before_text:
+208|            warnings.append("Extra text detected before <response> tag")
+209|
+210|        # Check text after </response> if closing tag exists
+211|        if end_pos != -1:
+212|            after_text = response[end_pos + len("</response>") :].strip()
+213|            if after_text:
+214|                warnings.append("Extra text detected after </response> tag")
+215|
+216|                # Count total <response> tags
+217|                total_response_count = response.count("<response>")
+218|                if total_response_count > 1:
+219|                    warnings.append(
+220|                        f"IMPORTANT: Only issue one <response> block at a time. "
+221|                        f"You issued {total_response_count} and only the first "
+222|                        f"was executed."
+223|                    )
+224|
+225|    def _extract_response_content(self, response: str) -> str:
+226|        """Extract content from <response> tags."""
+227|        start_pos = response.find("<response>")
+228|        if start_pos == -1:
+229|            return ""
+230|
+231|        end_pos = response.find("</response>", start_pos)
+232|        if end_pos == -1:
+233|            # Missing closing tag - return content from opening tag to end
+234|            return response[start_pos + len("<response>") :].strip()
+235|
+236|        return response[start_pos + len("<response>") : end_pos].strip()
+237|
+238|    def _extract_sections(self, content: str, warnings: list[str]) -> dict[str, Any]:
+239|        """Extract analysis, plan, commands, and task_complete sections."""
+240|        sections = {}
+241|        found_sections = set()
+242|
+243|        # Define patterns for each section
+244|        section_patterns = {
+245|            "analysis": (
+246|                r"<analysis>(.*?)</analysis>",
+247|                r"<analysis\s*/>",
+248|                r"<analysis></analysis>",
+249|            ),
+250|            "plan": (r"<plan>(.*?)</plan>", r"<plan\s*/>", r"<plan></plan>"),
+251|            "commands": (
+252|                r"<commands>(.*?)</commands>",
+253|                r"<commands\s*/>",
+254|                r"<commands></commands>",
+255|            ),
+256|            "task_complete": (
+257|                r"<task_complete>(.*?)</task_complete>",
+258|                r"<task_complete\s*/>",
+259|                r"<task_complete></task_complete>",
+260|            ),
+261|        }
+262|
+263|        for section_name, patterns in section_patterns.items():
+264|            full_pattern, self_closing_pattern, empty_pattern = patterns
+265|
+266|            # Try full pattern first
+267|            match = re.search(full_pattern, content, re.DOTALL)
+268|            if match:
+269|                sections[section_name] = match.group(1).strip()
+270|                found_sections.add(section_name)
+271|                continue
+272|
+273|            # Try self-closing pattern
+274|            if re.search(self_closing_pattern, content):
+275|                sections[section_name] = ""  # Self-closing = empty content
+276|                found_sections.add(section_name)
+277|                continue
+278|
+279|            # Try empty pattern
+280|            if re.search(empty_pattern, content):
+281|                sections[section_name] = ""  # Empty = empty content
+282|                found_sections.add(section_name)
+283|                continue
+284|
+285|        # Check for missing required sections
+286|        required = set(self.required_sections)
+287|        missing = required - found_sections
+288|        for section in missing:
+289|            if section != "task_complete":  # task_complete is optional
+290|                warnings.append(f"Missing <{section}> section")
+291|
+292|        # Check for unexpected tags at the direct child level of <response> only
+293|        # Find all top-level tags (not nested inside other tags)
+294|        top_level_tags = self._find_top_level_tags(content)
+295|        expected_tags = set(self.required_sections + ["task_complete"])
+296|        unexpected = set(top_level_tags) - expected_tags
+297|        for tag in unexpected:
+298|            warnings.append(
+299|                f"Unknown tag found: <{tag}>, expected "
+300|                f"analysis/plan/commands/task_complete"
+301|            )
+302|
+303|        # Check for multiple instances of same tag
+304|        for section_name in self.required_sections + ["task_complete"]:
+305|            tag_count = len(re.findall(f"<{section_name}(?:\\s|>|/>)", content))
+306|            if tag_count > 1:
+307|                if section_name == "commands":
+308|                    warnings.append(
+309|                        f"IMPORTANT: Only issue one <commands> block at a time. "
+310|                        f"You issued {tag_count} and only the first was executed."
+311|                    )
+312|                else:
+313|                    warnings.append(f"Multiple <{section_name}> sections found")
+314|
+315|        # Check for correct order of sections (analysis, plan, commands)
+316|        self._check_section_order(content, warnings)
+317|
+318|        return sections
+319|
+320|    def _parse_xml_commands(
+321|        self, xml_content: str, warnings: list[str]
+322|    ) -> tuple[list[ParsedCommand], str]:
+323|        """Parse XML content and extract command objects manually."""
+324|
+325|        # Find all keystrokes elements manually for better error reporting
+326|        commands = []
+327|        keystrokes_pattern = re.compile(
+328|            r"<keystrokes([^>]*)>(.*?)</keystrokes>", re.DOTALL
+329|        )
+330|
+331|        matches = keystrokes_pattern.findall(xml_content)
+332|        for i, (attributes_str, keystrokes_content) in enumerate(matches):
+333|            # Check for attribute issues
+334|            self._check_attribute_issues(attributes_str, i + 1, warnings)
+335|
+336|            # Parse attributes
+337|            duration = 1.0
+338|
+339|            # Parse duration attribute
+340|            duration_match = re.search(
+341|                r'duration\s*=\s*["\']([^"\']*)["\']', attributes_str
+342|            )
+343|            if duration_match:
+344|                try:
+345|                    duration = float(duration_match.group(1))
+346|                except ValueError:
+347|                    warnings.append(
+348|                        f"Command {i + 1}: Invalid duration value "
+349|                        f"'{duration_match.group(1)}', using default 1.0"
+350|                    )
+351|            else:
+352|                warnings.append(
+353|                    f"Command {i + 1}: Missing duration attribute, using default 1.0"
+354|                )
+355|
+356|            # Check for newline at end of keystrokes
+357|            if i < len(matches) - 1 and not keystrokes_content.endswith("\n"):
+358|                warnings.append(
+359|                    f"Command {i + 1} should end with newline when followed "
+360|                    f"by another command. Otherwise the two commands will be "
+361|                    f"concatenated together on the same line."
+362|                )
+363|
+364|            commands.append(
+365|                ParsedCommand(keystrokes=keystrokes_content, duration=duration)
+366|            )
+367|
+368|        # Check for XML entities and warn
+369|        entities = {
+370|            "&lt;": "<",
+371|            "&gt;": ">",
+372|            "&amp;": "&",
+373|            "&quot;": '"',
+374|            "&apos;": "'",
+375|        }
+376|        for entity, char in entities.items():
+377|            if entity in xml_content:
+378|                warnings.append(
+379|                    f"Warning: {entity} is read verbatim and not converted to {char}. "
+380|                    f"NEVER USE {entity}, unless you want these exact characters to "
+381|                    f"appear directly in the output."
+382|                )
+383|
+384|        # Check for \r\n line endings and warn
+385|        if "\\r\\n" in xml_content:
+386|            warnings.append(
+387|                "Warning: \\r\\n line endings are not necessary - use \\n "
+388|                "instead for simpler output"
+389|            )
+390|
+391|        return commands, ""
+392|
+393|    def _find_top_level_tags(self, content: str) -> list[str]:
+394|        """Find all top-level XML tags (direct children of response), not
+395|        nested tags."""
+396|        top_level_tags = []
+397|        depth = 0
+398|        i = 0
+399|
+400|        while i < len(content):
+401|            if content[i] == "<":
+402|                # Find the end of this tag
+403|                tag_end = content.find(">", i)
+404|                if tag_end == -1:
+405|                    break
+406|
+407|                tag_content = content[i + 1 : tag_end]
+408|
+409|                # Skip comments, CDATA, etc.
+410|                if tag_content.startswith("!") or tag_content.startswith("?"):
+411|                    i = tag_end + 1
+412|                    continue
+413|
+414|                # Check if this is a closing tag
+415|                if tag_content.startswith("/"):
+416|                    depth -= 1
+417|                    i = tag_end + 1
+418|                    continue
+419|
+420|                # Check if this is a self-closing tag
+421|                is_self_closing = tag_content.endswith("/")
+422|
+423|                # Extract tag name (first word)
+424|                tag_name = tag_content.split()[0] if " " in tag_content else tag_content
+425|                if tag_name.endswith("/"):
+426|                    tag_name = tag_name[:-1]
+427|
+428|                # If we're at depth 0, this is a top-level tag
+429|                if depth == 0:
+430|                    top_level_tags.append(tag_name)
+431|
+432|                # Adjust depth for opening tags (but not self-closing)
+433|                if not is_self_closing:
+434|                    depth += 1
+435|
+436|                i = tag_end + 1
+437|            else:
+438|                i += 1
+439|
+440|        return top_level_tags
+441|
+442|    def _check_section_order(self, content: str, warnings: list[str]) -> None:
+443|        """Check if sections appear in the correct order: analysis, plan, commands."""
+444|        # Find positions of each section
+445|        positions = {}
+446|        for section in ["analysis", "plan", "commands"]:
+447|            # Look for opening tags
+448|            match = re.search(f"<{section}(?:\\s|>|/>)", content)
+449|            if match:
+450|                positions[section] = match.start()
+451|
+452|        # Check if we have at least 2 sections to compare order
+453|        if len(positions) < 2:
+454|            return
+455|
+456|        # Expected order
+457|        expected_order = ["analysis", "plan", "commands"]
+458|
+459|        # Get sections that are present, in the order they appear
+460|        present_sections = []
+461|        for section in expected_order:
+462|            if section in positions:
+463|                present_sections.append((section, positions[section]))
+464|
+465|        # Sort by position to get actual order
+466|        actual_order = [
+467|            section for section, pos in sorted(present_sections, key=lambda x: x[1])
+468|        ]
+469|
+470|        # Get expected order for present sections only
+471|        expected_present = [s for s in expected_order if s in positions]
+472|
+473|        # Compare orders
+474|        if actual_order != expected_present:
+475|            actual_str = " → ".join(actual_order)
+476|            expected_str = " → ".join(expected_present)
+477|            warnings.append(
+478|                f"Sections appear in wrong order. Found: {actual_str}, "
+479|                f"expected: {expected_str}"
+480|            )
+481|
+482|    def _check_attribute_issues(
+483|        self, attributes_str: str, command_num: int, warnings: list[str]
+484|    ) -> None:
+485|        """Check for attribute-related issues."""
+486|        # Check for missing quotes
+487|        unquoted_pattern = re.compile(r'(\w+)\s*=\s*([^"\'\s>]+)')
+488|        unquoted_matches = unquoted_pattern.findall(attributes_str)
+489|        for attr_name, attr_value in unquoted_matches:
+490|            warnings.append(
+491|                f"Command {command_num}: Attribute '{attr_name}' value should be "
+492|                f'quoted: {attr_name}="{attr_value}"'
+493|            )
+494|
+495|        # Check for single quotes (should use double quotes for consistency)
+496|        single_quote_pattern = re.compile(r"(\w+)\s*=\s*'([^']*)'")
+497|        single_quote_matches = single_quote_pattern.findall(attributes_str)
+498|        for attr_name, attr_value in single_quote_matches:
+499|            warnings.append(
+500|                f"Command {command_num}: Use double quotes for attribute "
+(more lines below)

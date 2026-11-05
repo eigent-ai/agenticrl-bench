@@ -1,0 +1,2 @@
+#!/bin/bash
+awk -F, 'NR>1{s+=$2} END{print s}' /app/orders.csv > /app/total.txt

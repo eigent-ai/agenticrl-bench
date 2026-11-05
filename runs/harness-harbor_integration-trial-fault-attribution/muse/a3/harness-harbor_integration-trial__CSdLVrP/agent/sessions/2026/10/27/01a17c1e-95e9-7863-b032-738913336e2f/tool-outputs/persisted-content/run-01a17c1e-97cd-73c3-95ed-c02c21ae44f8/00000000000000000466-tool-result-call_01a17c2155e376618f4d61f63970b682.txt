@@ -1,0 +1,288 @@
+Read text file `/app/reference/harbor-0.23.0/harbor/agents/terminus_2/terminus_2.py`.
+(799 line(s) above)
+800|        1. Appending the prompt step to the trajectory
+801|        2. Calling the LLM with the prompt and message history
+802|        3. Tracking API request time
+803|        4. Updating subagent metrics
+804|        5. Appending the response step to the trajectory
+805|        6. Collecting rollout details
+806|        7. Saving the subagent trajectory
+807|
+808|        Args:
+809|            prompt: The prompt to send to the LLM
+810|            message_history: The message history to provide context
+811|            steps: The trajectory steps (will be modified to include prompt and response steps)
+812|            session_id: Session ID for the subagent
+813|            agent_name: Name of the subagent (e.g., "terminus-2-summarization-summary")
+814|            filename_suffix: Suffix for trajectory filename (e.g., "summary", "questions", "answers")
+815|            summary_text: Human-readable summary for the trajectory ref
+816|            subagent_name_for_logging: Name used in logging messages
+817|
+818|        Returns:
+819|            tuple: (LLM response, SubagentTrajectoryRef)
+820|        """
+821|        # Append the prompt step
+822|        prompt_step_id = len(steps) + 1
+823|        steps.append(
+824|            Step(
+825|                step_id=prompt_step_id,
+826|                timestamp=datetime.now(timezone.utc).isoformat(),
+827|                source="user",
+828|                message=prompt,
+829|            )
+830|        )
+831|        response_step_id = prompt_step_id + 1
+832|
+833|        start_time = time.time()
+834|        response: LLMResponse = await self._llm.call(
+835|            prompt=prompt,
+836|            message_history=message_history,
+837|            **self._llm_call_kwargs,
+838|        )
+839|        self._track_api_request_time(start_time)
+840|
+841|        usage_info = response.usage
+842|        self._update_subagent_metrics(usage_info)
+843|
+844|        self._append_subagent_response_step(
+845|            steps,
+846|            response_step_id,
+847|            response,
+848|            usage_info,
+849|            subagent_name_for_logging,
+850|        )
+851|
+852|        self._collect_subagent_rollout_detail(response)
+853|
+854|        trajectory_ref = self._save_subagent_trajectory(
+855|            session_id=session_id,
+856|            agent_name=agent_name,
+857|            steps=steps,
+858|            usage_info=usage_info,
+859|            filename_suffix=filename_suffix,
+860|            summary_text=summary_text,
+861|        )
+862|
+863|        return response, trajectory_ref
+864|
+865|    async def _summarize(
+866|        self, chat: Chat, original_instruction: str, session: TmuxSession
+867|    ) -> tuple[str, list[SubagentTrajectoryRef] | None]:
+868|        """Create a summary of the agent's work to pass to a new agent instance.
+869|
+870|        This method implements a three-step context summarization process using separate
+871|        subagents to compress conversation history while preserving critical information:
+872|
+873|        **Step 1: Summary Generation (SUBAGENT 1)**
+874|        - Message history: Unwound chat.messages (limited context after token freeing)
+875|        - Prompt: Generate comprehensive summary of all work completed so far
+876|        - Response: summary_response.content (detailed narrative of progress)
+877|
+878|        **Step 2: Question Asking (SUBAGENT 2)**
+879|        - Message history: [] (fresh start, no conversation context)
+880|        - Prompt: Given the original task, summary from Step 1, and current terminal screen,
+881|        generate questions about information missing from the summary.
+882|        - Response: model_questions (list of clarifying questions)
+883|
+884|        **Step 3: Answer Providing (SUBAGENT 3)**
+885|        - Message history: chat.messages + [summary_prompt, summary_response] (extended context)
+886|        - Prompt: Given the questions from Step 2, answer the questions based on full conversation history.
+887|        - Response: answers_response.content (detailed answers)
+888|
+889|        **Final handoff:**
+890|        - Chat history replaced with: [system, question_prompt (which includes summary from step 1), model_questions]
+891|        - Result: Compressed context that preserves critical task-specific information, allowing
+892|        the main agent to continue working on the task without losing context.
+893|
+894|        **Why three steps?** This question-answer approach ensures the summarization doesn't
+895|        lose important details - the questions subagent identifies gaps, and the answers
+896|        subagent (with full context) fills them in.
+897|
+898|        Args:
+899|            chat: Chat object containing conversation history (may be unwound)
+900|            original_instruction: The original task instruction from user
+901|            session: TmuxSession for capturing current terminal state
+902|
+903|        Returns:
+904|            tuple: (handoff_prompt, subagent_trajectory_refs)
+905|                - handoff_prompt: The prompt to continue with (includes answers + instructions)
+906|                - subagent_trajectory_refs: List of 3 SubagentTrajectoryRef objects, or None if summarization failed
+907|        """
+908|        if len(chat.messages) == 0:
+909|            return original_instruction, None
+910|
+911|        # Increment summarization count
+912|        self._summarization_count += 1
+913|        subagent_trajectory_refs = []
+914|
+915|        # ===== SUBAGENT 1: Summary Generation =====
+916|        summary_session_id = (
+917|            f"{self._session_id}-summarization-{self._summarization_count}-summary"
+918|        )
+919|
+920|        # Trajectory needs to reflect what is sent to LLM: essentially the previous chat
+921|        # history, minus the messages that were removed to free up tokens.
+922|        # Calculate how many trajectory steps to include based on remaining chat messages:
+923|        # - Chat has: [system, agent1, user1, agent2, user2, ...]
+924|        # - Trajectory has: [step1_system, step2_agent, step3_agent, ...]
+925|        # - Formula: steps_to_include = 1 + (num_messages - 1) // 2
+926|        steps_to_include = 1 + (len(chat.messages) - 1) // 2
+927|        summary_steps, step_id_counter = self._prepare_copied_trajectory_steps(
+928|            steps_to_include
+929|        )
+930|
+931|        summary_prompt = f"""You are about to hand off your work to another AI agent.
+932|            Please provide a comprehensive summary of what you have
+933|            accomplished so far on this task:
+934|
+935|Original Task: {original_instruction}
+936|
+937|Based on the conversation history, please provide a detailed summary covering:
+938|1. **Major Actions Completed** - List each significant command you executed
+939|            and what you learned from it.
+940|2. **Important Information Learned** - A summary of crucial findings, file
+941|            locations, configurations, error messages, or system state discovered.
+942|3. **Challenging Problems Addressed** - Any significant issues you
+943|            encountered and how you resolved them.
+944|4. **Current Status** - Exactly where you are in the task completion process.
+945|
+946|
+947|Be comprehensive and detailed. The next agent needs to understand everything
+948|            that has happened so far in order to continue."""
+949|
+950|        summary_response, summary_trajectory_ref = await self._run_subagent(
+951|            prompt=summary_prompt,
+952|            message_history=chat.messages,
+953|            steps=summary_steps,
+954|            session_id=summary_session_id,
+955|            agent_name="terminus-2-summarization-summary",
+956|            filename_suffix="summary",
+957|            summary_text=f"Context summarization {self._summarization_count}: Step 1 - Summary generation",
+958|            subagent_name_for_logging="summary generation LLM call",
+959|        )
+960|        subagent_trajectory_refs.append(summary_trajectory_ref)
+961|
+962|        # ===== SUBAGENT 2: Question Asking =====
+963|        current_screen = await session.capture_pane(capture_entire=False)
+964|        questions_session_id = (
+965|            f"{self._session_id}-summarization-{self._summarization_count}-questions"
+966|        )
+967|        questions_steps = []
+968|
+969|        question_prompt = f"""You are picking up work from a previous AI agent on this task:
+970|
+971|**Original Task:** {original_instruction}
+972|
+973|**Summary from Previous Agent:**
+974|{summary_response.content}
+975|
+976|**Current Terminal Screen:**
+977|{current_screen}
+978|
+979|Please begin by asking several questions (at least five, more if necessary)
+980|about the current state of the solution that are not answered in the summary
+981|from the prior agent. After you ask these questions you will be on your own,
+982|so ask everything you need to know."""
+983|
+984|        questions_response, questions_trajectory_ref = await self._run_subagent(
+985|            prompt=question_prompt,
+986|            message_history=[],
+987|            steps=questions_steps,
+988|            session_id=questions_session_id,
+989|            agent_name="terminus-2-summarization-questions",
+990|            filename_suffix="questions",
+991|            summary_text=f"Context summarization {self._summarization_count}: Step 2 - Question asking",
+992|            subagent_name_for_logging="questions subagent",
+993|        )
+994|        model_questions = questions_response.content
+995|        subagent_trajectory_refs.append(questions_trajectory_ref)
+996|
+997|        # ===== SUBAGENT 3: Answer Providing =====
+998|        answers_session_id = (
+999|            f"{self._session_id}-summarization-{self._summarization_count}-answers"
+1000|        )
+1001|
+1002|        # Reuse the actual trajectory steps (same as summary subagent)
+1003|        # At this point, chat.messages has the same unwound history as in summary subagent
+1004|        answers_steps, step_id_counter = self._prepare_copied_trajectory_steps(
+1005|            steps_to_include
+1006|        )
+1007|
+1008|        # Add the summary prompt and response steps that are part of the message history
+1009|        # Mark these as copied context since they were already part of the summary subagent trajectory
+1010|        answers_steps.append(
+1011|            Step(
+1012|                step_id=step_id_counter,
+1013|                timestamp=datetime.now(timezone.utc).isoformat(),
+1014|                source="user",
+1015|                message=summary_prompt,
+1016|                is_copied_context=True,
+1017|            )
+1018|        )
+1019|        step_id_counter += 1
+1020|
+1021|        answers_steps.append(
+1022|            Step(
+1023|                step_id=step_id_counter,
+1024|                timestamp=datetime.now(timezone.utc).isoformat(),
+1025|                source="agent",
+1026|                model_name=summary_response.model_name or self._model_name,
+1027|                message=summary_response.content,
+1028|                reasoning_content=summary_response.reasoning_content,
+1029|                is_copied_context=True,
+1030|                extra={
+1031|                    "note": "Copied from summary subagent - metrics already recorded there"
+1032|                },
+1033|            )
+1034|        )
+1035|        step_id_counter += 1
+1036|
+1037|        answer_request_prompt = (
+1038|            "The next agent has a few questions for you, please answer each of them one by one in detail:\n\n"
+1039|            + model_questions
+1040|        )
+1041|
+1042|        # The answer subagent should see: unwound chat history + summary prompt + summary response
+1043|        answers_message_history = chat.messages + [
+1044|            {"role": "user", "content": summary_prompt},
+1045|            {"role": "assistant", "content": summary_response.content},
+1046|        ]
+1047|
+1048|        answers_response, answers_trajectory_ref = await self._run_subagent(
+1049|            prompt=answer_request_prompt,
+1050|            message_history=answers_message_history,
+1051|            steps=answers_steps,
+1052|            session_id=answers_session_id,
+1053|            agent_name="terminus-2-summarization-answers",
+1054|            filename_suffix="answers",
+1055|            summary_text=f"Context summarization {self._summarization_count}: Step 3 - Answer providing",
+1056|            subagent_name_for_logging="answers subagent",
+1057|        )
+1058|        subagent_trajectory_refs.append(answers_trajectory_ref)
+1059|
+1060|        # Update chat history with the handoff context
+1061|        # Note: We only include questions, not answers. The answers will be provided
+1062|        # via the handoff_prompt to the next agent iteration.
+1063|        chat._messages = [
+1064|            chat.messages[0],
+1065|            {"role": "user", "content": question_prompt},
+1066|            {"role": "assistant", "content": model_questions},
+1067|        ]
+1068|        chat.reset_response_chain()
+1069|
+1070|        handoff_prompt = (
+1071|            "Here are the answers the other agent provided.\n\n"
+1072|            + answers_response.content
+1073|            + "\n\n"
+1074|            + "Continue working on this task from where the previous agent left off."
+1075|            " You can no longer ask questions. Please follow the spec to interact with "
+1076|            "the terminal."
+1077|        )
+1078|
+1079|        return handoff_prompt, subagent_trajectory_refs
+1080|
+1081|    async def _check_proactive_summarization(
+1082|        self, chat: Chat, original_instruction: str, session: TmuxSession
+1083|    ) -> tuple[str, list[SubagentTrajectoryRef] | None] | None:
+1084|        """Check if we should proactively summarize due to token usage.
+(more lines below)

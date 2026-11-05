@@ -1,0 +1,703 @@
+Read text file `/opt/verl/verl/trainer/ppo/core_algos.py`.
+(1335 line(s) above)
+1336|    negative_approx_kl = log_prob - old_log_prob
+1337|    # Clamp negative_approx_kl for stability
+1338|    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+1339|    ratio = torch.exp(negative_approx_kl)
+1340|    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+1341|
+1342|    pg_losses1 = -advantages * ratio
+1343|    if cliprange_low is None:
+1344|        cliprange_low = cliprange
+1345|    if cliprange_high is None:
+1346|        cliprange_high = cliprange
+1347|    pg_losses2 = -advantages * torch.clamp(
+1348|        ratio, 1 - cliprange_low, 1 + cliprange_high
+1349|    )  # - clip(ratio, 1-cliprange, 1+cliprange) * A
+1350|    clip_pg_losses1 = torch.maximum(
+1351|        pg_losses1, pg_losses2
+1352|    )  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
+1353|    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+1354|
+1355|    pg_losses3 = -advantages * clip_ratio_c
+1356|    clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+1357|    pg_clipfrac_lower = verl_F.masked_mean(
+1358|        torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask
+1359|    )
+1360|
+1361|    pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+1362|
+1363|    # Apply rollout correction weights if provided
+1364|    if rollout_is_weights is not None:
+1365|        pg_losses = pg_losses * rollout_is_weights
+1366|
+1367|    pg_loss = agg_loss(
+1368|        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
+1369|    )
+1370|
+1371|    pg_metrics = {
+1372|        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+1373|        "actor/ppo_kl": ppo_kl.detach().item(),
+1374|        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+1375|    }
+1376|    return pg_loss, pg_metrics
+1377|
+1378|
+1379|@register_policy_loss("dppo_tv")
+1380|def compute_policy_loss_dppo_tv(
+1381|    old_log_prob: torch.Tensor,
+1382|    log_prob: torch.Tensor,
+1383|    advantages: torch.Tensor,
+1384|    response_mask: torch.Tensor,
+1385|    loss_agg_mode: str = "token-mean",
+1386|    config: Optional[ActorConfig] = None,
+1387|    rollout_is_weights: torch.Tensor | None = None,
+1388|) -> tuple[torch.Tensor, dict[str, Any]]:
+1389|    """
+1390|    Compute the clipped policy objective and related metrics for DPPO-Binary-TV.
+1391|
+1392|    See https://arxiv.org/pdf/2602.04879 for more details.
+1393|
+1394|    Args:
+1395|        old_log_prob (torch.Tensor):
+1396|            Log-probabilities of actions under the old policy, shape (batch_size, response_length).
+1397|        log_prob (torch.Tensor):
+1398|            Log-probabilities of actions under the current policy, shape (batch_size, response_length).
+1399|        advantages (torch.Tensor):
+1400|            Advantage estimates for each action, shape (batch_size, response_length).
+1401|        response_mask (torch.Tensor):
+1402|            Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
+1403|        loss_agg_mode (str, optional):
+1404|            Aggregation mode for `agg_loss`. Defaults to "token-mean".
+1405|        config: `(verl.trainer.config.ActorConfig)`:
+1406|            config for the actor.
+1407|        rollout_log_probs: `(torch.Tensor)`:
+1408|            log probabilities of actions under the rollout policy, shape (batch_size, response_length).
+1409|    """
+1410|
+1411|    assert config is not None
+1412|    assert not isinstance(config, AlgoConfig)
+1413|    # Note: the clip_ratio is different from the standard PPO, it is the TV divergence threshold for DPPO.
+1414|    clip_divergence = config.clip_ratio
+1415|    clip_divergence_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_divergence
+1416|    clip_divergence_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_divergence
+1417|
+1418|    negative_approx_kl = log_prob - old_log_prob
+1419|    # Clamp negative_approx_kl for stability
+1420|    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+1421|    ratio = torch.exp(negative_approx_kl)
+1422|    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+1423|
+1424|    # Instead of dual-clip PPO, we use truncated importance sampling (TIS) to clip the policy loss.
+1425|    # However, a large threshold is recommended to avoid performance degradation due to the truncation bias.
+1426|    # See Section 5.4 in https://arxiv.org/pdf/2602.04879 for more details.
+1427|    clip_ratio_c = config.get("clip_ratio_c", 20.0)
+1428|    truncated_ratio = torch.clamp(ratio, max=clip_ratio_c)
+1429|    truncated_ratio = truncated_ratio.detach()
+1430|
+1431|    # Compute valid mask for DPPO-Binary-TV
+1432|    prob = torch.exp(log_prob)
+1433|    old_prob = torch.exp(old_log_prob)
+1434|    valid_positive_mask = (prob - old_prob) <= clip_divergence_high
+1435|    valid_negative_mask = (prob - old_prob) >= -clip_divergence_low
+1436|    valid_mask = torch.where(advantages > 0, valid_positive_mask, valid_negative_mask)
+1437|    valid_mask = valid_mask.detach().float()
+1438|
+1439|    pg_losses = -advantages * truncated_ratio * log_prob * valid_mask
+1440|
+1441|    # Apply rollout correction weights if provided
+1442|    if rollout_is_weights is not None:
+1443|        pg_losses = pg_losses * rollout_is_weights
+1444|
+1445|    pg_loss = agg_loss(
+1446|        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
+1447|    )
+1448|
+1449|    pg_clipfrac = verl_F.masked_mean((1.0 - valid_mask).float(), response_mask)
+1450|    pg_clipfrac_lower = verl_F.masked_mean((ratio > clip_ratio_c).float() * valid_mask, response_mask)
+1451|
+1452|    pg_metrics = {
+1453|        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+1454|        "actor/ppo_kl": ppo_kl.detach().item(),
+1455|        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+1456|    }
+1457|    return pg_loss, pg_metrics
+1458|
+1459|
+1460|@register_policy_loss("dppo_kl")
+1461|def compute_policy_loss_dppo_kl(
+1462|    old_log_prob: torch.Tensor,
+1463|    log_prob: torch.Tensor,
+1464|    advantages: torch.Tensor,
+1465|    response_mask: torch.Tensor,
+1466|    loss_agg_mode: str = "token-mean",
+1467|    config: Optional[ActorConfig] = None,
+1468|    rollout_is_weights: torch.Tensor | None = None,
+1469|) -> tuple[torch.Tensor, dict[str, Any]]:
+1470|    """
+1471|    Compute the clipped policy objective and related metrics for DPPO-Binary-KL.
+1472|
+1473|    See https://arxiv.org/pdf/2602.04879 for more details.
+1474|
+1475|    Args:
+1476|        old_log_prob (torch.Tensor):
+1477|            Log-probabilities of actions under the old policy, shape (batch_size, response_length).
+1478|        log_prob (torch.Tensor):
+1479|            Log-probabilities of actions under the current policy, shape (batch_size, response_length).
+1480|        advantages (torch.Tensor):
+1481|            Advantage estimates for each action, shape (batch_size, response_length).
+1482|        response_mask (torch.Tensor):
+1483|            Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
+1484|        loss_agg_mode (str, optional):
+1485|            Aggregation mode for `agg_loss`. Defaults to "token-mean".
+1486|        config: `(verl.trainer.config.ActorConfig)`:
+1487|            config for the actor.
+1488|        rollout_log_probs: `(torch.Tensor)`:
+1489|            log probabilities of actions under the rollout policy, shape (batch_size, response_length).
+1490|    """
+1491|
+1492|    assert config is not None
+1493|    assert not isinstance(config, AlgoConfig)
+1494|    # Note: the clip_ratio is different from the standard PPO, it is the KL divergence threshold for DPPO.
+1495|    clip_divergence = config.clip_ratio
+1496|    clip_divergence_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_divergence
+1497|    clip_divergence_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_divergence
+1498|
+1499|    negative_approx_kl = log_prob - old_log_prob
+1500|    # Clamp negative_approx_kl for stability
+1501|    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+1502|    ratio = torch.exp(negative_approx_kl)
+1503|    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+1504|
+1505|    # Instead of dual-clip PPO, we use truncated importance sampling (TIS) to clip the policy loss.
+1506|    # However, a large threshold is recommended to avoid performance degradation due to the truncation bias.
+1507|    # See Section 5.4 in https://arxiv.org/pdf/2602.04879 for more details.
+1508|    clip_ratio_c = config.get("clip_ratio_c", 20.0)
+1509|    truncated_ratio = torch.clamp(ratio, max=clip_ratio_c)
+1510|    truncated_ratio = truncated_ratio.detach()
+1511|
+1512|    # Compute valid mask for DPPO-Binary-KL
+1513|    prob = torch.exp(log_prob)
+1514|    old_prob = torch.exp(old_log_prob)
+1515|    binary_kl = old_prob * (old_log_prob - log_prob) + (1 - old_prob) * torch.log(
+1516|        (1.0 - old_prob + 1e-8) / (1.0 - prob + 1e-8)
+1517|    )
+1518|    valid_positive_mask = (binary_kl <= clip_divergence_high) | (prob <= old_prob)
+1519|    valid_negative_mask = (binary_kl <= clip_divergence_low) | (prob >= old_prob)
+1520|    valid_mask = torch.where(advantages > 0, valid_positive_mask, valid_negative_mask)
+1521|    valid_mask = valid_mask.detach().float()
+1522|
+1523|    pg_losses = -advantages * truncated_ratio * log_prob * valid_mask
+1524|
+1525|    # Apply rollout correction weights if provided
+1526|    if rollout_is_weights is not None:
+1527|        pg_losses = pg_losses * rollout_is_weights
+1528|
+1529|    pg_loss = agg_loss(
+1530|        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
+1531|    )
+1532|
+1533|    # For compatibility, return zero for pg_clipfrac_lower (not used in standard DPPO)
+1534|    pg_clipfrac = verl_F.masked_mean((1.0 - valid_mask).float(), response_mask)
+1535|    pg_clipfrac_lower = verl_F.masked_mean((ratio > clip_ratio_c).float() * valid_mask, response_mask)
+1536|
+1537|    pg_metrics = {
+1538|        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+1539|        "actor/ppo_kl": ppo_kl.detach().item(),
+1540|        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+1541|    }
+1542|    return pg_loss, pg_metrics
+1543|
+1544|
+1545|@register_policy_loss("gspo")
+1546|def compute_policy_loss_gspo(
+1547|    old_log_prob: torch.Tensor,
+1548|    log_prob: torch.Tensor,
+1549|    advantages: torch.Tensor,
+1550|    response_mask: torch.Tensor,
+1551|    loss_agg_mode: str = "seq-mean-token-mean",
+1552|    config: Optional[ActorConfig] = None,
+1553|    rollout_is_weights: torch.Tensor | None = None,
+1554|) -> tuple[torch.Tensor, dict[str, Any]]:
+1555|    """
+1556|    Compute the clipped policy objective and related metrics for GSPO.
+1557|
+1558|    See https://arxiv.org/pdf/2507.18071 for more details.
+1559|
+1560|    Args:
+1561|        old_log_prob (torch.Tensor):
+1562|            Log-probabilities of actions under the old policy, shape (batch_size, response_length).
+1563|        log_prob (torch.Tensor):
+1564|            Log-probabilities of actions under the current policy, shape (batch_size, response_length).
+1565|        advantages (torch.Tensor):
+1566|            Advantage estimates for each action, shape (batch_size, response_length).
+1567|        response_mask (torch.Tensor):
+1568|            Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
+1569|        loss_agg_mode (str, optional):
+1570|            Aggregation mode for `agg_loss`. For GSPO, it is recommended to use "seq-mean-token-mean".
+1571|    """
+1572|
+1573|    assert config is not None
+1574|    assert isinstance(config, ActorConfig)
+1575|    clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else config.clip_ratio
+1576|    clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else config.clip_ratio
+1577|
+1578|    negative_approx_kl = log_prob - old_log_prob
+1579|
+1580|    # compute sequence-level importance ratio:
+1581|    # si(θ) = (π_θ(yi|x)/π_θold(yi|x))^(1/|yi|) =
+1582|    # exp [(1/|y_i|) * Σ_t log(π_θ(y_i,t|x,y_i,<t)/π_θold(y_i,t|x,y_i,<t))]
+1583|    seq_lengths = torch.sum(response_mask, dim=-1).clamp(min=1)
+1584|    negative_approx_kl_seq = torch.sum(negative_approx_kl * response_mask, dim=-1) / seq_lengths
+1585|
+1586|    # Combined ratio at token level:
+1587|    # s_i,t(θ) = sg[s_i(θ)] · π_θ(y_i,t|x, y_i,<t) / sg[π_θ(y_i,t|x, y_i,<t)]
+1588|    # In log space: log(s_i,t(θ)) = sg[log(s_i(θ))] + log_prob - sg[log_prob]
+1589|    log_seq_importance_ratio = log_prob - log_prob.detach() + negative_approx_kl_seq.detach().unsqueeze(-1)
+1590|    log_seq_importance_ratio = torch.clamp(log_seq_importance_ratio, max=10.0)  # clamp for numerical stability
+1591|
+1592|    # finaly exp() to remove log
+1593|    seq_importance_ratio = torch.exp(log_seq_importance_ratio)
+1594|
+1595|    pg_losses1 = -advantages * seq_importance_ratio
+1596|    pg_losses2 = -advantages * torch.clamp(seq_importance_ratio, 1 - clip_ratio_low, 1 + clip_ratio_high)
+1597|    pg_losses = torch.maximum(pg_losses1, pg_losses2)
+1598|
+1599|    # Apply rollout correction weights if provided
+1600|    if rollout_is_weights is not None:
+1601|        pg_losses = pg_losses * rollout_is_weights
+1602|
+1603|    # NOTE: differ from GSPO original paper that aggregate the loss at the sequence level (seq-mean-token-mean),
+1604|    # we support aggregate the loss in different modes, default is token-mean.
+1605|    pg_loss = agg_loss(
+1606|        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
+1607|    )
+1608|
+1609|    # For compatibility, return zero for pg_clipfrac_lower (not used in standard GSPO)
+1610|    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+1611|    pg_clipfrac_lower = torch.tensor(0.0, device=pg_loss.device)
+1612|
+1613|    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+1614|    pg_metrics = {
+1615|        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+1616|        "actor/ppo_kl": ppo_kl.detach().item(),
+1617|        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+1618|    }
+1619|    return pg_loss, pg_metrics
+1620|
+1621|
+1622|@register_policy_loss("sapo")
+1623|def compute_policy_loss_sapo(
+1624|    old_log_prob: torch.Tensor,
+1625|    log_prob: torch.Tensor,
+1626|    advantages: torch.Tensor,
+1627|    response_mask: torch.Tensor,
+1628|    loss_agg_mode: str = "seq-mean-token-mean",
+1629|    config: Optional[ActorConfig] = None,
+1630|    rollout_is_weights: torch.Tensor | None = None,
+1631|) -> tuple[torch.Tensor, dict[str, Any]]:
+1632|    """
+1633|    Compute the smoothed policy objective and related metrics for SAPO.
+1634|
+1635|    See https://arxiv.org/pdf/2511.20347 for more details.
+1636|
+1637|    Args:
+1638|        old_log_prob (torch.Tensor):
+1639|            Log-probabilities of actions under the old policy, shape (batch_size, response_length).
+1640|        log_prob (torch.Tensor):
+1641|            Log-probabilities of actions under the current policy, shape (batch_size, response_length).
+1642|        advantages (torch.Tensor):
+1643|            Advantage estimates for each action, shape (batch_size, response_length).
+1644|        response_mask (torch.Tensor):
+1645|            Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
+1646|        loss_agg_mode (str, optional):
+1647|            Aggregation mode for `agg_loss`. For SAPO, it is recommended to use "seq-mean-token-mean".
+1648|    """
+1649|
+1650|    assert config is not None
+1651|    assert isinstance(config, ActorConfig)
+1652|
+1653|    # temperature for positive and negative token updates
+1654|    tau_pos = torch.as_tensor(config.tau_pos, dtype=advantages.dtype, device=advantages.device)
+1655|    tau_neg = torch.as_tensor(config.tau_neg, dtype=advantages.dtype, device=advantages.device)
+1656|
+1657|    def gate_function(x, tau):
+1658|        """The gating function used in SAPO"""
+1659|        return torch.sigmoid(tau * (x - 1.0)) * (4.0 / tau)
+1660|
+1661|    # compute IS at token level:
+1662|    # r_{i,t}(θ) = π_θ(y_{i,t}|x, y_{i,<t}) / π_θold(y_{i,t}|x, y_{i,<t})]
+1663|    # In log space: log(r_{i,t}(θ)) = log_prob - ol_log_prob
+1664|    negative_approx_kl = log_prob - old_log_prob
+1665|    # Clamp negative_approx_kl for stability
+1666|    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+1667|    # finally exp() to remove log and get r_{i,t}(θ)
+1668|    ratio = torch.exp(negative_approx_kl)
+1669|
+1670|    # tau_{i,t} is tau_pos if adv > 0 else tau_neg
+1671|    taus = torch.where(
+1672|        condition=advantages > 0,
+1673|        input=tau_pos,  # if A_{i,t} > 0 we set to tau_pos
+1674|        other=tau_neg,  # if A_{i,t} <= 0 we set to tau_neg
+1675|    )
+1676|
+1677|    # compute the gates f_{i,t}(r_{i,t}(θ)) at token level
+1678|    gates = gate_function(ratio, taus)
+1679|
+1680|    # compute policy gradient loss
+1681|    pg_losses = -gates * advantages
+1682|
+1683|    # Apply rollout correction weights if provided
+1684|    if rollout_is_weights is not None:
+1685|        pg_losses = pg_losses * rollout_is_weights
+1686|
+1687|    # for SAPO, we need to aggregate the loss at the sequence level (seq-mean-token-mean)
+1688|    pg_loss = agg_loss(
+1689|        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode="seq-mean-token-mean", **config.global_batch_info
+1690|    )
+1691|
+1692|    # For compatibility, return zero for both pg_clipfrac and pg_clipfrac_lower (not used in SAPO)
+1693|    pg_clipfrac = torch.tensor(0.0, device=pg_loss.device)
+1694|    pg_clipfrac_lower = torch.tensor(0.0, device=pg_loss.device)
+1695|    # compute KL for metrics tracking
+1696|    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+1697|    # return metrics dict
+1698|    pg_metrics = {
+1699|        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+1700|        "actor/ppo_kl": ppo_kl.detach().item(),
+1701|        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+1702|    }
+1703|
+1704|    return pg_loss, pg_metrics
+1705|
+1706|
+1707|@register_policy_loss("gpg")
+1708|def compute_policy_loss_gpg(
+1709|    old_log_prob: torch.Tensor,
+1710|    log_prob: torch.Tensor,
+1711|    advantages: torch.Tensor,
+1712|    response_mask: torch.Tensor,
+1713|    loss_agg_mode: str = "token-mean",
+1714|    config: Optional[ActorConfig] = None,
+1715|    rollout_is_weights: torch.Tensor | None = None,
+1716|) -> tuple[torch.Tensor, dict[str, Any]]:
+1717|    """Adapted from
+1718|    https://github.com/AMAP-ML/GPG/blob/main/VisualThinker-R1-Zero/src/open-r1-multimodal/src/open_r1/trainer/grpo_trainer.py#L495
+1719|    Args:
+1720|        log_prob: `(torch.Tensor)`
+1721|            shape: (bs, response_length)
+1722|        advantages: `(torch.Tensor)`
+1723|            shape: (bs, response_length)
+1724|        response_mask: `(torch.Tensor)`
+1725|            shape: (bs, response_length)
+1726|    return:
+1727|        pg_loss: `a scalar torch.Tensor`
+1728|            policy gradient loss computed via GPG
+1729|    """
+1730|    assert config is not None
+1731|    pg_losses = -log_prob * advantages
+1732|
+1733|    # Apply rollout correction weights if provided
+1734|    if rollout_is_weights is not None:
+1735|        pg_losses = pg_losses * rollout_is_weights
+1736|
+1737|    pg_loss = agg_loss(
+1738|        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
+1739|    )
+1740|    return pg_loss, {}
+1741|
+1742|
+1743|@register_policy_loss("clip_cov")
+1744|def compute_policy_loss_clip_cov(
+1745|    old_log_prob: torch.Tensor,
+1746|    log_prob: torch.Tensor,
+1747|    advantages: torch.Tensor,
+1748|    response_mask: torch.Tensor,
+1749|    loss_agg_mode: str = "token-mean",
+1750|    config: Optional[ActorConfig] = None,
+1751|    rollout_is_weights: torch.Tensor | None = None,
+1752|) -> tuple[torch.Tensor, dict[str, Any]]:
+1753|    """
+1754|    Compute the clipped policy objective and related metrics for Clip-Cov.
+1755|
+1756|    Adapted from
+1757|    https://github.com/PRIME-RL/Entropy-Mechanism-of-RL/blob/main/verl/trainer/ppo/core_algos.py
+1758|
+1759|    Args:
+1760|        old_log_prob (torch.Tensor):
+1761|            Log-probabilities of actions under the old policy, shape (batch_size, response_length).
+1762|        log_prob (torch.Tensor):
+1763|            Log-probabilities of actions under the current policy, shape (batch_size, response_length).
+1764|        advantages (torch.Tensor):
+1765|            Advantage estimates for each action, shape (batch_size, response_length).
+1766|        response_mask (torch.Tensor):
+1767|            Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
+1768|        cliprange (float, optional):
+1769|            Clipping parameter ε for standard PPO. See https://arxiv.org/abs/1707.06347.
+1770|            Defaults to None (must be provided).
+1771|        cliprange_low (float, optional):
+1772|            Lower clip range for dual-clip PPO. Defaults to same as `cliprange`.
+1773|        cliprange_high (float, optional):
+1774|            Upper clip range for dual-clip PPO. Defaults to same as `cliprange`.
+1775|        loss_agg_mode (str, optional):
+1776|            Aggregation mode for `agg_loss`. Defaults to "token-mean".
+1777|        clip_cov_ratio (float, optional):
+1778|            Ratio for clipping the covariance. Defaults to 0.0002.
+1779|        clip_cov_lb (float, optional):
+1780|            Lower bound for clipping covariance. Defaults to 1.0.
+1781|        clip_cov_ub (float, optional):
+1782|            Upper bound for clipping covariance. Defaults to 5.0.
+1783|    """
+1784|    assert config is not None
+1785|    assert not isinstance(config, AlgoConfig), "passing AlgoConfig not supported yet"
+1786|    assert config.policy_loss is not None
+1787|
+1788|    clip_cov_ratio = config.policy_loss.clip_cov_ratio if config.policy_loss.clip_cov_ratio is not None else 0.0002
+1789|    cliprange = config.clip_ratio
+1790|    cliprange_low = config.clip_ratio_low if config.clip_ratio_low is not None else cliprange
+1791|    cliprange_high = config.clip_ratio_high if config.clip_ratio_high is not None else cliprange
+1792|    clip_cov_ub = config.policy_loss.clip_cov_ub if config.policy_loss.clip_cov_ub is not None else 5.0
+1793|    clip_cov_lb = config.policy_loss.clip_cov_lb if config.policy_loss.clip_cov_lb is not None else 1.0
+1794|
+1795|    assert clip_cov_ratio > 0, "clip_ratio should be larger than 0."
+1796|
+1797|    negative_approx_kl = log_prob - old_log_prob
+1798|    ratio = torch.exp(negative_approx_kl)
+1799|    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+1800|
+1801|    pg_losses1 = -advantages * ratio
+1802|
+1803|    if cliprange_low is None:
+1804|        cliprange_low = cliprange
+1805|    if cliprange_high is None:
+1806|        cliprange_high = cliprange
+1807|
+1808|    corr = torch.ones_like(advantages)
+1809|    pg_losses2 = -advantages * torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)
+1810|    clip_by_origin = (pg_losses2 > pg_losses1) & (response_mask > 0)
+1811|
+1812|    cov_all = (advantages - verl_F.masked_mean(advantages, response_mask)) * (
+1813|        log_prob - verl_F.masked_mean(log_prob.detach(), response_mask)
+1814|    )
+1815|    cov_all[response_mask == 0] = -torch.inf
+1816|    cov_all[clip_by_origin] = -torch.inf
+1817|
+1818|    clip_num = max(int(clip_cov_ratio * response_mask.sum().item()), 1)
+1819|    top_k_idx = (cov_all < clip_cov_ub) & (cov_all > clip_cov_lb) & (response_mask > 0)
+1820|    top_k_idx = torch.nonzero(top_k_idx)
+1821|
+1822|    if len(top_k_idx) > 0:
+1823|        perm = torch.randperm(len(top_k_idx))
+1824|        top_k_idx = top_k_idx[perm[: min(clip_num, len(top_k_idx))]]
+1825|    else:
+1826|        top_k_idx = torch.empty((0, 2), device=cov_all.device, dtype=torch.long)
+1827|
+1828|    corr[top_k_idx[:, 0], top_k_idx[:, 1]] = 0
+1829|
+1830|    pg_clipfrac = verl_F.masked_mean((corr == 0).float(), response_mask)
+1831|
+1832|    pg_losses = torch.maximum(pg_losses1, pg_losses2) * corr
+1833|
+1834|    # Apply rollout correction weights if provided
+1835|    if rollout_is_weights is not None:
+1836|        pg_losses = pg_losses * rollout_is_weights
+1837|
+1838|    pg_loss = agg_loss(
+1839|        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
+1840|    )
+1841|    pg_metrics = {
+1842|        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+1843|        "actor/ppo_kl": ppo_kl.detach().item(),
+1844|    }
+1845|    return pg_loss, pg_metrics
+1846|
+1847|
+1848|@register_policy_loss("kl_cov")
+1849|def compute_policy_loss_kl_cov(
+1850|    old_log_prob: torch.Tensor,
+1851|    log_prob: torch.Tensor,
+1852|    advantages: torch.Tensor,
+1853|    response_mask: torch.Tensor,
+1854|    loss_agg_mode: str = "token-mean",
+1855|    config: Optional[ActorConfig] = None,
+1856|    rollout_is_weights: torch.Tensor | None = None,
+1857|) -> tuple[torch.Tensor, dict[str, Any]]:
+1858|    """
+1859|    Compute the clipped policy objective and related metrics for Clip-Cov.
+1860|
+1861|    Adapted from
+1862|    https://github.com/PRIME-RL/Entropy-Mechanism-of-RL/blob/main/verl/trainer/ppo/core_algos.py
+1863|
+1864|    Args:
+1865|        old_log_prob (torch.Tensor):
+1866|            Log-probabilities of actions under the old policy, shape (batch_size, response_length).
+1867|        log_prob (torch.Tensor):
+1868|            Log-probabilities of actions under the current policy, shape (batch_size, response_length).
+1869|        advantages (torch.Tensor):
+1870|            Advantage estimates for each action, shape (batch_size, response_length).
+1871|        response_mask (torch.Tensor):
+1872|            Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
+1873|        loss_agg_mode (str, optional):
+1874|            Aggregation mode for `agg_loss`. Defaults to "token-mean".
+1875|        kl_cov_ratio (float, optional):
+1876|            Ratio for selecting the top-k covariance values. Defaults to 0.0002.
+1877|        ppo_kl_coef (float, optional):
+1878|            Coefficient for the KL penalty term in the loss. Defaults to 1.
+1879|    """
+1880|    assert config is not None
+1881|    assert not isinstance(config, AlgoConfig), "passing AlgoConfig not supported yet"
+1882|    assert config.policy_loss is not None
+1883|
+1884|    kl_cov_ratio = config.policy_loss.kl_cov_ratio if config.policy_loss.kl_cov_ratio is not None else 0.0002
+1885|    ppo_kl_coef = config.policy_loss.ppo_kl_coef if config.policy_loss.ppo_kl_coef is not None else 1.0
+1886|
+1887|    assert kl_cov_ratio > 0, "kl_cov_ratio should be larger than 0."
+1888|
+1889|    negative_approx_kl = log_prob - old_log_prob
+1890|    abs_kl = negative_approx_kl.abs()
+1891|    ratio = torch.exp(negative_approx_kl)
+1892|    ppo_kl_abs = verl_F.masked_mean(negative_approx_kl.abs(), response_mask)
+1893|    pg_losses1 = -advantages * ratio
+1894|    pg_losses_kl = -advantages * ratio + ppo_kl_coef * abs_kl
+1895|    pg_losses = pg_losses1
+1896|
+1897|    all_valid = response_mask > 0
+1898|    all_valid_idx = torch.nonzero(all_valid.reshape(-1), as_tuple=True)[0]
+1899|    all_valid_adv = advantages[all_valid].detach().reshape(-1).cpu()
+1900|    all_valid_logp = log_prob[all_valid].detach().reshape(-1).cpu()
+1901|
+1902|    k = min(kl_cov_ratio, len(all_valid_adv))
+1903|
+1904|    if k != 0:
+1905|        cov_lst_all = (all_valid_adv - all_valid_adv.mean()) * (all_valid_logp - all_valid_logp.mean())
+1906|        k_percent_nums = max(1, int(len(cov_lst_all) * kl_cov_ratio))
+1907|        large_cov_idxs = torch.topk(cov_lst_all, k_percent_nums, largest=True).indices
+1908|
+1909|        if len(large_cov_idxs) != 0:
+1910|            large_cov_idxs = all_valid_idx[large_cov_idxs]
+1911|            pg_losses[large_cov_idxs // advantages.shape[1], large_cov_idxs % advantages.shape[1]] = pg_losses_kl[
+1912|                large_cov_idxs // advantages.shape[1], large_cov_idxs % advantages.shape[1]
+1913|            ]
+1914|
+1915|    # Apply rollout correction weights if provided
+1916|    if rollout_is_weights is not None:
+1917|        pg_losses = pg_losses * rollout_is_weights
+1918|
+1919|    pg_loss = agg_loss(
+1920|        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
+1921|    )
+1922|    pg_metrics = {
+1923|        "actor/ppo_kl": ppo_kl_abs.detach().item(),
+1924|    }
+1925|    return pg_loss, pg_metrics
+1926|
+1927|
+1928|@register_policy_loss("geo_mean")
+1929|def compute_policy_loss_geo_mean(
+1930|    old_log_prob: torch.Tensor,
+1931|    log_prob: torch.Tensor,
+1932|    advantages: torch.Tensor,
+1933|    response_mask: torch.Tensor,
+1934|    loss_agg_mode: str = "token-mean",
+1935|    config: Optional[ActorConfig] = None,
+1936|    rollout_is_weights: torch.Tensor | None = None,
+1937|) -> tuple[torch.Tensor, dict[str, Any]]:
+1938|    """
+1939|    Compute the clipped policy objective and related metrics for GMPO.
+1940|
+1941|    Adapted from paper https://arxiv.org/abs/2507.20673
+1942|    https://github.com/callsys/GMPO/blob/main/train_zero_math_gmpo.py
+1943|
+1944|    Args:
+1945|        old_log_prob (torch.Tensor):
+1946|            Log-probabilities of actions under the old policy, shape (batch_size, response_length).
+1947|        log_prob (torch.Tensor):
+1948|            Log-probabilities of actions under the current policy, shape (batch_size, response_length).
+1949|        advantages (torch.Tensor):
+1950|            Advantage estimates for each action, shape (batch_size, response_length).
+1951|        response_mask (torch.Tensor):
+1952|            Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
+1953|        loss_agg_mode (str, optional):
+1954|            not used
+1955|    """
+1956|
+1957|    assert config is not None
+1958|    assert not isinstance(config, AlgoConfig)
+1959|    clip_ratio = config.clip_ratio  # Clipping parameter. See https://arxiv.org/abs/1707.06347.
+1960|    clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
+1961|    clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
+1962|
+1963|    cliprange = clip_ratio
+1964|    cliprange_low = clip_ratio_low
+1965|    cliprange_high = clip_ratio_high
+1966|    if cliprange_low is None:
+1967|        cliprange_low = cliprange
+1968|    if cliprange_high is None:
+1969|        cliprange_high = cliprange
+1970|
+1971|    negative_approx_kl = log_prob - old_log_prob
+1972|    # Clamp negative_approx_kl for stability (uncomment it if you like)
+1973|    # negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+1974|    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+1975|
+1976|    # Clipping at token-level & Clipping wider
+1977|    sgn_advantage = torch.sign(advantages)
+1978|    negative_approx_kl_clamp = torch.clamp(negative_approx_kl, -cliprange_low, cliprange_high)
+1979|    negative_approx_kl_min = torch.min(sgn_advantage * negative_approx_kl, sgn_advantage * negative_approx_kl_clamp)
+1980|    negative_approx_kl_min = sgn_advantage * negative_approx_kl_min
+1981|
+1982|    # Geometric-Mean Policy Optimization
+1983|    response_mask_sum = response_mask.sum(dim=-1)
+1984|    ratio = torch.exp((negative_approx_kl_min * response_mask).sum(dim=-1) / (response_mask_sum + 1e-8))
+1985|    # we only support sequence level advantage for now,
+1986|    # otherwise, below would be not consistent with the paper
+1987|    advantage = (advantages * response_mask).sum(dim=-1) / (response_mask_sum + 1e-8)
+1988|    pg_losses = -advantage * ratio
+1989|
+1990|    # Apply rollout correction weights if provided
+1991|    # For geo_mean, IS weights are 2D (batch_size, seq_length) and need to be aggregated to sequence level
+1992|    if rollout_is_weights is not None:
+1993|        # Aggregate token-level weights to sequence level using geometric mean for consistency
+1994|        # Note: rollout_is_weights is always 2D regardless of aggregation mode
+1995|        seq_is_weights = torch.exp(
+1996|            (torch.log(rollout_is_weights + 1e-10) * response_mask).sum(dim=-1) / (response_mask_sum + 1e-8)
+1997|        )
+1998|        pg_losses = pg_losses * seq_is_weights
+1999|
+2000|    pg_loss = torch.mean(pg_losses)
+2001|
+2002|    # higher: ratio is too large that need clamp to clip_high (when adv > 0)
+2003|    clipped = torch.ne(negative_approx_kl, negative_approx_kl_clamp)
+2004|    pg_clipfrac = verl_F.masked_mean((clipped * (advantages > 0)).float(), response_mask)
+2005|    pg_clipfrac_lower = verl_F.masked_mean((clipped * (advantages < 0)).float(), response_mask)
+2006|    pg_metrics = {
+2007|        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+2008|        "actor/ppo_kl": ppo_kl.detach().item(),
+2009|        "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+2010|    }
+2011|    return pg_loss, pg_metrics
+2012|
+2013|
+2014|@register_policy_loss("dro")
+2015|def compute_policy_loss_dro(
+2016|    old_log_prob: torch.Tensor,
+2017|    log_prob: torch.Tensor,
+2018|    advantages: torch.Tensor,
+2019|    response_mask: torch.Tensor,
+2020|    loss_agg_mode: str = "token-mean",
+2021|    config: Optional[ActorConfig] = None,
+2022|    rollout_is_weights: torch.Tensor | None = None,
+2023|) -> tuple[torch.Tensor, dict[str, Any]]:
+2024|    """Compute Direct Reward Optimization with a quadratic log-ratio penalty."""
+2025|    assert config is not None
+2026|    assert config.policy_loss is not None
+2027|
+2028|    beta = config.policy_loss.dro_beta
+2029|    if beta is None or beta <= 0:
+2030|        raise ValueError("policy_loss.dro_beta must be a positive value when using DRO")
+2031|
+2032|    log_ratio = log_prob - old_log_prob
+2033|    pg_losses = -(log_prob * advantages - 0.5 * beta * log_ratio.square())
+2034|
+2035|    if rollout_is_weights is not None:
+(more lines below)

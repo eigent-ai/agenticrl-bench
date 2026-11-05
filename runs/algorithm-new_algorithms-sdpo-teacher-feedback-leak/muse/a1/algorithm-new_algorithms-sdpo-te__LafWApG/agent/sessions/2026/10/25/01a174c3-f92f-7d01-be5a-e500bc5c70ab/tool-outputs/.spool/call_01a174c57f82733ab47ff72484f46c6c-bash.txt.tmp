@@ -1,0 +1,91 @@
+611:    def _collect_feedback(
+612:        include_environment_feedback: bool,
+617:        Collect environment feedback from reward_extra_infos_dict.
+620:            include_environment_feedback: Whether to include environment feedback
+625:            List of feedback strings (or None for entries without feedback)
+627:        feedback_list: list[Any] = [None] * batch_size
+628:        if include_environment_feedback and reward_extra_infos_dict is not None:
+629:            raw_feedback = reward_extra_infos_dict.get("feedback", [])
+630:            for i in range(min(len(raw_feedback), batch_size)):
+631:                # Only include non-empty feedback strings
+632:                if raw_feedback[i] and isinstance(raw_feedback[i], str) and raw_feedback[i].strip():
+633:                    feedback_list[i] = raw_feedback[i]
+634:        return feedback_list
+690:        # Extract feedback if available and include_environment_feedback is enabled
+691:        feedback_list = self._collect_feedback(
+692:            include_environment_feedback=self_distillation_cfg.include_environment_feedback,
+713:            has_feedback = feedback_list[i] is not None
+714:            feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
+716:            # If feedback_only_without_solution is True, only use feedback when no solution exists
+717:            use_feedback = has_feedback and (not feedback_only_without_solution or not has_solution)
+726:            # build feedback section
+727:            feedback_section = ""
+728:            if use_feedback:
+729:                feedback_section = self_distillation_cfg.feedback_template.format(
+730:                    feedback_raw=feedback_list[i]
+733:            # combine solution and feedback sections
+734:            if use_feedback or has_solution:
+738:                    feedback=feedback_section,
+766:        # Compute which samples actually use feedback (accounting for environment_feedback_only_without_solution)
+767:        feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
+768:        feedback_used = [
+769:            feedback_list[i] is not None and (not feedback_only_without_solution or solution_strs[i] is None)
+773:        # self_distillation_mask is True if sample has a solution OR feedback is used (i.e., will get a reprompted message)
+775:            [solution_strs[i] is not None or feedback_used[i] for i in range(batch_size)],
+781:        num_with_feedback_available = sum(1 for f in feedback_list if f is not None)
+782:        num_with_feedback_used = sum(1 for f in feedback_used if f)
+787:            "self_distillation/feedback_available_fraction": num_with_feedback_available / batch_size,
+788:            "self_distillation/feedback_used_fraction": num_with_feedback_used / batch_size,
+===
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:611:    def _collect_feedback(
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:612:        include_environment_feedback: bool,
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:617:        Collect environment feedback from reward_extra_infos_dict.
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:620:            include_environment_feedback: Whether to include environment feedback
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:625:            List of feedback strings (or None for entries without feedback)
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:627:        feedback_list: list[Any] = [None] * batch_size
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:628:        if include_environment_feedback and reward_extra_infos_dict is not None:
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:629:            raw_feedback = reward_extra_infos_dict.get("feedback", [])
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:630:            for i in range(min(len(raw_feedback), batch_size)):
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:631:                # Only include non-empty feedback strings
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:632:                if raw_feedback[i] and isinstance(raw_feedback[i], str) and raw_feedback[i].strip():
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:633:                    feedback_list[i] = raw_feedback[i]
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:634:        return feedback_list
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:690:        # Extract feedback if available and include_environment_feedback is enabled
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:691:        feedback_list = self._collect_feedback(
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:692:            include_environment_feedback=self_distillation_cfg.include_environment_feedback,
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:713:            has_feedback = feedback_list[i] is not None
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:714:            feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:716:            # If feedback_only_without_solution is True, only use feedback when no solution exists
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:717:            use_feedback = has_feedback and (not feedback_only_without_solution or not has_solution)
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:726:            # build feedback section
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:727:            feedback_section = ""
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:728:            if use_feedback:
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:729:                feedback_section = self_distillation_cfg.feedback_template.format(
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:730:                    feedback_raw=feedback_list[i]
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:733:            # combine solution and feedback sections
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:734:            if use_feedback or has_solution:
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:738:                    feedback=feedback_section,
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:766:        # Compute which samples actually use feedback (accounting for environment_feedback_only_without_solution)
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:767:        feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:768:        feedback_used = [
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:769:            feedback_list[i] is not None and (not feedback_only_without_solution or solution_strs[i] is None)
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:773:        # self_distillation_mask is True if sample has a solution OR feedback is used (i.e., will get a reprompted message)
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:775:            [solution_strs[i] is not None or feedback_used[i] for i in range(batch_size)],
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:781:        num_with_feedback_available = sum(1 for f in feedback_list if f is not None)
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:782:        num_with_feedback_used = sum(1 for f in feedback_used if f)
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:787:            "self_distillation/feedback_available_fraction": num_with_feedback_available / batch_size,
+/opt/SDPO/verl/trainer/ppo/ray_trainer.py:788:            "self_distillation/feedback_used_fraction": num_with_feedback_used / batch_size,
+/opt/SDPO/verl/trainer/config/algorithm.py:581:        use_pf_ppo (bool): Whether to enable preference feedback PPO.
+/opt/SDPO/verl/trainer/config/algorithm.py:582:        pf_ppo (dict[str, Any]): Preference feedback PPO settings.
+/opt/SDPO/verl/workers/config/actor.py:56:        reprompt_template (str): Template for reprompting. Uses {prompt}, {solution}, {feedback} placeholders.
+/opt/SDPO/verl/workers/config/actor.py:58:        feedback_template (str): Template for formatting feedback section. Uses {feedback_raw} placeholder.
+/opt/SDPO/verl/workers/config/actor.py:59:        include_environment_feedback (bool): Whether to include environment feedback in reprompting for wrong attempts.
+/opt/SDPO/verl/workers/config/actor.py:60:        environment_feedback_only_without_solution (bool): If True, only use feedback when no solution is available (ignore feedback when solution exists).
+/opt/SDPO/verl/workers/config/actor.py:61:        reprompt_template_feedback (str): Template for reprompting with feedback but no solution.
+/opt/SDPO/verl/workers/config/actor.py:62:        reprompt_template_feedback_solution (str): Template for reprompting with both feedback and solution.
+/opt/SDPO/verl/workers/config/actor.py:78:        "{prompt}{solution}{feedback}\n\n"
+/opt/SDPO/verl/workers/config/actor.py:86:    feedback_template: str = (
+/opt/SDPO/verl/workers/config/actor.py:88:        "The following is feedback from your unsuccessful earlier attempt:\n\n"
+/opt/SDPO/verl/workers/config/actor.py:89:        "{feedback_raw}\n\n"
+/opt/SDPO/verl/workers/config/actor.py:91:    include_environment_feedback: bool = False
+/opt/SDPO/verl/workers/config/actor.py:92:    environment_feedback_only_without_solution: bool = False

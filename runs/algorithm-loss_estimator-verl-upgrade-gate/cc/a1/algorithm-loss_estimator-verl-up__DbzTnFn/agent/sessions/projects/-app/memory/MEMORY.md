@@ -1,0 +1,1 @@
+- [verl upgrade gate](verl-upgrade-gate.md) — /app/upgrade_gate: what it checks, how to re-record goldens, design choices

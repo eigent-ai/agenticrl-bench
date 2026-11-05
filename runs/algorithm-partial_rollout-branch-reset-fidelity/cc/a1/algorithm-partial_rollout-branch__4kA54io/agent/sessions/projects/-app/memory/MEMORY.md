@@ -1,0 +1,1 @@
+- [Branching reset](branching-reset.md) — reset(traj, k) requirements, design as built, sbx quirks (RPC stalls during creates, normalized tenant modes)

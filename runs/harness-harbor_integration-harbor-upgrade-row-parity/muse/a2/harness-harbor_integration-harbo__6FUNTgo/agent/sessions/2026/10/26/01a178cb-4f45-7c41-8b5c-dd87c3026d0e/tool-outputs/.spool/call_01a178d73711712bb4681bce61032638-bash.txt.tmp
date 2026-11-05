@@ -1,0 +1,621 @@
+import traceback
+from datetime import datetime, timezone
+from uuid import UUID, uuid4
+
+from pydantic import BaseModel, Field
+
+from harbor.models.agent.context import AgentContext
+from harbor.models.task.config import VerifierEnvironmentMode
+from harbor.models.task.id import GitTaskId, LocalTaskId, PackageTaskId
+from harbor.models.trial.config import TrialConfig
+from harbor.models.verifier.result import VerifierResult
+
+
+class TimingInfo(BaseModel):
+    """Timing information for a phase of trial execution."""
+
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+
+
+class ExceptionInfo(BaseModel):
+    """Information about an exception that occurred during trial execution."""
+
+    exception_type: str
+    exception_message: str
+    exception_traceback: str
+    occurred_at: datetime
+
+    @classmethod
+    def from_exception(cls, e: BaseException) -> "ExceptionInfo":
+        return cls(
+            exception_type=type(e).__name__,
+            exception_message=str(e),
+            exception_traceback=traceback.format_exc(),
+            occurred_at=datetime.now(timezone.utc),
+        )
+
+
+class ModelInfo(BaseModel):
+    """Information about a model that participated in a trial.
+
+    ``provider`` is optional: when the user runs e.g. ``-m gpt-5.4`` with no
+    ``<provider>/`` prefix, the CLI records the model name without a
+    provider. Downstream writes to the ``model`` table omit the column so
+    the DB default (``'unknown'``) takes over, keeping both sides honest
+    about "not specified" vs "explicitly unknown".
+    """
+
+    name: str
+    provider: str | None = None
+
+
+class AgentInfo(BaseModel):
+    """Information about an agent that participated in a trial."""
+
+    name: str
+    version: str
+    model_info: ModelInfo | None = None
+
+
+class StepResult(BaseModel):
+    step_name: str
+    agent_result: AgentContext | None = None
+    verifier_result: VerifierResult | None = None
+    exception_info: ExceptionInfo | None = None
+    agent_execution: TimingInfo | None = None
+    verifier: TimingInfo | None = None
+
+
+class TrialResult(BaseModel):
+    id: UUID = Field(default_factory=uuid4)
+    task_name: str
+    trial_name: str
+    trial_uri: str
+    task_id: LocalTaskId | GitTaskId | PackageTaskId
+    source: str | None = None
+    task_checksum: str
+    config: TrialConfig
+    agent_info: AgentInfo
+    agent_result: AgentContext | None = None
+    verifier_result: VerifierResult | None = None
+    verifier_environment_mode: VerifierEnvironmentMode | None = Field(
+        default=None,
+        description=(
+            "Resolved verifier environment mode ('shared' or 'separate') the "
+            "trial-level verify ran in. None for multi-step trials: the mode "
+            "is resolved per step there and is not recorded yet."
+        ),
+    )
+    exception_info: ExceptionInfo | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    environment_setup: TimingInfo | None = None
+    agent_setup: TimingInfo | None = None
+    agent_execution: TimingInfo | None = None
+    verifier: TimingInfo | None = None
+    step_results: list[StepResult] | None = None
+
+    def compute_token_cost_totals(
+        self,
+    ) -> tuple[int | None, int | None, int | None, float | None]:
+        """Sum (n_input_tokens, n_cache_tokens, n_output_tokens, cost_usd).
+
+        Single-step trials record an ``AgentContext`` on ``agent_result``;
+        multi-step trials never set that and instead record one per step on
+        ``step_results[i].agent_result``. Aggregate whichever is populated.
+        Returned fields preserve the same semantics as ``AgentContext`` —
+        in particular ``n_input_tokens`` is total input *including* cache.
+        """
+        if self.agent_result is not None:
+            contexts = [self.agent_result]
+        elif self.step_results:
+            contexts = [
+                sr.agent_result
+                for sr in self.step_results
+                if sr.agent_result is not None
+            ]
+        else:
+            contexts = []
+
+            self.logger.debug(f"Trial {self.config.trial_name} cancelled")
+            self._record_exception(exc)
+            await self._emit(TrialEvent.CANCEL)
+            await self._close_bridge()
+            await self._recover_outputs()
+            raise
+        except Exception as exc:
+            self.logger.debug(f"Trial {self.config.trial_name} failed: {exc}")
+            self._record_exception(exc)
+            await self._close_bridge()
+            await self._recover_outputs()
+        finally:
+            try:
+                await self._finalize()
+            finally:
+                try:
+                    self._scrub_jobs_dir()
+                finally:
+                    self._close_logger_handler()
+
+        return self.result
+
+    @abstractmethod
+    async def _run(self) -> None:
+        pass
+
+    @abstractmethod
+    async def _recover_outputs(self) -> None:
+        pass
+
+    async def _prepare(self) -> None:
+        if self._task_trajectory_error is not None:
+            raise self._task_trajectory_error
+        self._validate_agent_capabilities()
+        await self._setup_agent_environment()
+        try:
+            await self.agent_environment.run_healthcheck()
+            await self._upload_injected_skills()
+            with self.agent_environment.with_default_user(self.task.config.agent.user):
+                if self.user_agent is not None:
+                    await self._setup_user_agent()
+                await self._setup_agent()
+                if self.user_agent is not None:
+                    await self._setup_bridge()
+        finally:
+            # if fails, can be used for debugging
+            self._write_stream_handle()
+        self.result.agent_info = self.agent.to_agent_info()
+
+    async def _finalize(self) -> None:
+        try:
+            await self._close_bridge()
+        finally:
+            await self._stop_agent_environment()
+        self.result.finished_at = self._now()
+        self.paths.result_path.write_text(self.result.model_dump_json(indent=4))
+        await self._emit(TrialEvent.END)
+
+    def _record_exception(self, exc: BaseException) -> None:
+        if self.result.exception_info is not None:
+            self.logger.debug(
+                "Skipping exception record because trial already has exception_info",
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+            return
+
+        self.result.exception_info = ExceptionInfo.from_exception(exc)
+        self.paths.exception_message_path.write_text(traceback.format_exc())
+
+    def _resolve_timeout_sec(
+        self,
+        *,
+        base_sec: float,
+        max_sec: float | None = None,
+        multiplier: float | None,
+    ) -> float:
+        resolved_multiplier = (
+            multiplier if multiplier is not None else self.config.timeout_multiplier
+        )
+        return min(base_sec, max_sec or float("inf")) * resolved_multiplier
+
+    async def _run_agent_phase(
+        self,
+        *,
+        target: TrialResult | StepResult,
+        instruction: str,
+        timeout_sec: float | None,
+        user: str | int | None,
+        step_cfg: StepConfig | None = None,
+        resume: bool = False,
+        load: bool = False,
+    ) -> None:
+        await self._emit(TrialEvent.AGENT_START)
+
+        target.agent_result = AgentContext()
+        target.agent_execution = TimingInfo(started_at=self._now())
+
+        running_agent = self.agent
+        exec_env = self.agent.extra_env
+        if self.user_agent is not None:
+            if self.bridge is None or self.config.user_agent is None:
+                raise RuntimeError("User-agent trial requires an initialized bridge")
+
+            running_agent = self.user_agent
+            instruction = render_user_prompt(
+                instruction,
+                self.bridge.prompt(),
+                template_path=self.config.user_agent.user_prompt_template_path,
+                persona_path=self.config.user_agent.user_persona_path,
+            )
+
+            # ACPX launches and may restart the target from this ambient
+            # environment. Apply target values last so the target always sees
+            # its own resolved credentials when the two roles share a key.
+            exec_env = {
+                **self.user_agent.extra_env,
+                **self.bridge.env(),
+                **self.agent.extra_env,
+            }
+
+        try:
+            plan = self._network_plan(step_cfg)
+            step_name = step_cfg.name if step_cfg is not None else None
+            with self.agent_environment.with_default_user(user):
+                async with self._phase_network_policy(
+                    self.agent_environment,
+                    baseline_policy=plan.agent_env_baseline,
+                    phase_policy=plan.agent_phase,
+                ):
+                    with self.agent_environment.scoped_exec_env(exec_env):
+                        with self._log_context(
+                            "agent", self.agent_environment, step_name
+                        ):
+                            if load:
+                                run = self.agent.load
+                            elif resume:
+                                run = running_agent.resume
+                            else:
+                                run = running_agent.run
+                            from harbor.trial.sync_trajectory import sync_trajectory
+
+                            async with sync_trajectory(
+                                self.agent_environment,
+                                running_agent,
+                                self.paths.step_agent_dir(step_name)
+                                if step_name is not None
+                                else self.paths.agent_dir,
+                                enabled=self.user_agent is None,
+                            ):
+                                await asyncio.wait_for(
+                                    run(
+                                        instruction=instruction,
+                                        environment=self.agent_environment,
+                                        context=target.agent_result,
+                                    ),
+                                    timeout=timeout_sec,
+                                )
+        except asyncio.TimeoutError as exc:
+            raise AgentTimeoutError(
+                f"Agent execution timed out after {timeout_sec} seconds"
+            ) from exc
+        finally:
+            if self.user_agent is not None:
+                await self._close_bridge(user=user)
+            target.agent_execution.finished_at = self._now()
+            await self._emit(TrialEvent.AGENT_END)
+
+    async def _download_agent_logs(self) -> None:
+        if self._are_agent_logs_downloaded:
+            return
+
+        if self.agent_environment.capabilities.mounted:
+            await self.agent_environment.prepare_logs_for_host()
+            self._are_agent_logs_downloaded = True
+            return
+
+        await self._download_role_logs(
+            agent_config=self.config.agent,
+            source_dir=self.agent_env_paths.agent_dir,
+            target_dir=self.paths.agent_dir,
+        )
+        if self.user_agent is not None and self.config.user_agent is not None:
+            await self._download_role_logs(
+                agent_config=self.config.user_agent,
+                source_dir=self.agent_env_paths.user_agent_dir,
+                target_dir=self.paths.user_agent_dir,
+            )
+
+        self._are_agent_logs_downloaded = True
+
+    async def _download_role_logs(
+        self,
+        *,
+        agent_config: AgentConfig,
+        source_dir: PurePosixPath,
+        target_dir: Path,
+    ) -> None:
+        try:
+            if agent_config.include_logs or agent_config.exclude_logs:
+                await self.agent_environment.download_dir_filtered(
+                    source_dir=source_dir.as_posix(),
+                    target_dir=target_dir,
+                    include=agent_config.include_logs or None,
+                    exclude=agent_config.exclude_logs or None,
+                )
+            else:
+                await self.agent_environment.download_dir(
+                    source_dir=source_dir.as_posix(),
+                    target_dir=target_dir,
+                )
+        except Exception as e:
+            self.logger.error(
+                f"Failed to download logs to {target_dir}: {e}",
+                exc_info=True,
+            )
+
+    async def _upload_agent_logs(self) -> None:
+        """Upload locally-generated agent logs back to non-mounted environments."""
+        if self.agent_environment.capabilities.mounted:
+            return
+
+        await self._upload_role_logs(
+            source_dir=self.paths.agent_dir,
+            target_dir=self.agent_env_paths.agent_dir,
+        )
+        if self.user_agent is not None:
+            await self._upload_role_logs(
+                source_dir=self.paths.user_agent_dir,
+                target_dir=self.agent_env_paths.user_agent_dir,
+            )
+
+    async def _upload_role_logs(
+        self, *, source_dir: Path, target_dir: PurePosixPath
+    ) -> None:
+        try:
+            await self.agent_environment.upload_dir(
+                source_dir=source_dir,
+                target_dir=target_dir.as_posix(),
+            )
+        except Exception as e:
+            self.logger.error(
+                f"Failed to upload {source_dir.name} logs back to environment: {e}",
+                exc_info=True,
+            )
+
+    async def _run_step_verifier(
+        self,
+        step: StepConfig,
+        step_result: StepResult,
+        *,
+        artifacts_dir: Path,
+        mode: VerifierEnvironmentMode,
+    ) -> None:
+        if self.config.verifier.disable:
+            return
+
+        step_result.verifier = TimingInfo(started_at=self._now())
+        user = self._step_verifier_user(step)
+
+        try:
+            await self._emit(TrialEvent.VERIFICATION_START)
+
+            if mode == VerifierEnvironmentMode.SEPARATE:
+                step_result.verifier_result = await self._run_separate_verifier(
+                    key=step.name,
+                    timeout_sec=self._step_verifier_timeout_sec(step),
+                    artifacts_dir=artifacts_dir,
+                    artifacts=step.artifacts,
+                    step_cfg=step,
+                    user=user,
+                    env=step.verifier.env or None,
+                )
+            else:
+                await self._reset_shared_step_verifier_dirs()
+                # Set this before invoking the verifier because a failed verifier may
+                # still have uploaded tests or written partial outputs. MultiStepTrial
+                # consumes the flag before the next agent phase.
+                self._shared_verifier_dirs_need_reset = True
+                step_result.verifier_result = await self._run_shared_verifier(
+                    timeout_sec=self._step_verifier_timeout_sec(step),
+                    user=user,
+                    env=step.verifier.env or None,
+                    step_name=step.name,
+                    step_cfg=step,
+                )
+        except Exception as exc:
+            if step_result.exception_info is None:
+                step_result.exception_info = ExceptionInfo.from_exception(exc)
+        finally:
+            step_result.verifier.finished_at = self._now()
+
+    def _select_multi_step_reward(self) -> VerifierResult | None:
+        if self.task.config.multi_step_reward_strategy is MultiStepRewardStrategy.FINAL:
+            if not self.result.step_results:
+                return None
+            return self.result.step_results[-1].verifier_result
+        return self._aggregate_step_rewards()
+
+    def _aggregate_step_rewards(self) -> VerifierResult | None:
+        """Compute per-key means across steps with verifier results.
+
+        Missing keys count as 0. Steps without a verifier result are excluded from
+        the denominator.
+        """
+        if not self.result.step_results:
+            return None
+
+        valid_rewards = [
+            result.verifier_result.rewards or {}
+            for result in self.result.step_results
+            if result.verifier_result is not None
+        ]
+        if not valid_rewards:
+            return None
+
+        all_keys = {key for rewards in valid_rewards for key in rewards}
+        if not all_keys:
+            return None
+
+        count = len(valid_rewards)
+        return VerifierResult(
+            rewards={
+                key: sum(rewards.get(key, 0) for rewards in valid_rewards) / count
+                for key in all_keys
+            }
+        )
+
+    async def _reset_shared_step_verifier_dirs(self) -> None:
+        await self.agent_environment.empty_dirs(
+            [self.agent_env_paths.verifier_dir],
+            chmod=True,
+        )
+        await self.agent_environment.empty_dirs(
+            [self.agent_env_paths.tests_dir], chmod=False
+        )
+
+    def _step_verifier_timeout_sec(self, step: StepConfig) -> float | None:
+        default_timeout_sec = (
+            step.verifier.timeout_sec
+            if step.verifier.timeout_sec is not None
+            else self.task.config.verifier.timeout_sec
+        )
+        return self._resolve_timeout_sec(
+            base_sec=self.config.verifier.override_timeout_sec or default_timeout_sec,
+            max_sec=self.config.verifier.max_timeout_sec,
+            multiplier=self.config.verifier_timeout_multiplier,
+        )
+
+    def _step_verifier_user(self, step: StepConfig) -> str | int | None:
+        if step.verifier.user is not None:
+            return step.verifier.user
+        return self.task.config.verifier.user
+
+    async def _run_shared_verifier(
+        self,
+        *,
+        timeout_sec: float | None,
+        user: str | int | None,
+        env: dict[str, str] | None = None,
+        step_name: str | None = None,
+        step_cfg: StepConfig | None = None,
+    ) -> VerifierResult:
+        plan = self._network_plan(step_cfg)
+        with self.agent_environment.with_default_user(user):
+            verifier = VerifierFactory.create_verifier_from_config(
+                self.config.verifier,
+                task=self.task,
+                trial_paths=self.paths,
+                environment=self.agent_environment,
+                override_env=self.config.verifier.env or None,
+                logger=self.logger,
+                verifier_env=env,
+                step_name=step_name,
+            )
+            async with self._phase_network_policy(
+                self.agent_environment,
+                baseline_policy=plan.agent_env_baseline,
+                phase_policy=plan.verifier_phase,
+            ):
+                with self._log_context(
+                    "verification", self.agent_environment, step_name
+                ):
+                    return await asyncio.wait_for(
+                        verifier.verify(), timeout=timeout_sec
+                    )
+
+    async def _run_separate_verifier(
+        self,
+        *,
+        key: str,
+        timeout_sec: float | None,
+        artifacts_dir: Path,
+        artifacts: Sequence[str | ArtifactConfig] | None = None,
+        step_cfg: StepConfig | None = None,
+        user: str | int | None,
+        env: dict[str, str] | None = None,
+    ) -> VerifierResult:
+        definition = resolve_verifier_environment_definition(
+            self.task.config, self.task.paths, step_cfg
+        )
+
+        if definition is None:
+            message = "Separate verifier mode did not resolve an environment config"
+            if step_cfg is not None:
+                message += f" for step {step_cfg.name!r}. This should never happen."
+            raise RuntimeError(message)
+
+        env_config = definition.config
+        plan = self._network_plan(step_cfg, env_config=env_config)
+
+        async with self._separate_verifier_env(
+            definition,
+            key=key,
+            plan=plan,
+        ) as target_env:
+            with target_env.with_default_user(user):
+                env_paths = EnvironmentPaths.for_os(target_env.os)
+
+                await target_env.empty_dirs([env_paths.verifier_dir], chmod=True)
+
+                await self._artifact_handler.upload_artifacts(
+                    target_env,
+                    artifacts_dir=artifacts_dir,
+                    source_artifacts_dir=self.agent_env_paths.artifacts_dir,
+                    target_artifacts_dir=env_paths.artifacts_dir,
+                    artifacts=artifacts,
+                )
+
+                verifier = VerifierFactory.create_verifier_from_config(
+                    self.config.verifier,
+                    task=self.task,
+                    trial_paths=self.paths,
+                    environment=target_env,
+                    override_env=self.config.verifier.env or None,
+                    logger=self.logger,
+                    verifier_env=env,
+                    step_name=step_cfg.name if step_cfg is not None else None,
+                    skip_tests_upload=definition.bundled_tests,
+                )
+
+                verifier_env_baseline = plan.verifier_env_baseline
+                if verifier_env_baseline is None:
+                    raise RuntimeError(
+                        "separate verifier env requires a verifier baseline "
+                        "in the network plan"
+                    )
+
+                step_name = step_cfg.name if step_cfg is not None else None
+                async with self._phase_network_policy(
+                    target_env,
+                    baseline_policy=verifier_env_baseline,
+                    phase_policy=plan.verifier_phase,
+                ):
+                    with self._log_context("verification", target_env, step_name):
+                        return await asyncio.wait_for(
+                            verifier.verify(), timeout=timeout_sec
+                        )
+
+    @contextlib.asynccontextmanager
+    async def _separate_verifier_env(
+        self,
+        definition: VerifierEnvironmentDefinition,
+        *,
+        key: str,
+        plan: TrialNetworkPlan,
+    ) -> AsyncGenerator[BaseEnvironment, None]:
+        env_config = definition.config
+        verifier_runtime_config = self.config.environment.model_copy(
+            update={"extra_docker_compose": []}
+        )
+        if plan.verifier_env_baseline is None:
+            raise RuntimeError(
+                "separate verifier env requires a verifier baseline in the network plan"
+            )
+        env = EnvironmentFactory.create_environment_from_config(
+            config=verifier_runtime_config,
+            stream=False,
+            environment_dir=definition.directory,
+            enable_environment_dir_upload=not definition.bundled_tests,
+            environment_name=self.task.short_name,
+            session_id=self._separate_verifier_session_id(key),
+            trial_paths=self.paths,
+            task_env_config=definition.config,
+            logger=self.logger,
+            mounts=self._verifier_env_mounts(env_config),
+            network_policy=plan.verifier_env_baseline,
+            phase_network_policies=[plan.verifier_phase],
+        )
+        env.context_id = self._id
+        self._validate_separate_verifier_env_policies(env, plan=plan)
+        try:
+            await asyncio.wait_for(
+                env.start(force_build=False),
+                timeout=self._environment_build_timeout_sec,
+            )
+            yield env
+        finally:
+            try:
+                await asyncio.shield(env.stop(delete=self.config.environment.delete))
+            except Exception as exc:
+                self.logger.debug(f"Failed to stop verifier env '{key}': {exc}")

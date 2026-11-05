@@ -1,0 +1,146 @@
+from pydantic import BaseModel
+
+
+class VerifierResult(BaseModel):
+    rewards: dict[str, float | int] | None = None
+from __future__ import annotations
+
+import logging
+from abc import ABC, abstractmethod
+from typing import Any
+
+from harbor.environments.base import BaseEnvironment
+from harbor.models.task.task import Task
+from harbor.models.trial.paths import TrialPaths
+from harbor.models.verifier.result import VerifierResult
+from harbor.utils.logger import logger as global_logger
+
+
+class BaseVerifier(ABC):
+    """Base class for Harbor verifiers."""
+
+    def __init__(
+        self,
+        *,
+        task: Task,
+        trial_paths: TrialPaths,
+        environment: BaseEnvironment,
+        override_env: dict[str, str] | None = None,
+        logger: logging.Logger | None = None,
+        verifier_env: dict[str, str] | None = None,
+        step_name: str | None = None,
+        include_logs: list[str] | None = None,
+        exclude_logs: list[str] | None = None,
+        **_: Any,
+    ) -> None:
+        self.task = task
+        self.trial_paths = trial_paths
+        self.environment = environment
+        self.override_env: dict[str, str] = dict(override_env) if override_env else {}
+        self.logger: logging.Logger = (logger or global_logger).getChild(__name__)
+        self.verifier_env = verifier_env
+        self.step_name = step_name
+        self.include_logs = include_logs
+        self.exclude_logs = exclude_logs
+
+    @abstractmethod
+    async def verify(self) -> VerifierResult:
+        """Run verification and return a Harbor verifier result."""
+85:class TrialPaths:
+86-    """
+87-    The output directory of a trial.
+88-
+89-    Single-step trial directory structure:
+90-    trial_dir/
+91-    ├── agent/          # Logs written by the agent.
+92-    ├── user-agent/     # Logs written by the simulated-user agent. Only
+93-    │                     created for simulated-user trials (user_agent set).
+94-    ├── verifier/       # Logs written by the verifier.
+95-    ├── artifacts/      # Collected artifacts from the environment.
+96-    │   ├── manifest.json           # What was collected, from where (each
+97-    │   │                              entry tagged with its service).
+98-    │   ├── <abs source path>       # Source-derived entries from any service
+99-    │   │                              (main or sidecar), mirrored under one flat
+100-    │   │                              base dir, e.g. /var/log/x -> var/log/x. The
+101-    │   │                              agent's convention dir lands at
+102-    │   │                              logs/artifacts/.
+103-    │   └── <destination>/          # Entries with an explicit destination.
+104-    ├── config.json     # Trial configuration for reproducibility.
+105-    ├── lock.json       # Resolved trial inputs for reproducibility.
+106-    ├── results.json    # JSON representation of TrialResult.
+107-    └── trial.log       # Logs from the trial.
+108-
+109-    Multi-step trial directory structure:
+110-    trial_dir/
+111-    ├── steps/
+112-    │   └── {step_name}/
+113-    │       ├── agent/
+114-    │       ├── verifier/
+115-    │       └── artifacts/
+116-    │           └── manifest.json
+117-    ├── config.json
+118-    ├── lock.json
+119-    ├── results.json
+120-    └── trial.log
+121-
+122-    For multi-step trials, agent/, verifier/, and artifacts/ exist at the trial
+123-    root only transiently as mount targets for the environment; their contents
+124-    are relocated into steps/{step_name}/ after each step, and the now-empty
+125-    root-level dirs are removed at the end of the trial via
+563:        q = lambda p: quote_shell_arg(p, self.os)  # noqa: E731
+565:        if self.os == TaskOS.WINDOWS:
+591:        q = lambda p: quote_shell_arg(p, self.os)  # noqa: E731
+593:        if self.os == TaskOS.WINDOWS:
+615:        q = lambda p: quote_shell_arg(p, self.os)  # noqa: E731
+617:        if self.os == TaskOS.WINDOWS:
+649:        if self.os == TaskOS.WINDOWS:
+732:        return self.os
+1374:        if self.os == TaskOS.WINDOWS:
+1375:            quoted_path = quote_shell_arg(path, self.os)
+/opt/venvs/client/lib/python3.12/site-packages/harbor/models/job/config.py:291:class RetryConfig(BaseModel):
+/opt/venvs/client/lib/python3.12/site-packages/harbor/models/job/config.py-292-    max_retries: int = Field(
+/opt/venvs/client/lib/python3.12/site-packages/harbor/models/job/config.py-293-        default=0, description="Maximum number of retry attempts", ge=0
+/opt/venvs/client/lib/python3.12/site-packages/harbor/models/job/config.py-294-    )
+/opt/venvs/client/lib/python3.12/site-packages/harbor/models/job/config.py-295-    include_exceptions: set[str] | None = Field(
+/opt/venvs/client/lib/python3.12/site-packages/harbor/models/job/config.py-296-        default=None,
+/opt/venvs/client/lib/python3.12/site-packages/harbor/models/job/config.py-297-        description="Exception types to retry on. If None, retries all exceptions.",
+/opt/venvs/client/lib/python3.12/site-packages/harbor/models/job/config.py-298-    )
+/opt/venvs/client/lib/python3.12/site-packages/harbor/models/job/config.py-299-    exclude_exceptions: set[str] | None = Field(
+/opt/venvs/client/lib/python3.12/site-packages/harbor/models/job/config.py-300-        default_factory=lambda: {
+/opt/venvs/client/lib/python3.12/site-packages/harbor/models/job/config.py-301-            "AgentTimeoutError",
+/opt/venvs/client/lib/python3.12/site-packages/harbor/models/job/config.py-302-            "VerifierTimeoutError",
+/opt/venvs/client/lib/python3.12/site-packages/harbor/models/job/config.py-303-            "RewardFileNotFoundError",
+/opt/venvs/client/lib/python3.12/site-packages/harbor/models/job/config.py-304-            "RewardFileEmptyError",
+/opt/venvs/client/lib/python3.12/site-packages/harbor/models/job/config.py-305-            "VerifierOutputParseError",
+/opt/venvs/client/lib/python3.12/site-packages/harbor/models/job/config.py-306-            "ApiUsageLimitError",
+/opt/venvs/client/lib/python3.12/site-packages/harbor/models/job/config.py-307-            "AgentSafetyRefusalError",
+/opt/venvs/client/lib/python3.12/site-packages/harbor/models/job/config.py-308-            "AgentAuthenticationError",
+/opt/venvs/client/lib/python3.12/site-packages/harbor/models/job/config.py-309-            "ModelNotFoundError",
+/opt/venvs/client/lib/python3.12/site-packages/harbor/models/job/config.py-310-        },
+/opt/venvs/client/lib/python3.12/site-packages/harbor/models/job/config.py-311-        description="Exception types to NOT retry on. Takes precedence over "
+/opt/venvs/client/lib/python3.12/site-packages/harbor/models/job/config.py-312-        "include_exceptions.",
+/opt/venvs/client/lib/python3.12/site-packages/harbor/models/job/config.py-313-    )
+/opt/venvs/client/lib/python3.12/site-packages/harbor/models/job/config.py-314-    wait_multiplier: float = Field(
+/opt/venvs/client/lib/python3.12/site-packages/harbor/models/job/config.py-315-        default=1.0, description="Multiplier for exponential backoff wait time"
+/opt/venvs/client/lib/python3.12/site-packages/harbor/models/job/config.py-316-    )
+/opt/venvs/client/lib/python3.12/site-packages/harbor/models/job/config.py-317-    min_wait_sec: float = Field(
+/opt/venvs/client/lib/python3.12/site-packages/harbor/models/job/config.py-318-        default=1.0, description="Minimum wait time in seconds between retries"
+/opt/venvs/client/lib/python3.12/site-packages/harbor/models/job/config.py-319-    )
+/opt/venvs/client/lib/python3.12/site-packages/harbor/models/job/config.py-320-    max_wait_sec: float = Field(
+/opt/venvs/client/lib/python3.12/site-packages/harbor/models/job/config.py-321-        default=60.0, description="Maximum wait time in seconds between retries"
+198:    def create_error_response(
+199-        self,
+200-        message: str,
+201-        err_type: str = "BadRequestError",
+202-        status_code: int = 400,
+203-        param: Optional[str] = None,
+204-    ) -> ORJSONResponse:
+205-        """Create an error response"""
+206-        # TODO: remove fastapi dependency in openai and move response handling to the entrypoint
+207-        error = ErrorResponse(
+208-            object="error",
+209-            message=message,
+210-            type=err_type,
+211-            param=param,
+212-            code=status_code,
+213-        )

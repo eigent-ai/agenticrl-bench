@@ -1,0 +1,281 @@
+Read text file `/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/llms/lite_llm.py`.
+(499 line(s) above)
+500|            if not logprobs_data:
+501|                return None
+502|
+503|            content = logprobs_data.get("content", [])
+504|            return [
+505|                token_data["logprob"]
+506|                for token_data in content
+507|                if "logprob" in token_data
+508|            ]
+509|        except (KeyError, TypeError, IndexError):
+510|            return None
+511|
+512|    def _extract_provider_extra(self, response) -> dict[str, Any] | None:
+513|        """Extract non-token_ids fields from provider_specific_fields.
+514|
+515|        Returns all fields from provider_specific_fields except 'token_ids'
+516|        (which is handled separately by _extract_token_ids). This captures
+517|        provider-specific data such as router expert indices for MoE models.
+518|
+519|        Returns:
+520|            Dictionary of extra provider-specific data, or None if not available.
+521|        """
+522|        try:
+523|            choices = response.get("choices", [])
+524|            if not choices:
+525|                return None
+526|
+527|            choice = choices[0]
+528|            if (
+529|                not hasattr(choice, "provider_specific_fields")
+530|                or not choice.provider_specific_fields
+531|            ):
+532|                return None
+533|
+534|            extra = {
+535|                k: v
+536|                for k, v in choice.provider_specific_fields.items()
+537|                if k != "token_ids"
+538|            }
+539|            return extra if extra else None
+540|
+541|        except Exception as e:
+542|            self._logger.debug(f"Error extracting provider extra fields: {e}")
+543|            return None
+544|
+545|    def _extract_cost(self, response) -> float:
+546|        """Extract cost from a response's _hidden_params or compute via litellm.
+547|
+548|        Args:
+549|            response: The LLM response object
+550|
+551|        Returns:
+552|            The cost in USD, or 0.0 if unavailable.
+553|        """
+554|        cost = 0.0
+555|        if hasattr(response, "_hidden_params"):
+556|            hidden_params = response._hidden_params
+557|            if isinstance(hidden_params, dict):
+558|                cost = hidden_params.get("response_cost", 0.0) or 0.0
+559|
+560|        if cost == 0.0:
+561|            try:
+562|                cost = litellm.completion_cost(completion_response=response) or 0.0
+563|            except Exception:
+564|                cost = 0.0
+565|
+566|        return float(cost)
+567|
+568|    def _extract_usage_info(self, response) -> UsageInfo | None:
+569|        """Extract token usage and cost from a completion API response.
+570|
+571|        Args:
+572|            response: The LLM response object
+573|
+574|        Returns:
+575|            UsageInfo with token counts and cost, or None if not available.
+576|        """
+577|        try:
+578|            # LiteLLM returns a ModelResponse object with a usage attribute
+579|            # See: https://docs.litellm.ai/docs/completion/prompt_caching
+580|            usage = response.usage
+581|
+582|            prompt_tokens = getattr(usage, "prompt_tokens", 0)
+583|            completion_tokens = getattr(usage, "completion_tokens", 0)
+584|
+585|            # Get cache tokens from prompt_tokens_details.cached_tokens
+586|            cache_tokens = 0
+587|            if hasattr(usage, "prompt_tokens_details"):
+588|                prompt_tokens_details = usage.prompt_tokens_details
+589|                if prompt_tokens_details is not None:
+590|                    cache_tokens = (
+591|                        getattr(prompt_tokens_details, "cached_tokens", 0) or 0
+592|                    )
+593|
+594|            cost = self._extract_cost(response)
+595|
+596|            return UsageInfo(
+597|                prompt_tokens=prompt_tokens,
+598|                completion_tokens=completion_tokens,
+599|                cache_tokens=cache_tokens,
+600|                cost_usd=cost,
+601|            )
+602|        except (AttributeError, TypeError):
+603|            return None
+604|
+605|    def _extract_responses_usage_info(self, response) -> UsageInfo | None:
+606|        """Extract token usage and cost from a responses API response.
+607|
+608|        Args:
+609|            response: The responses API response object
+610|
+611|        Returns:
+612|            UsageInfo with token counts and cost, or None if not available.
+613|        """
+614|        if not hasattr(response, "usage") or response.usage is None:
+615|            return None
+616|
+617|        usage = response.usage
+618|        prompt_tokens = getattr(usage, "input_tokens", 0) or 0
+619|        completion_tokens = getattr(usage, "output_tokens", 0) or 0
+620|        cost = self._extract_cost(response)
+621|
+622|        return UsageInfo(
+623|            prompt_tokens=prompt_tokens,
+624|            completion_tokens=completion_tokens,
+625|            cache_tokens=0,
+626|            cost_usd=cost,
+627|        )
+628|
+629|    def _handle_litellm_error(self, e: Exception) -> NoReturn:
+630|        """Translate litellm exceptions into harbor exceptions.
+631|
+632|        Always re-raises; never returns normally.
+633|        """
+634|        if isinstance(e, LiteLLMContextWindowExceededError):
+635|            raise ContextLengthExceededError
+636|        if isinstance(e, LiteLLMAuthenticationError):
+637|            raise e
+638|        if isinstance(e, LiteLLMBadRequestError):
+639|            if self._is_context_length_error(e):
+640|                raise ContextLengthExceededError from e
+641|        raise e
+642|
+643|    def _build_base_kwargs(self, logging_path: Path | None = None) -> dict[str, Any]:
+644|        """Build the base kwargs shared by both completion and responses API calls."""
+645|        logger_fn = (
+646|            self._init_logger_fn(logging_path) if logging_path is not None else None
+647|        )
+648|        return {
+649|            **self._llm_kwargs,
+650|            "model": self._model_name,
+651|            "drop_params": True,
+652|            "logger_fn": logger_fn,
+653|            "api_base": self._api_base,
+654|        }
+655|
+656|    def _is_context_length_error(self, error: LiteLLMBadRequestError) -> bool:
+657|        """Check provider error payloads for context-length overflow signals."""
+658|
+659|        parts = [
+660|            str(error),
+661|            str(getattr(error, "body", "")),
+662|            str(getattr(error, "message", "")),
+663|            str(getattr(error, "error", "")),
+664|        ]
+665|
+666|        combined = " ".join(part.lower() for part in parts if part)
+667|        phrases = (
+668|            "context length exceeded",
+669|            "context_length_exceeded",
+670|            "maximum context length",
+671|            "`inputs` tokens + `max_new_tokens`",
+672|            "model's context length",  # vllm 0.16.0 error message
+673|            "prompt is too long",  # Anthropic via OpenAI-compatible proxies
+674|            "input is too long for requested model",  # Bedrock via proxy
+675|        )
+676|        return any(phrase in combined for phrase in phrases)
+677|
+678|    async def _call_responses(
+679|        self,
+680|        prompt: str,
+681|        message_history: list[dict[str, Any] | Message] = [],
+682|        response_format: dict[str, Any] | type[BaseModel] | None = None,
+683|        logging_path: Path | None = None,
+684|        **kwargs,
+685|    ) -> LLMResponse:
+686|        """Call the OpenAI Responses API via litellm.aresponses().
+687|
+688|        When previous_response_id is provided (via kwargs), uses server-side
+689|        state chaining — only the new user prompt is sent. Otherwise, builds
+690|        the full input from message_history + prompt.
+691|        """
+692|        previous_response_id = kwargs.pop("previous_response_id", None)
+693|
+694|        try:
+695|            # Build responses_kwargs
+696|            responses_kwargs: dict[str, Any] = self._build_base_kwargs(logging_path)
+697|
+698|            if self._reasoning_effort is not None:
+699|                responses_kwargs["reasoning"] = {
+700|                    "effort": self._reasoning_effort,
+701|                }
+702|
+703|            # Get max_output_tokens from model info
+704|            max_output_tokens = self.get_model_output_limit()
+705|            if max_output_tokens is not None:
+706|                responses_kwargs["max_output_tokens"] = max_output_tokens
+707|
+708|            if response_format is not None:
+709|                responses_kwargs["response_format"] = response_format
+710|
+711|            if self._temperature is not None:
+712|                responses_kwargs["temperature"] = self._temperature
+713|            responses_kwargs.update(kwargs)
+714|
+715|            if previous_response_id is not None:
+716|                # Server-side state chaining: only send the new prompt
+717|                responses_kwargs["previous_response_id"] = previous_response_id
+718|                responses_kwargs["input"] = prompt
+719|            else:
+720|                # Build full input from message history + new prompt
+721|                input_items = []
+722|                for msg in message_history:
+723|                    role = (
+724|                        msg.get("role", "user")
+725|                        if isinstance(msg, dict)
+726|                        else getattr(msg, "role", "user")
+727|                    )
+728|                    content = (
+729|                        msg.get("content", "")
+730|                        if isinstance(msg, dict)
+731|                        else getattr(msg, "content", "")
+732|                    )
+733|                    input_items.append({"role": role, "content": content})
+734|                input_items.append({"role": "user", "content": prompt})
+735|                responses_kwargs["input"] = input_items
+736|
+737|            response = await litellm.aresponses(**responses_kwargs)
+738|
+739|        except Exception as e:
+740|            self._handle_litellm_error(e)
+741|
+742|        # Extract text content from response.output
+743|        content = ""
+744|        reasoning_content = None
+745|        for output_item in response.output:
+746|            if getattr(output_item, "type", None) == "message":
+747|                for content_part in getattr(output_item, "content", []):
+748|                    if getattr(content_part, "type", None) == "output_text":
+749|                        content += getattr(content_part, "text", "")
+750|
+751|        # Extract usage information
+752|        usage_info = self._extract_responses_usage_info(response)
+753|
+754|        # Check for truncation via response status
+755|        response_status = getattr(response, "status", None)
+756|        if response_status == "incomplete":
+757|            incomplete_details = getattr(response, "incomplete_details", None)
+758|            reason = (
+759|                getattr(incomplete_details, "reason", "unknown")
+760|                if incomplete_details
+761|                else "unknown"
+762|            )
+763|            if reason == "max_output_tokens":
+764|                raise OutputLengthExceededError(
+765|                    f"Model {self._model_name} hit max_tokens limit. "
+766|                    f"Response was truncated.",
+767|                    truncated_response=content,
+768|                )
+769|
+770|        response_id = getattr(response, "id", None)
+771|
+772|        return LLMResponse(
+773|            content=content,
+774|            reasoning_content=reasoning_content,
+775|            model_name=getattr(response, "model", None),
+776|            usage=usage_info,
+777|            response_id=response_id,
+778|        )

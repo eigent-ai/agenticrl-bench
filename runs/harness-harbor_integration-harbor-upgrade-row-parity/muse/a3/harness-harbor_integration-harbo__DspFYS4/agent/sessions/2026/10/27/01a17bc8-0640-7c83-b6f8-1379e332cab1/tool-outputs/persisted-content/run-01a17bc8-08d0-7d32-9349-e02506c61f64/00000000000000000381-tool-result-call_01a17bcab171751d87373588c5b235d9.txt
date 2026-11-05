@@ -1,0 +1,139 @@
+Read text file `/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/models/trial/result.py`.
+1|import traceback
+2|from datetime import datetime, timezone
+3|from uuid import UUID, uuid4
+4|
+5|from pydantic import BaseModel, Field
+6|
+7|from harbor.models.agent.context import AgentContext
+8|from harbor.models.task.config import VerifierEnvironmentMode
+9|from harbor.models.task.id import GitTaskId, LocalTaskId, PackageTaskId
+10|from harbor.models.trial.config import TrialConfig
+11|from harbor.models.verifier.result import VerifierResult
+12|
+13|
+14|class TimingInfo(BaseModel):
+15|    """Timing information for a phase of trial execution."""
+16|
+17|    started_at: datetime | None = None
+18|    finished_at: datetime | None = None
+19|
+20|
+21|class ExceptionInfo(BaseModel):
+22|    """Information about an exception that occurred during trial execution."""
+23|
+24|    exception_type: str
+25|    exception_message: str
+26|    exception_traceback: str
+27|    occurred_at: datetime
+28|
+29|    @classmethod
+30|    def from_exception(cls, e: BaseException) -> "ExceptionInfo":
+31|        return cls(
+32|            exception_type=type(e).__name__,
+33|            exception_message=str(e),
+34|            exception_traceback=traceback.format_exc(),
+35|            occurred_at=datetime.now(timezone.utc),
+36|        )
+37|
+38|
+39|class ModelInfo(BaseModel):
+40|    """Information about a model that participated in a trial.
+41|
+42|    ``provider`` is optional: when the user runs e.g. ``-m gpt-5.4`` with no
+43|    ``<provider>/`` prefix, the CLI records the model name without a
+44|    provider. Downstream writes to the ``model`` table omit the column so
+45|    the DB default (``'unknown'``) takes over, keeping both sides honest
+46|    about "not specified" vs "explicitly unknown".
+47|    """
+48|
+49|    name: str
+50|    provider: str | None = None
+51|
+52|
+53|class AgentInfo(BaseModel):
+54|    """Information about an agent that participated in a trial."""
+55|
+56|    name: str
+57|    version: str
+58|    model_info: ModelInfo | None = None
+59|
+60|
+61|class StepResult(BaseModel):
+62|    step_name: str
+63|    agent_result: AgentContext | None = None
+64|    verifier_result: VerifierResult | None = None
+65|    exception_info: ExceptionInfo | None = None
+66|    agent_execution: TimingInfo | None = None
+67|    verifier: TimingInfo | None = None
+68|
+69|
+70|class TrialResult(BaseModel):
+71|    id: UUID = Field(default_factory=uuid4)
+72|    task_name: str
+73|    trial_name: str
+74|    trial_uri: str
+75|    task_id: LocalTaskId | GitTaskId | PackageTaskId
+76|    source: str | None = None
+77|    task_checksum: str
+78|    config: TrialConfig
+79|    agent_info: AgentInfo
+80|    agent_result: AgentContext | None = None
+81|    verifier_result: VerifierResult | None = None
+82|    verifier_environment_mode: VerifierEnvironmentMode | None = Field(
+83|        default=None,
+84|        description=(
+85|            "Resolved verifier environment mode ('shared' or 'separate') the "
+86|            "trial-level verify ran in. None for multi-step trials: the mode "
+87|            "is resolved per step there and is not recorded yet."
+88|        ),
+89|    )
+90|    exception_info: ExceptionInfo | None = None
+91|    started_at: datetime | None = None
+92|    finished_at: datetime | None = None
+93|    environment_setup: TimingInfo | None = None
+94|    agent_setup: TimingInfo | None = None
+95|    agent_execution: TimingInfo | None = None
+96|    verifier: TimingInfo | None = None
+97|    step_results: list[StepResult] | None = None
+98|
+99|    def compute_token_cost_totals(
+100|        self,
+101|    ) -> tuple[int | None, int | None, int | None, float | None]:
+102|        """Sum (n_input_tokens, n_cache_tokens, n_output_tokens, cost_usd).
+103|
+104|        Single-step trials record an ``AgentContext`` on ``agent_result``;
+105|        multi-step trials never set that and instead record one per step on
+106|        ``step_results[i].agent_result``. Aggregate whichever is populated.
+107|        Returned fields preserve the same semantics as ``AgentContext`` —
+108|        in particular ``n_input_tokens`` is total input *including* cache.
+109|        """
+110|        if self.agent_result is not None:
+111|            contexts = [self.agent_result]
+112|        elif self.step_results:
+113|            contexts = [
+114|                sr.agent_result
+115|                for sr in self.step_results
+116|                if sr.agent_result is not None
+117|            ]
+118|        else:
+119|            contexts = []
+120|
+121|        if not contexts:
+122|            return None, None, None, None
+123|
+124|        n_input: int | None = None
+125|        n_cache: int | None = None
+126|        n_output: int | None = None
+127|        cost: float | None = None
+128|        for ctx in contexts:
+129|            if ctx.n_input_tokens is not None:
+130|                n_input = (n_input or 0) + ctx.n_input_tokens
+131|            if ctx.n_cache_tokens is not None:
+132|                n_cache = (n_cache or 0) + ctx.n_cache_tokens
+133|            if ctx.n_output_tokens is not None:
+134|                n_output = (n_output or 0) + ctx.n_output_tokens
+135|            if ctx.cost_usd is not None:
+136|                cost = (cost or 0.0) + ctx.cost_usd
+137|
+138|        return n_input, n_cache, n_output, cost

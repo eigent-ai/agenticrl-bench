@@ -1,0 +1,1 @@
+SELECT id, name, key FROM user ORDER BY id

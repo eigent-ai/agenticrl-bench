@@ -1,0 +1,79 @@
+Read text file `/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/llms/base.py`.
+1|from abc import ABC, abstractmethod
+2|from dataclasses import dataclass
+3|from enum import Enum
+4|from typing import Any
+5|
+6|from harbor.models.metric import UsageInfo
+7|
+8|
+9|class LLMBackend(str, Enum):
+10|    """Enum for available LLM backends."""
+11|
+12|    LITELLM = "litellm"
+13|    TINKER = "tinker"
+14|
+15|
+16|@dataclass
+17|class LLMResponse:
+18|    """Response from an LLM call containing the generated content and metadata.
+19|
+20|    Attributes:
+21|        content: The generated text response
+22|        reasoning_content: The LLM's explicit internal reasoning
+23|        usage: Token usage and cost information
+24|        prompt_token_ids: Full prompt token IDs including conversation history (if collect_rollout_details=True)
+25|        completion_token_ids: Token IDs for the generated completion (if collect_rollout_details=True)
+26|        logprobs: Log probabilities for each completion token (if collect_rollout_details=True)
+27|    """
+28|
+29|    content: str
+30|    reasoning_content: str | None = None
+31|    model_name: str | None = None
+32|    usage: UsageInfo | None = None
+33|    response_id: str | None = None
+34|    prompt_token_ids: list[int] | None = None
+35|    completion_token_ids: list[int] | None = None
+36|    logprobs: list[float] | None = None
+37|    extra: dict[str, Any] | None = None
+38|
+39|
+40|class ContextLengthExceededError(Exception):
+41|    """Raised when the LLM response indicates the context length was exceeded."""
+42|
+43|    pass
+44|
+45|
+46|class OutputLengthExceededError(Exception):
+47|    """Raised when the LLM response was truncated due to max_tokens limit."""
+48|
+49|    def __init__(self, message: str, truncated_response: str | None = None):
+50|        super().__init__(message)
+51|        self.truncated_response = truncated_response
+52|
+53|
+54|class BaseLLM(ABC):
+55|    def __init__(self, **kwargs):
+56|        super().__init__(**kwargs)
+57|
+58|    @abstractmethod
+59|    async def call(self, prompt: str, **kwargs) -> LLMResponse:
+60|        pass
+61|
+62|    @abstractmethod
+63|    def get_model_context_limit(self) -> int:
+64|        """Get the context limit (max input tokens) for the current model.
+65|
+66|        Returns:
+67|            int: The maximum input tokens the model can accept, or a fallback value if unavailable.
+68|        """
+69|        pass
+70|
+71|    @abstractmethod
+72|    def get_model_output_limit(self) -> int | None:
+73|        """Get the output limit (max output tokens) for the current model.
+74|
+75|        Returns:
+76|            int | None: The maximum output tokens the model can generate, or None if unavailable.
+77|        """
+78|        pass

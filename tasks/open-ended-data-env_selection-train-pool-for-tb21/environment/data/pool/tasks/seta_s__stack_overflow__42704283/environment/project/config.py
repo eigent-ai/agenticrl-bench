@@ -1,0 +1,8 @@
+# Regularization hyperparameters
+LAMBDA1 = 0.0
+WEIGHT_DECAY = 1e-3
+LR = 0.01
+INPUT_DIM = 10
+HIDDEN_DIM = 20
+OUTPUT_DIM = 2
+BATCH_SIZE = 32

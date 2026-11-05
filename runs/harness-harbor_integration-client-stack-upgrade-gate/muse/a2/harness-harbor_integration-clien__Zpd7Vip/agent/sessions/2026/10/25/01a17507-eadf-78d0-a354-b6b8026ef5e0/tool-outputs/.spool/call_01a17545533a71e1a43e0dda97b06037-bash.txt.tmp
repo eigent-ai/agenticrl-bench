@@ -1,0 +1,51 @@
+        messages = add_anthropic_caching(messages, self._model_name)
+
+        try:
+            # Build completion_kwargs with all parameters
+            completion_kwargs = {
+                **self._build_base_kwargs(logging_path),
+                "messages": messages,
+                "response_format": response_format,
+                "reasoning_effort": self._reasoning_effort,
+            }
+            if self._temperature is not None:
+                completion_kwargs["temperature"] = self._temperature
+
+            # Add logprobs and return_token_ids if rollout details collection is enabled
+            if self._collect_rollout_details:
+                completion_kwargs["logprobs"] = True
+                # Request token IDs from provider (supported by vLLM)
+                # Note: Some providers (e.g., OpenAI) will reject this parameter, but we'll catch and retry without it
+                if "extra_body" not in completion_kwargs:
+                    completion_kwargs["extra_body"] = {}
+                extra_body: dict[str, Any] = completion_kwargs["extra_body"]  # ty: ignore[invalid-assignment]
+                extra_body["return_token_ids"] = True
+
+            # Add any additional kwargs, deep-merging extra_body to preserve
+            # internally-set fields (e.g., return_token_ids) when caller also
+            # passes extra_body via llm_call_kwargs.
+            if "extra_body" in completion_kwargs and "extra_body" in kwargs:
+                existing_extra_body: dict[str, Any] = completion_kwargs["extra_body"]  # ty: ignore[invalid-assignment]
+                new_extra_body: dict[str, Any] = kwargs.pop("extra_body")
+                completion_kwargs["extra_body"] = {
+                    **existing_extra_body,
+                    **new_extra_body,
+                }
+            elif "extra_body" in kwargs:
+                kwargs["extra_body"] = {**kwargs["extra_body"]}
+            completion_kwargs.update(kwargs)
+
+            # Add thinking parameter for Anthropic models if max_thinking_tokens is set
+            if self._max_thinking_tokens is not None and (
+                "anthropic" in self._model_name.lower()
+                or "claude" in self._model_name.lower()
+            ):
+                budget = self._max_thinking_tokens
+                if budget < 1024:
+                    self._logger.warning(
+                        f"max_thinking_tokens={budget} is below minimum of 1024. "
+                        "Using minimum value of 1024."
+                    )
+                    budget = 1024
+                completion_kwargs["thinking"] = {
+                    "type": "enabled",

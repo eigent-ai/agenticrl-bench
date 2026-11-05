@@ -1,0 +1,31 @@
+diff -ruN '--exclude=__pycache__' base/verl/trainer/ppo/v1/utils.py M11/verl/trainer/ppo/v1/utils.py
+--- base/verl/trainer/ppo/v1/utils.py	2026-10-12 11:39:31.000000000 +0000
++++ M11/verl/trainer/ppo/v1/utils.py	2026-10-12 12:10:25.589065807 +0000
+@@ -195,6 +195,27 @@
+         session_key_to_local_index[session_key] = len(final_indices) - 1
+     row_to_local_index = [session_key_to_local_index[session_key] for session_key in row_session_keys]
+ 
++    # every output of a session carries the session's outcome
++    final_rewards = data.batch["token_level_rewards"][final_indices].sum(dim=-1)
++    row_rewards = final_rewards[row_to_local_index]
++    fanout = data.select_idxs(list(range(len(row_session_keys))))
++    fanout.batch["token_level_rewards"] = torch.zeros_like(fanout.batch["token_level_rewards"])
++    fanout.batch["token_level_rewards"][:, 0] = row_rewards
++    fanout = compute_advantage(
++        fanout,
++        adv_estimator=adv_estimator,
++        gamma=gamma,
++        lam=lam,
++        num_repeat=num_repeat,
++        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
++        config=config,
++    )
++    row_first_nnz = data.batch["response_mask"].argmax(dim=1)
++    row_scores = fanout.batch["advantages"][torch.arange(len(fanout)), row_first_nnz]
++    data.batch["advantages"] = row_scores.unsqueeze(-1) * data.batch["response_mask"]
++    data.batch["returns"] = data.batch["advantages"]
++    return data
++
+     # select final sessions from batch data for group relative advantage computation
+     final_data = compute_advantage(
+         data.select_idxs(final_indices),

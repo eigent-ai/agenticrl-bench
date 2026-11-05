@@ -1,0 +1,189 @@
+Read text file `/root/miles/miles/rollout/generate_utils/prefill_logprobs.py`.
+1|from __future__ import annotations
+2|
+3|from collections import defaultdict
+4|from collections.abc import Mapping
+5|from typing import Any
+6|
+7|from miles.rollout.generate_utils.generate_endpoint_utils import compute_routing_headers, policy_uses_routing_key
+8|from miles.utils.http_utils import post
+9|from miles.utils.lora import LORA_ADAPTER_NAME, lora_rollout_enabled
+10|from miles.utils.multi_lora import slot_lora_name
+11|from miles.utils.processing_utils import encode_image_for_rollout_engine
+12|from miles.utils.types import Sample
+13|
+14|
+15|def _lora_path_for_sample(args: Any, sample: Sample) -> str | None:
+16|    """Adapter name to score under: the sample slot's __miles_slot_{N} name, the fixed single-LoRA name, or None."""
+17|    if sample.adapter is not None:
+18|        return slot_lora_name(sample.adapter.slot)
+19|    if lora_rollout_enabled(args):
+20|        return LORA_ADAPTER_NAME
+21|    return None
+22|
+23|
+24|def _build_prefill_scoring_payload(
+25|    args: Any,
+26|    sample: Sample,
+27|    sampling_params: Mapping[str, Any],
+28|) -> dict[str, Any]:
+29|    prompt_len = len(sample.tokens) - sample.response_length
+30|    if prompt_len <= 0:
+31|        raise ValueError(
+32|            "Cannot recompute rollout logprobs via prefill without at least one prompt token: "
+33|            f"tokens={len(sample.tokens)}, response_length={sample.response_length}"
+34|        )
+35|
+36|    payload = {
+37|        "input_ids": sample.tokens,
+38|        "sampling_params": {
+39|            **dict(sampling_params),
+40|            "max_new_tokens": 0,
+41|            "temperature": 0,
+42|            "skip_special_tokens": False,
+43|        },
+44|        "return_logprob": True,
+45|        # SGLang returns input_token_logprobs aligned to tokens from logprob_start_len,
+46|        # with the first value None. Start one token before the response so the
+47|        # returned tail contains every response-token logprob.
+48|        "logprob_start_len": prompt_len - 1,
+49|    }
+50|
+51|    if (lora_path := _lora_path_for_sample(args, sample)) is not None:
+52|        payload["lora_path"] = lora_path
+53|
+54|    if sample.multimodal_inputs and sample.multimodal_inputs.get("images"):
+55|        image_data = sample.multimodal_inputs["images"]
+56|        payload["image_data"] = [encode_image_for_rollout_engine(image) for image in image_data]
+57|
+58|    return payload
+59|
+60|
+61|def _can_batch_prefill_score(args: Any, samples: list[Sample]) -> bool:
+62|    if policy_uses_routing_key(args):
+63|        return False
+64|    return not any(sample.multimodal_inputs and sample.multimodal_inputs.get("images") for sample in samples)
+65|
+66|
+67|def _build_batch_prefill_scoring_payload(
+68|    args: Any,
+69|    samples: list[Sample],
+70|    sampling_params: Mapping[str, Any],
+71|) -> dict[str, Any]:
+72|    payloads = [_build_prefill_scoring_payload(args, sample, sampling_params) for sample in samples]
+73|    logprob_start_len = payloads[0]["logprob_start_len"]
+74|    if any(payload["logprob_start_len"] != logprob_start_len for payload in payloads):
+75|        raise ValueError("Batched SGLang prefill scoring requires a shared logprob_start_len")
+76|
+77|    lora_paths = {payload.get("lora_path") for payload in payloads}
+78|    if len(lora_paths) > 1:
+79|        # A batch payload carries a single lora_path; callers must group samples by adapter first.
+80|        raise ValueError("Batched SGLang prefill scoring requires a shared lora_path")
+81|
+82|    batch_payload: dict[str, Any] = {
+83|        "input_ids": [payload["input_ids"] for payload in payloads],
+84|        "sampling_params": payloads[0]["sampling_params"],
+85|        "return_logprob": True,
+86|        "logprob_start_len": logprob_start_len,
+87|    }
+88|    if (lora_path := next(iter(lora_paths))) is not None:
+89|        batch_payload["lora_path"] = lora_path
+90|    return batch_payload
+91|
+92|
+93|def _extract_response_logprobs(sample: Sample, meta_info: Mapping[str, Any]) -> list[float]:
+94|    input_token_logprobs = meta_info.get("input_token_logprobs")
+95|    if not input_token_logprobs:
+96|        raise ValueError("SGLang prefill scoring response did not include input_token_logprobs")
+97|
+98|    response_items = input_token_logprobs[-sample.response_length :]
+99|    response_tokens = sample.tokens[-sample.response_length :]
+100|    scored_tokens = [item[1] for item in response_items]
+101|    if scored_tokens != response_tokens:
+102|        raise ValueError(
+103|            "SGLang prefill scoring token alignment mismatch: "
+104|            f"expected response tail {response_tokens[:8]}... len={len(response_tokens)}, "
+105|            f"got {scored_tokens[:8]}... len={len(scored_tokens)}"
+106|        )
+107|
+108|    response_logprobs = [item[0] for item in response_items]
+109|    if any(logprob is None for logprob in response_logprobs):
+110|        raise ValueError("SGLang prefill scoring returned None for a response-token logprob")
+111|
+112|    return response_logprobs
+113|
+114|
+115|async def recompute_rollout_logprobs_via_prefill(
+116|    args: Any,
+117|    sample: Sample,
+118|    *,
+119|    url: str,
+120|    sampling_params: Mapping[str, Any],
+121|    headers: Mapping[str, str] | None = None,
+122|) -> None:
+123|    if not getattr(args, "recompute_logprobs_via_prefill", False):
+124|        return
+125|    if sample.response_length == 0:
+126|        sample.rollout_log_probs = []
+127|        return
+128|    if sample.status == Sample.Status.ABORTED:
+129|        return
+130|
+131|    payload = _build_prefill_scoring_payload(args, sample, sampling_params)
+132|    output = await post(url, payload, headers=headers)
+133|    sample.rollout_log_probs = _extract_response_logprobs(sample, output["meta_info"])
+134|    sample.metadata["rollout_log_probs_source"] = "sglang_prefill_recompute"
+135|
+136|
+137|async def recompute_samples_rollout_logprobs_via_prefill(
+138|    args: Any,
+139|    samples: list[Sample],
+140|    *,
+141|    url: str,
+142|    sampling_params: Mapping[str, Any],
+143|) -> None:
+144|    if not getattr(args, "recompute_logprobs_via_prefill", False):
+145|        return
+146|
+147|    samples_to_score = [
+148|        sample for sample in samples if sample.response_length != 0 and sample.status != Sample.Status.ABORTED
+149|    ]
+150|    if not samples_to_score:
+151|        return
+152|
+153|    flush_url = url.rsplit("/", 1)[0] + "/flush_cache"
+154|
+155|    if _can_batch_prefill_score(args, samples_to_score):
+156|        # A batch must share one logprob_start_len and one lora_path, so group by both.
+157|        samples_by_batch_key: dict[tuple[int, str | None], list[Sample]] = defaultdict(list)
+158|        for sample in samples_to_score:
+159|            prompt_len = len(sample.tokens) - sample.response_length
+160|            samples_by_batch_key[(prompt_len - 1, _lora_path_for_sample(args, sample))].append(sample)
+161|
+162|        for batch_samples in samples_by_batch_key.values():
+163|            await post(flush_url, {})
+164|            payload = _build_batch_prefill_scoring_payload(args, batch_samples, sampling_params)
+165|            outputs = await post(url, payload)
+166|            if not isinstance(outputs, list):
+167|                raise ValueError(f"SGLang batch prefill scoring returned {type(outputs).__name__}, expected list")
+168|            if len(outputs) != len(batch_samples):
+169|                raise ValueError(
+170|                    "SGLang batch prefill scoring output count mismatch: "
+171|                    f"expected {len(batch_samples)}, got {len(outputs)}"
+172|                )
+173|            for sample, output in zip(batch_samples, outputs, strict=True):
+174|                sample.rollout_log_probs = _extract_response_logprobs(sample, output["meta_info"])
+175|                sample.metadata["rollout_log_probs_source"] = "sglang_prefill_recompute"
+176|        return
+177|
+178|    for sample in samples_to_score:
+179|        headers = compute_routing_headers(args, sample)
+180|
+181|        await post(flush_url, {}, headers=headers)
+182|        await recompute_rollout_logprobs_via_prefill(
+183|            args,
+184|            sample,
+185|            url=url,
+186|            sampling_params=sampling_params,
+187|            headers=headers,
+188|        )

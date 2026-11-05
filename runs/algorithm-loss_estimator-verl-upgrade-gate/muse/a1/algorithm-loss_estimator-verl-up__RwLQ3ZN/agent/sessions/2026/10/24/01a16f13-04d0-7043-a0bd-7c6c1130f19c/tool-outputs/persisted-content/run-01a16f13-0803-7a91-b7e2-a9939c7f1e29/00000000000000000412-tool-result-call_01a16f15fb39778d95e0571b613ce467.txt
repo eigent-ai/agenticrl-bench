@@ -1,0 +1,502 @@
+Read text file `/opt/verl/verl/utils/seqlen_balancing.py`.
+1|# Copyright 2024 Bytedance Ltd. and/or its affiliates
+2|#
+3|# Licensed under the Apache License, Version 2.0 (the "License");
+4|# you may not use this file except in compliance with the License.
+5|# You may obtain a copy of the License at
+6|#
+7|#     http://www.apache.org/licenses/LICENSE-2.0
+8|#
+9|# Unless required by applicable law or agreed to in writing, software
+10|# distributed under the License is distributed on an "AS IS" BASIS,
+11|# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+12|# See the License for the specific language governing permissions and
+13|# limitations under the License.
+14|
+15|import copy
+16|import heapq
+17|from itertools import chain
+18|
+19|import torch
+20|from torch import distributed as dist
+21|
+22|from verl.protocol import DataProto
+23|from verl.utils import tensordict_utils as tu
+24|from verl.utils.device import get_device_name
+25|
+26|
+27|def calculate_workload(seqlen_list: torch.Tensor) -> torch.Tensor:
+28|    """Calculate approximate computational workload for transformer attention.
+29|
+30|    Estimates FLOPs for dense transformer blocks based on sequence length using
+31|    the formula: FLOPs ≈ 12 * hidden_size² * seqlen + 2 * hidden_size * seqlen²
+32|
+33|    The constants are calibrated for a 7B model (hidden_size=4096), yielding:
+34|    workload ∝ 24576 * seqlen + seqlen²
+35|
+36|    Args:
+37|        seqlen_list: Sequence lengths as a tensor.
+38|
+39|    Returns:
+40|        torch.Tensor: Estimated workload values proportional to actual FLOPs.
+41|
+42|    Note:
+43|        The returned values are relative workloads, not actual FLOP counts.
+44|        Useful for balancing computation across data parallel ranks.
+45|    """
+46|    return 24576 * seqlen_list + seqlen_list**2
+47|
+48|
+49|def karmarkar_karp(seqlen_list: list[int], k_partitions: int, equal_size: bool) -> list[list[int]]:
+50|    """Partition items into k groups using the Karmarkar-Karp differencing method.
+51|
+52|    Implements the Largest Differencing Method (LDM) algorithm for balanced
+53|    multi-way number partitioning. This heuristic produces near-optimal partitions
+54|    by iteratively combining the sets with the largest difference.
+55|
+56|    Args:
+57|        seqlen_list: Values to partition (typically sequence lengths or workloads).
+58|        k_partitions: Number of partitions to create.
+59|        equal_size: If True, each partition will have exactly len(seqlen_list) / k_partitions
+60|            items. If False, partitions may have different sizes.
+61|
+62|    Returns:
+63|        list[list[int]]: List of k partitions, each containing indices into seqlen_list.
+64|
+65|    See Also:
+66|        https://en.wikipedia.org/wiki/Largest_differencing_method
+67|
+68|    Note:
+69|        When equal_size=True, len(seqlen_list) must be divisible by k_partitions.
+70|    """
+71|
+72|    # see: https://en.wikipedia.org/wiki/Largest_differencing_method
+73|    class Set:
+74|        def __init__(self) -> None:
+75|            self.sum = 0
+76|            self.items = []
+77|
+78|        def add(self, idx: int, val: int):
+79|            self.items.append((idx, val))
+80|            self.sum += val
+81|
+82|        def merge(self, other):
+83|            for idx, val in other.items:
+84|                self.items.append((idx, val))
+85|                self.sum += val
+86|
+87|        def __lt__(self, other):
+88|            if self.sum != other.sum:
+89|                return self.sum < other.sum
+90|            if len(self.items) != len(other.items):
+91|                return len(self.items) < len(other.items)
+92|            return self.items < other.items
+93|
+94|    class State:
+95|        def __init__(self, items: list[tuple[int, int]], k: int) -> None:
+96|            self.k = k
+97|            # sets should always be decreasing order
+98|            self.sets = [Set() for _ in range(k)]
+99|            assert len(items) in [1, k], f"{len(items)} not in [1, {k}]"
+100|            for i, (idx, seqlen) in enumerate(items):
+101|                self.sets[i].add(idx=idx, val=seqlen)
+102|            self.sets = sorted(self.sets, reverse=True)
+103|
+104|        def get_partitions(self):
+105|            partitions = []
+106|            for i in range(len(self.sets)):
+107|                cur_partition = []
+108|                for idx, _ in self.sets[i].items:
+109|                    cur_partition.append(idx)
+110|                partitions.append(cur_partition)
+111|            return partitions
+112|
+113|        def merge(self, other):
+114|            for i in range(self.k):
+115|                self.sets[i].merge(other.sets[self.k - 1 - i])
+116|            self.sets = sorted(self.sets, reverse=True)
+117|
+118|        @property
+119|        def spread(self) -> int:
+120|            return self.sets[0].sum - self.sets[-1].sum
+121|
+122|        def __lt__(self, other):
+123|            # least heap, let the state with largest spread to be popped first,
+124|            # if the spread is the same, let the state who has the largest set
+125|            # to be popped first.
+126|            if self.spread != other.spread:
+127|                return self.spread > other.spread
+128|            return self.sets[0] > other.sets[0]
+129|
+130|        def __repr__(self) -> str:
+131|            repr_str = "["
+132|            for i in range(self.k):
+133|                if i > 0:
+134|                    repr_str += ","
+135|                repr_str += "{"
+136|                for j, (_, seqlen) in enumerate(self.sets[i].items):
+137|                    if j > 0:
+138|                        repr_str += ","
+139|                    repr_str += str(seqlen)
+140|                repr_str += "}"
+141|            repr_str += "]"
+142|            return repr_str
+143|
+144|    sorted_seqlen_list = sorted([(seqlen, i) for i, seqlen in enumerate(seqlen_list)])
+145|    states_pq = []
+146|    if equal_size:
+147|        assert len(seqlen_list) % k_partitions == 0, f"{len(seqlen_list)} % {k_partitions} != 0"
+148|        for offset in range(0, len(sorted_seqlen_list), k_partitions):
+149|            items = []
+150|            for i in range(k_partitions):
+151|                seqlen, idx = sorted_seqlen_list[offset + i]
+152|                items.append((idx, seqlen))
+153|            heapq.heappush(states_pq, State(items=items, k=k_partitions))
+154|    else:
+155|        for seqlen, idx in sorted_seqlen_list:
+156|            heapq.heappush(states_pq, State(items=[(idx, seqlen)], k=k_partitions))
+157|
+158|    while len(states_pq) > 1:
+159|        state0 = heapq.heappop(states_pq)
+160|        state1 = heapq.heappop(states_pq)
+161|        # merge states
+162|        state0.merge(state1)
+163|        heapq.heappush(states_pq, state0)
+164|
+165|    final_state = states_pq[0]
+166|    partitions = final_state.get_partitions()
+167|    if equal_size:
+168|        for i, partition in enumerate(partitions):
+169|            assert len(partition) * k_partitions == len(seqlen_list), (
+170|                f"{len(partition)} * {k_partitions} != {len(seqlen_list)}"
+171|            )
+172|    return partitions
+173|
+174|
+175|def greedy_partition(seqlen_list: list[int], k_partitions: int, equal_size: bool) -> list[list[int]]:
+176|    """Partition items into k groups using a greedy assignment strategy.
+177|
+178|    Assigns each item to the partition with the smallest current sum, iterating
+179|    through items in order. Simpler but typically less optimal than Karmarkar-Karp.
+180|
+181|    Args:
+182|        seqlen_list: Values to partition (typically sequence lengths or workloads).
+183|        k_partitions: Number of partitions to create.
+184|        equal_size: If True, adds a bias to ensure equal partition sizes.
+185|            Requires len(seqlen_list) to be divisible by k_partitions.
+186|
+187|    Returns:
+188|        list[list[int]]: List of k partitions, each containing indices into seqlen_list.
+189|
+190|    Note:
+191|        When equal_size=True, a large bias is added to encourage equal distribution
+192|        of items before considering the actual values.
+193|    """
+194|    bias = sum(seqlen_list) + 1 if equal_size else 0
+195|    sorted_seqlen = [(seqlen + bias, i) for i, seqlen in enumerate(seqlen_list)]
+196|    partitions = [[] for _ in range(k_partitions)]
+197|    partition_sums = [0 for _ in range(k_partitions)]
+198|    for seqlen, i in sorted_seqlen:
+199|        min_idx = None
+200|        for j in range(k_partitions):
+201|            if min_idx is None or partition_sums[j] < partition_sums[min_idx]:
+202|                min_idx = j
+203|        partitions[min_idx].append(i)
+204|        partition_sums[min_idx] += seqlen
+205|    if equal_size:
+206|        for i, partition in enumerate(partitions):
+207|            assert len(partition) * k_partitions == len(seqlen_list), (
+208|                f"{len(partition)} * {k_partitions} != {len(seqlen_list)}"
+209|            )
+210|    return partitions
+211|
+212|
+213|def get_seqlen_balanced_partitions(seqlen_list: list[int], k_partitions: int, equal_size: bool):
+214|    """
+215|    Calculates partitions of indices from seqlen_list such that the sum of sequence lengths
+216|    in each partition is balanced. Uses the Karmarkar-Karp differencing method.
+217|
+218|    This is useful for balancing workload across devices or batches, especially when
+219|    dealing with variable sequence lengths.
+220|
+221|    Args:
+222|        seqlen_list (List[int]): A list of sequence lengths for each item.
+223|        k_partitions (int): The desired number of partitions.
+224|        equal_size (bool): If True, ensures that each partition has the same number of items.
+225|                           Requires len(seqlen_list) to be divisible by k_partitions.
+226|                           If False, partitions can have varying numbers of items, focusing
+227|                           only on balancing the sum of sequence lengths.
+228|
+229|    Returns:
+230|        List[List[int]]: A list containing k_partitions lists. Each inner list contains the
+231|                         original indices of the items assigned to that partition. The indices
+232|                         within each partition list are sorted.
+233|
+234|    Raises:
+235|        AssertionError: If len(seqlen_list) < k_partitions.
+236|        AssertionError: If equal_size is True and len(seqlen_list) is not divisible by k_partitions.
+237|        AssertionError: If any resulting partition is empty.
+238|    """
+239|    assert len(seqlen_list) >= k_partitions, f"number of items:[{len(seqlen_list)}] < k_partitions:[{k_partitions}]"
+240|
+241|    def _check_and_sort_partitions(partitions):
+242|        assert len(partitions) == k_partitions, f"{len(partitions)} != {k_partitions}"
+243|        seen_idx = set()
+244|        sorted_partitions = [None] * k_partitions
+245|        for i, partition in enumerate(partitions):
+246|            assert len(partition) > 0, f"the {i}-th partition is empty"
+247|            for idx in partition:
+248|                seen_idx.add(idx)
+249|            sorted_partitions[i] = sorted(partition)
+250|        assert seen_idx == set(range(len(seqlen_list)))
+251|        return sorted_partitions
+252|
+253|    partitions = karmarkar_karp(seqlen_list=seqlen_list, k_partitions=k_partitions, equal_size=equal_size)
+254|    return _check_and_sort_partitions(partitions)
+255|
+256|
+257|def log_seqlen_unbalance(seqlen_list: list[int], partitions: list[list[int]], prefix):
+258|    """
+259|    Calculate and log metrics related to sequence length imbalance before and after partitioning.
+260|
+261|    Args:
+262|        seqlen_list (List[int]): A list of sequence lengths for each item.
+263|        partitions (List[List[int]]): A list of partitions, where each inner list contains indices
+264|                                      from seqlen_list assigned to that partition.
+265|        prefix (str): A prefix to be added to each metric key in the returned dictionary.
+266|
+267|    Returns:
+268|        dict: A dictionary containing metrics related to sequence length imbalance.
+269|    """
+270|    # Get the number of partitions
+271|    k_partition = len(partitions)
+272|    # assert len(seqlen_list) % k_partition == 0
+273|    batch_size = len(seqlen_list) // k_partition
+274|    min_sum_seqlen = None
+275|    max_sum_seqlen = None
+276|    total_sum_seqlen = 0
+277|
+278|    # Iterate over each batch of sequence lengths
+279|    for offset in range(0, len(seqlen_list), batch_size):
+280|        cur_sum_seqlen = sum(seqlen_list[offset : offset + batch_size])
+281|        if min_sum_seqlen is None or cur_sum_seqlen < min_sum_seqlen:
+282|            min_sum_seqlen = cur_sum_seqlen
+283|        if max_sum_seqlen is None or cur_sum_seqlen > max_sum_seqlen:
+284|            max_sum_seqlen = cur_sum_seqlen
+285|        total_sum_seqlen += cur_sum_seqlen
+286|
+287|    balanced_sum_seqlen_list = []
+288|    for partition in partitions:
+289|        cur_sum_seqlen_balanced = sum([seqlen_list[i] for i in partition])
+290|        balanced_sum_seqlen_list.append(cur_sum_seqlen_balanced)
+291|    # print("balanced_sum_seqlen_list: ", balanced_sum_seqlen_list)
+292|    min_sum_seqlen_balanced = min(balanced_sum_seqlen_list)
+293|    max_sum_seqlen_balanced = max(balanced_sum_seqlen_list)
+294|
+295|    return {
+296|        f"{prefix}/min": min_sum_seqlen,
+297|        f"{prefix}/max": max_sum_seqlen,
+298|        f"{prefix}/minmax_diff": max_sum_seqlen - min_sum_seqlen,
+299|        f"{prefix}/balanced_min": min_sum_seqlen_balanced,
+300|        f"{prefix}/balanced_max": max_sum_seqlen_balanced,
+301|        f"{prefix}/mean": total_sum_seqlen / len(partitions),
+302|    }
+303|
+304|
+305|def ceildiv(a: int, b: int) -> int:
+306|    """Compute ceiling division of a by b.
+307|
+308|    Returns the smallest integer greater than or equal to a/b.
+309|    Uses the identity: ceil(a/b) = floor((a + b - 1) / b) = -(-a // b)
+310|
+311|    Args:
+312|        a: Dividend (numerator).
+313|        b: Divisor (denominator), must be non-zero.
+314|
+315|    Returns:
+316|        int: Ceiling of a divided by b.
+317|
+318|    Example:
+319|        >>> ceildiv(7, 3)  # ceil(7/3) = ceil(2.33) = 3
+320|        3
+321|        >>> ceildiv(6, 3)  # ceil(6/3) = ceil(2.0) = 2
+322|        2
+323|    """
+324|    return -(a // -b)
+325|
+326|
+327|def roundup_divisible(a: int, b: int) -> int:
+328|    """Round up a to the nearest multiple of b.
+329|
+330|    Returns the smallest multiple of b that is >= a.
+331|
+332|    Args:
+333|        a: Value to round up.
+334|        b: Divisor to round to (must be positive).
+335|
+336|    Returns:
+337|        int: Smallest multiple of b that is >= a.
+338|
+339|    Example:
+340|        >>> roundup_divisible(7, 4)  # nearest multiple of 4 >= 7 is 8
+341|        8
+342|        >>> roundup_divisible(8, 4)  # 8 is already a multiple of 4
+343|        8
+344|    """
+345|    return ((a + b - 1) // b) * b
+346|
+347|
+348|def rearrange_micro_batches(
+349|    batch,
+350|    max_token_len,
+351|    dp_group=None,
+352|    num_batches_divided_by=None,
+353|    same_micro_num_in_dp=True,
+354|    min_num_micro_batch=None,
+355|    use_dynamic_bsz_balance=True,
+356|    force_group_size=1,
+357|):
+358|    """
+359|    Split a batch into micro-batches by total token count, with optional DP sync and padding.
+360|
+361|    Args:
+362|        batch (TensorDict): must include "attention_mask" (B*S); other fields are sliced similarly.
+363|        max_token_len (int): max sum of attention_mask per micro-batch.
+364|        dp_group (optional): torch.distributed group for data-parallel sync.
+365|        num_batches_divided_by (optional): virtual pipeline parallel size, for megatron.
+366|        same_micro_num_in_dp (bool): if True and dp_group set, pad all ranks to the same count.
+367|        min_num_micro_batch (int, optional): force at least this many splits (pads empty ones).
+368|        use_dynamic_bsz_balance (bool, optional): balance the computational workload between micro-batches
+369|        force_group_size (int, optional): force consecutive samples to be in the same micro-batch (for RM training).
+370|
+371|    Returns:
+372|        List[TensorDict]: the micro-batches.
+373|        List[List[int]]: index lists mapping each micro-batch back to original positions.
+374|    """
+375|    # this is per local micro_bsz
+376|    input_ids = batch["input_ids"]
+377|    if input_ids.is_nested:
+378|        seq_len_effective: torch.Tensor = input_ids.offsets().diff()
+379|        max_seq_len = max(seq_len_effective)
+380|    else:
+381|        max_seq_len = batch["attention_mask"].shape[-1]
+382|        seq_len_effective: torch.Tensor = batch["attention_mask"].sum(dim=1)
+383|
+384|    assert max_token_len >= max_seq_len, (
+385|        f"max_token_len must be greater than the sequence length. Got {max_token_len=} and {max_seq_len=}"
+386|    )
+387|
+388|    # Validate force_group_size
+389|    batch_size = len(seq_len_effective)
+390|    assert batch_size % force_group_size == 0, (
+391|        f"Batch size {batch_size} must be divisible by force_group_size {force_group_size}"
+392|    )
+393|
+394|    total_seqlen = seq_len_effective.sum().item()
+395|    # NOTE: num_microbatches <= batch_size, so take the min of this two.
+396|    # When force_group_size > 1, we work with groups instead of individual samples
+397|    num_groups = batch_size // force_group_size
+398|    num_micro_batches = min(num_groups, ceildiv(total_seqlen, max_token_len))
+399|    if min_num_micro_batch is not None:
+400|        # used to support pp
+401|        num_micro_batches = max(min_num_micro_batch, num_micro_batches)
+402|    sync_micro_batch_count = dist.is_initialized() and same_micro_num_in_dp and dp_group is not None
+403|    if sync_micro_batch_count:
+404|        num_micro_batches = torch.tensor([num_micro_batches], device=get_device_name())
+405|        dist.all_reduce(num_micro_batches, op=dist.ReduceOp.MAX, group=dp_group)
+406|        num_micro_batches = num_micro_batches.cpu().item()
+407|    if num_batches_divided_by is not None:
+408|        num_micro_batches = roundup_divisible(num_micro_batches, num_batches_divided_by)
+409|
+410|    # upcast to int64 to avoid potential overflow im `calculate_workload` computation.
+411|    seq_len_effective = seq_len_effective.long()
+412|
+413|    # When force_group_size > 1, aggregate workloads by groups
+414|    if force_group_size > 1:
+415|        # Calculate workload for each group (sum of workloads of samples in the group)
+416|        workloads_per_sample = calculate_workload(seq_len_effective)
+417|        workloads_per_sample_grouped = workloads_per_sample.view(num_groups, force_group_size)
+418|        group_workloads = workloads_per_sample_grouped.sum(dim=1).cpu().tolist()
+419|        group_token_lens = seq_len_effective.view(num_groups, force_group_size).sum(dim=1).cpu().tolist()
+420|        workloads = group_workloads
+421|    else:
+422|        # note that seq_len_effective is a GPU tensor. We need to make it a list to avoid D2H!
+423|        workloads = calculate_workload(seq_len_effective).cpu().tolist()
+424|        group_token_lens = seq_len_effective.cpu().tolist()
+425|
+426|    max_group_token_len = max(group_token_lens)
+427|    min_num_groups = num_groups
+428|    if sync_micro_batch_count:
+429|        # Fatal constraints must be agreed on before any rank raises; otherwise peers can hang in the next collective.
+430|        constraints = torch.tensor([max_group_token_len, -num_groups], dtype=torch.long, device=get_device_name())
+431|        dist.all_reduce(constraints, op=dist.ReduceOp.MAX, group=dp_group)
+432|        max_group_token_len = int(constraints[0].item())
+433|        min_num_groups = -int(constraints[1].item())
+434|
+435|    if max_group_token_len > max_token_len:
+436|        raise ValueError(
+437|            "A forced group exceeds max_token_len and cannot be split. "
+438|            f"Got max_group_token_len={max_group_token_len} and max_token_len={max_token_len}."
+439|        )
+440|
+441|    # ceildiv(total_seqlen, max_token_len) is only a lower bound because samples are indivisible.
+442|    # Increase the number of micro-batches until the balanced partition also respects the hard limit.
+443|    step = num_batches_divided_by or 1
+444|    while True:
+445|        if num_micro_batches > min_num_groups:
+446|            raise ValueError(
+447|                "Cannot satisfy max_token_len while keeping forced groups atomic and using the same "
+448|                "micro-batch count across DP ranks. "
+449|                f"Requested {num_micro_batches} non-empty micro-batches, but a rank has only "
+450|                f"{min_num_groups} forced groups."
+451|            )
+452|        micro_bsz_group_idx = get_seqlen_balanced_partitions(workloads, num_micro_batches, equal_size=False)
+453|        within_limit = all(
+454|            sum(group_token_lens[idx] for idx in partition) <= max_token_len for partition in micro_bsz_group_idx
+455|        )
+456|        if sync_micro_batch_count:
+457|            within_limit_tensor = torch.tensor([int(within_limit)], device=get_device_name())
+458|            dist.all_reduce(within_limit_tensor, op=dist.ReduceOp.MIN, group=dp_group)
+459|            within_limit = bool(within_limit_tensor.item())
+460|        if within_limit:
+461|            break
+462|        num_micro_batches += step
+463|
+464|    if force_group_size > 1:
+465|        # Convert group indices back to sample indices.
+466|        micro_bsz_idx = []
+467|        for group_partition in micro_bsz_group_idx:
+468|            sample_partition = []
+469|            for group_idx in group_partition:
+470|                start_idx = group_idx * force_group_size
+471|                sample_partition.extend(range(start_idx, start_idx + force_group_size))
+472|            micro_bsz_idx.append(sample_partition)
+473|    else:
+474|        micro_bsz_idx = micro_bsz_group_idx
+475|
+476|    if use_dynamic_bsz_balance:
+477|        # Use the sum of squared sequence lengths to approximate attention computation workload
+478|        if force_group_size > 1:
+479|            # For grouped samples, use group workloads for sorting
+480|            micro_bsz_idx.sort(
+481|                key=lambda partition: (
+482|                    sum(workloads[idx // force_group_size] for idx in partition[::force_group_size]),
+483|                    partition[0] if partition else 0,
+484|                ),
+485|                reverse=True,
+486|            )
+487|        else:
+488|            micro_bsz_idx.sort(
+489|                key=lambda partition: (
+490|                    sum(workloads[idx] for idx in partition),
+491|                    partition[0] if partition else 0,
+492|                ),
+493|                reverse=True,
+494|            )
+495|        # Place smaller micro-batches at both ends to reduce the bubbles exposed during the warm-up and cool-down.
+496|        micro_bsz_idx = micro_bsz_idx[::2][::-1] + micro_bsz_idx[1::2]
+497|
+498|    micro_batches = []
+499|
+500|    for partition in micro_bsz_idx:
+(more lines below)

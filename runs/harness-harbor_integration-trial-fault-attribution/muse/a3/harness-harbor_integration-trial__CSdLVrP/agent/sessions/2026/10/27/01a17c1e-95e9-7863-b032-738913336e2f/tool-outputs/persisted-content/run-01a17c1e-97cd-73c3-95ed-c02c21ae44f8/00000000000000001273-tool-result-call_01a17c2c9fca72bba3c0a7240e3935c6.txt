@@ -1,0 +1,223 @@
+Read text file `/app/reference/harbor-0.23.0/harbor/agents/terminus_2/terminus_2.py`.
+(59 line(s) above)
+60|class Command:
+61|    keystrokes: str
+62|    duration_sec: float
+63|
+64|
+65|def _terminal_observation_source_call_id(
+66|    commands: list[Command], episode: int
+67|) -> str | None:
+68|    if len(commands) != 1:
+69|        return None
+70|    return f"call_{episode}_1"
+71|
+72|
+73|@dataclass
+74|class SubagentMetrics:
+75|    """Metrics for subagent operations (summarization, etc.)."""
+76|
+77|    total_prompt_tokens: int = 0
+78|    total_completion_tokens: int = 0
+79|    total_cached_tokens: int = 0
+80|    total_cost_usd: float = 0.0
+81|
+82|
+83|class Terminus2Options(AgentOptions):
+84|    max_turns: int | None = Field(
+85|        default=None,
+86|        validation_alias=AliasChoices("max_turns", "episodes", "max_episodes"),
+87|        description="Maximum agent turns. Omit for no practical limit.",
+88|    )
+89|    parser_name: str = Field(
+90|        default="json",
+91|        description="Response parser (json or xml).",
+92|    )
+93|    api_base: str | None = Field(
+94|        default=None,
+95|        description="LLM API base URL.",
+96|    )
+97|    temperature: float | None = Field(
+98|        default=None,
+99|        description="Sampling temperature. Omit to use the backend default.",
+100|    )
+101|    reasoning_effort: (
+102|        Literal["none", "minimal", "low", "medium", "high", "xhigh", "max", "default"]
+103|        | None
+104|    ) = Field(
+105|        default=None,
+106|        description="Reasoning effort level.",
+107|    )
+108|    collect_rollout_details: bool = Field(
+109|        default=False,
+110|        description="Collect token IDs and logprobs.",
+111|    )
+112|    session_id: str | None = Field(
+113|        default=None,
+114|        description="Agent session ID.",
+115|    )
+116|    enable_summarize: bool = Field(
+117|        default=True,
+118|        description="Enable context summarization.",
+119|    )
+120|    proactive_summarization_threshold: int = Field(
+121|        default=8000,
+122|        description="Free-token threshold for proactive summarization. 0 disables it.",
+123|    )
+124|    max_thinking_tokens: int | None = Field(
+125|        default=None,
+126|        description="Max thinking tokens (min 1024).",
+127|    )
+128|    model_info: dict[str, Any] | None = Field(
+129|        default=None,
+130|        description="LiteLLM model info for custom models.",
+131|    )
+132|    trajectory_config: TrajectoryConfig | None = Field(
+133|        default=None,
+134|        description="Trajectory options (raw_content, linear_history).",
+135|    )
+136|    tmux_pane_width: int = Field(
+137|        default=160,
+138|        description="Starting tmux pane width.",
+139|    )
+140|    tmux_pane_height: int = Field(
+141|        default=40,
+142|        description="Starting tmux pane height.",
+143|    )
+144|    store_all_messages: bool = Field(
+145|        default=False,
+146|        description="Store full chat messages in trial metadata.",
+147|    )
+148|    record_terminal_session: bool = Field(
+149|        default=True,
+150|        description="Capture asciinema terminal recordings.",
+151|    )
+152|    interleaved_thinking: bool = Field(
+153|        default=False,
+154|        description="Include reasoning in subsequent chat turns.",
+155|    )
+156|    suppress_max_turns_warning: bool = Field(
+157|        default=False,
+158|        description="Suppress the max_turns limit warning.",
+159|    )
+160|    use_responses_api: bool = Field(
+161|        default=False,
+162|        description="Use the OpenAI Responses API.",
+163|    )
+164|    llm_backend: LLMBackend | str = Field(
+165|        default=LLMBackend.LITELLM,
+166|        description="LLM backend (litellm or tinker).",
+167|    )
+168|    llm_kwargs: dict[str, Any] | None = Field(
+169|        default=None,
+170|        description="Extra LLM constructor kwargs.",
+171|    )
+172|    llm_call_kwargs: dict[str, Any] | None = Field(
+173|        default=None,
+174|        description="Extra LLM call kwargs (e.g. extra_body).",
+175|    )
+176|    session_id_headers: list[str] | None = Field(
+177|        default=None,
+178|        description="HTTP headers that receive the session ID.",
+179|    )
+180|
+181|
+182|class Terminus2(BaseAgent):
+183|    capabilities = AgentCapabilities(atif=True)
+184|
+185|    options_model = Terminus2Options
+186|    options: Terminus2Options
+187|
+188|    def _init_llm(
+189|        self,
+190|        llm_backend: LLMBackend | str,
+191|        model_name: str,
+192|        temperature: float | None,
+193|        collect_rollout_details: bool,
+194|        llm_kwargs: dict[str, Any] | None,
+195|        # LiteLLM-specific args
+196|        api_base: str | None,
+197|        session_id: str | None,
+198|        max_thinking_tokens: int | None,
+199|        reasoning_effort: str | None,
+200|        model_info: dict[str, Any] | None,
+201|        use_responses_api: bool,
+202|    ) -> BaseLLM:
+203|        """Initialize the LLM backend based on llm_backend parameter.
+204|
+205|        Args:
+206|            llm_backend: The LLM backend to use.
+207|            model_name: Name of the model.
+208|            temperature: Sampling temperature, if explicitly configured.
+209|            collect_rollout_details: Whether to collect token IDs and logprobs.
+210|            llm_kwargs: Additional kwargs passed to the LLM constructor.
+211|            api_base: Base URL for LiteLLM API endpoint.
+212|            session_id: Session ID for LiteLLM.
+213|            max_thinking_tokens: Max thinking tokens for LiteLLM extended thinking.
+214|            reasoning_effort: Reasoning effort level for LiteLLM.
+215|            model_info: Model info dict for LiteLLM custom models.
+216|            use_responses_api: Whether to use the Responses API.
+217|
+218|        Returns:
+219|            An initialized LLM instance.
+220|
+221|        Raises:
+222|            ValueError: If llm_backend is not a recognized backend.
+223|        """
+224|        # Normalize enum to string value for matching
+225|        backend_value = (
+226|            llm_backend.value if isinstance(llm_backend, LLMBackend) else llm_backend
+227|        )
+228|        constructor_kwargs = dict(llm_kwargs or {})
+229|        if temperature is not None:
+230|            constructor_kwargs["temperature"] = temperature
+231|
+232|        match backend_value:
+233|            case LLMBackend.LITELLM.value:
+234|                litellm_debug = constructor_kwargs.pop("litellm_debug", False)
+235|                configure_litellm_debug(debug=litellm_debug)
+236|
+237|                return LiteLLM(
+238|                    model_name=model_name,
+239|                    api_base=api_base,
+240|                    collect_rollout_details=collect_rollout_details,
+241|                    session_id=session_id,
+242|                    max_thinking_tokens=max_thinking_tokens,
+243|                    reasoning_effort=reasoning_effort,
+244|                    model_info=model_info,
+245|                    use_responses_api=use_responses_api,
+246|                    **constructor_kwargs,
+247|                )
+248|            case LLMBackend.TINKER.value:
+249|                from harbor.llms.tinker import TinkerLLM
+250|
+251|                return TinkerLLM(
+252|                    model_name=model_name,
+253|                    collect_rollout_details=collect_rollout_details,
+254|                    **constructor_kwargs,
+255|                )
+256|            case _:
+257|                raise ValueError(
+258|                    f"Unknown llm_backend: {llm_backend!r}. "
+259|                    f"Supported backends: {[b.value for b in LLMBackend]}"
+260|                )
+261|
+262|    def __init__(
+263|        self,
+264|        logs_dir: Path,
+265|        model_name: str | None = None,
+266|        max_turns: int | None = None,
+267|        parser_name: str = "json",
+268|        api_base: str | None = None,
+269|        temperature: float | None = None,
+270|        reasoning_effort: Literal[
+271|            "none", "minimal", "low", "medium", "high", "xhigh", "max", "default"
+272|        ]
+273|        | None = None,
+274|        collect_rollout_details: bool = False,
+275|        session_id: str | None = None,
+276|        session_id_headers: list[str] | None = None,
+277|        enable_summarize: bool = True,
+278|        proactive_summarization_threshold: int = 8000,
+279|        max_thinking_tokens: int | None = None,
+(more lines below)

@@ -1,0 +1,2 @@
+- [Terminal pool reward consistency](terminal-pool-reward-consistency.md) — Oct 2026 fix of /app/pool tasks, where things are, how to validate
+- [Sandbox timing facts](sandbox-runtime-timing-facts.md) — mixed hosts, quantized throttling, CPU time useless in gVisor

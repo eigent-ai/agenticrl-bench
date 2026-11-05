@@ -1,0 +1,61 @@
+        config.update({"architectures": ["MultiModalityCausalLM"]})
+
+    if model_override_args:
+        config.update(model_override_args)
+
+    # Special architecture mapping check for GGUF models
+    if is_gguf:
+        if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
+            raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
+        model_type = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]
+        config.update({"architectures": [model_type]})
+
+    return config
+
+
+@lru_cache_frozenset(maxsize=32)
+def get_generation_config(
+    model: str,
+    trust_remote_code: bool,
+    revision: Optional[str] = None,
+    **kwargs,
+):
+    try:
+        return GenerationConfig.from_pretrained(
+            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+        )
+    except OSError as e:
+        return None
+
+
+# Qwen-1M related
+def get_sparse_attention_config(
+    model: str,
+    sparse_attention_config_filename: str = "sparse_attention_config.json",
+) -> Dict[str, Any]:
+    is_local = os.path.isdir(model)
+    if not is_local:
+        # Download the config files.
+        model = download_from_hf(model, allow_patterns=["*.json"])
+
+    config_file = os.path.join(model, sparse_attention_config_filename)
+    if not os.path.exists(config_file):
+        return {}
+
+    # Load the sparse attention config.
+    with open(config_file) as f:
+        config = json.load(f)
+    return config
+
+
+# Models don't use the same configuration key for determining the maximum
+# context length.  Store them here so we can sanely check them.
+# NOTE: The ordering here is important. Some models have two of these and we
+# have a preference for which value gets used.
+CONTEXT_LENGTH_KEYS = [
+    "max_sequence_length",
+    "seq_length",
+    "max_seq_len",
+    "model_max_length",
+    "max_position_embeddings",
+]

@@ -1,0 +1,151 @@
+        )
+
+        # Handle single vs multiple requests
+        if request.input_ids is not None:
+            prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
+        elif is_multimodal:
+            # Standard VLMs render a text prompt (with placeholder strings) for the MM
+            # processor to tokenize. Inkling's custom encoder instead produces pre-rendered
+            # input_ids with single placeholders; pass those through so the MM processor
+            # expands them rather than re-tokenizing an empty prompt. Gated on the Inkling
+            # encoding spec so every other model keeps the standard text path.
+            if (
+                self.chat_encoding_spec == "inkling"
+                and isinstance(processed_messages.prompt_ids, list)
+                and processed_messages.prompt_ids
+            ):
+                prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
+            else:
+                prompt_kwargs = {"text": processed_messages.prompt}
+        else:
+            if isinstance(processed_messages.prompt_ids, str):
+                prompt_kwargs = {"text": processed_messages.prompt_ids}
+            else:
+                prompt_kwargs = {"input_ids": processed_messages.prompt_ids}
+
+        # Extract custom labels from raw request headers
+        custom_labels = self.extract_custom_labels(raw_request)
+
+        # Extract routed_dp_rank from header (has higher priority than body)
+        effective_routed_dp_rank = self.extract_routed_dp_rank_from_header(
+            raw_request, request.routed_dp_rank
+        )
+
+        # Resolve LoRA adapter from model parameter or explicit lora_path
+        lora_path = self._resolve_lora_path(request.model, request.lora_path)
+        img_max_dynamic_patch, vid_max_dynamic_patch = _extract_max_dynamic_patch(
+            request
+        )
+        require_reasoning = self._get_reasoning_from_request(request)
+
+        adapted_request = GenerateReqInput(
+            **prompt_kwargs,
+            image_data=processed_messages.image_data,
+            video_data=processed_messages.video_data,
+            audio_data=processed_messages.audio_data,
+            sampling_params=sampling_params,
+            return_logprob=request.logprobs,
+            logprob_start_len=-1,
+            top_logprobs_num=request.top_logprobs or 0,
+            stream=request.stream,
+            return_text_in_logprobs=True,
+            modalities=processed_messages.modalities,
+            lora_path=lora_path,
+            bootstrap_host=request.bootstrap_host,
+            bootstrap_port=request.bootstrap_port,
+            bootstrap_room=request.bootstrap_room,
+            routed_dp_rank=effective_routed_dp_rank,
+            disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
+            return_hidden_states=request.return_hidden_states,
+            return_routed_experts=request.return_routed_experts,
+            routed_experts_start_len=request.routed_experts_start_len,
+            rid=request.rid,
+            session_id=request.session_id,
+            extra_key=self._compute_extra_key(request),
+            require_reasoning=require_reasoning,
+            priority=request.priority,
+            routing_key=self.extract_routing_key(raw_request),
+            custom_labels=custom_labels,
+            custom_logit_processor=request.custom_logit_processor,
+            images_config=getattr(request, "images_config", None),
+            image_max_dynamic_patch=img_max_dynamic_patch,
+            video_max_dynamic_patch=vid_max_dynamic_patch,
+            max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
+            use_audio_in_video=getattr(request, "use_audio_in_video", False),
+            return_prompt_token_ids=request.return_prompt_token_ids,
+        )
+
+        return adapted_request, request
+
+    def _process_messages(
+        self, request: ChatCompletionRequest, is_multimodal: bool
+    ) -> MessageProcessingResult:
+        """Process chat messages and apply chat template"""
+        if self.default_chat_template_kwargs:
+            ctk = dict(request.chat_template_kwargs or {})
+            for k, v in self.default_chat_template_kwargs.items():
+                ctk.setdefault(k, v)
+            request.chat_template_kwargs = ctk
+            effort = ctk.get("reasoning_effort")
+            if effort is not None and request.reasoning_effort is None:
+                request.reasoning_effort = effort
+
+        # GptOss model needs to keep special tokens for harmony parsing
+        if self.is_gpt_oss or self.is_gemma4:
+            request.skip_special_tokens = False
+
+        self._patch_reasoning_skip_special_tokens(request)
+
+        thinking_mode = self._get_reasoning_from_request(request)
+        # SGLang's ReasonerGrammarBackend owns the reasoning prefix
+        # when --reasoning-parser is configured, so builtin xgrammar
+        # tags must describe only the post-reasoning tool-call suffix.
+        xgrammar_reasoning = thinking_mode and (
+            self.tokenizer_manager.server_args.reasoning_parser is None
+        )
+        tool_call_constraint = None
+
+        # Apply chat template and its stop strings
+        tools = None
+        if request.tools and request.tool_choice != "none":
+            request.skip_special_tokens = False
+            if not isinstance(request.tool_choice, str):
+                tools = [
+                    item.model_dump()
+                    for item in request.tools
+                    if item.function.name == request.tool_choice.function.name
+                ]
+            else:
+                tools = [item.model_dump() for item in request.tools]
+            if self.tool_call_parser:
+                parser = FunctionCallParser(
+                    request.tools,
+                    self.tool_call_parser,
+                    tokenizer=self.tokenizer_manager.tokenizer,
+                )
+                tool_call_constraint = parser.get_structure_constraint(
+                    request.tool_choice,
+                    parallel_tool_calls=request.parallel_tool_calls,
+                    thinking_mode=xgrammar_reasoning,
+                )
+            # Fallback: use generic JSON schema for required/named tool choice
+            # only when no parser-specific constraint was set
+            if tool_call_constraint is None and (
+                request.tool_choice == "required"
+                or isinstance(request.tool_choice, ToolChoice)
+            ):
+                json_schema = get_json_schema_constraint(
+                    request.tools,
+                    request.tool_choice,
+                    parallel_tool_calls=request.parallel_tool_calls,
+                )
+                tool_call_constraint = ("json_schema", json_schema)
+
+        # When input_ids are provided, skip template tokenization entirely;
+        # only stop tokens and tool_call_constraint are needed.
+        if request.input_ids is not None:
+            result = MessageProcessingResult(
+                prompt="",
+                prompt_ids=request.input_ids,
+                image_data=None,
+                audio_data=None,

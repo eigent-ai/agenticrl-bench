@@ -1,0 +1,34 @@
+---
+- name: Provision development users
+  hosts: localhost
+  connection: local
+  become: yes
+
+  vars_files:
+    - vars/users.yml
+
+  tasks:
+    - name: Create webdev user
+      user:
+        name: webdev
+        password: "{{ webdev_password }}"
+        state: present
+        shell: /bin/bash
+
+    - name: Change webdev default shell to fish
+      command: chsh -s /usr/bin/fish webdev
+
+    - name: Add fish shell to /etc/shells
+      lineinfile:
+        path: /etc/shells
+        line: /usr/local/bin/fish
+        create: no
+
+    - name: Create svcbot service user
+      user:
+        name: svcbot
+        system: yes
+        shell: /bin/false
+        home: /var/lib/svcbot
+        createhome: yes
+        state: present

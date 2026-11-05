@@ -1,0 +1,31 @@
+---
+# OE-STEP optimization notes
+
+## Baseline (bench --save-ref, stock launch, dev set)
+- Run 1: step 667.71 s = rollout 431.01 + train+sync 236.69 (boot 1132 s)
+- Run 2: step 665.75 s = rollout 430.42 + train+sync 235.33 (boot 552 s); served-logprob repeat stored (mean 0.0503, p99 0.4826)
+- Internal split of one timed step (Miles timers): ref log-probs fwd 35.7 s, old-actor log-probs fwd 35.4 s,
+  train fwd/bwd ~136 s (full recompute), CPU Adam ~9 s steady state (~44 s on the first step due to state
+  allocation), sleep ~13 s, weight sync ~4 s. Rollout: 4x TP1 SGLang engines, ~10-13 running requests/engine,
+  EAGLE/MTP accept length ~2.07, ~27 ms per speculative step; the longest episode (39.8k gen tokens at ~100 tok/s)
+  is close to the rollout critical path.
+
+## What changed (final configuration)
+
+### Trainer: skip two redundant full forward passes (~71 s/step)
+1. **No reference-model forward.** `--use-kl-loss` is set but `--kl-loss-coef 0` and the advantage KL coefficient
+   (`--kl-coef`, default 0) is also 0, so reference log-probs only ever feed terms multiplied by 0.
+   - `miles/ray/specs/train.py`: `with_ref` now requires `kl_coef != 0 or (use_kl_loss and kl_loss_coef != 0)`.
+     The ref checkpoint is then never loaded or forwarded.
+   - `miles/backends/training_utils/loss/hub/losses.py`: the KL-loss block tolerates missing
+     `ref_log_probs` (it contributes `0 * kl` either way). Loss and advantages are numerically unchanged.
+2. **No separate old-actor forward** (`--skip-actor-forward-only` in the launch). With one optimizer step per
+   rollout the training forward runs at the same weights, on the same micro-batches, with the same replayed
+   MoE routing, so the detached training log-probs are exactly what the skipped pass would recompute
+   (Miles' own validator for this flag enforces the preconditions: dropout 0, no router jitter, one step).
+   - To keep the debug train dump complete, the policy loss now stashes the detached per-micro-batch training
+     log-probs (`TRAIN_LOG_PROBS_COLLECTOR` in `losses.py`) and the Megatron actor restores them, in original
+     sample order via the micro-batch index schedule, into `rollout_data["log_probs"]` before the dump is
+     written (`miles/backends/megatron_utils/actor.py`). These are the genuine trainer scores at the
+     pre-update weights, so the rollout-vs-trainer log-prob check measures the same thing as in the baseline
+     (dump mismatch mean|Δ| 0.0431-0.0433 in all our runs vs 0.0432 baseline).

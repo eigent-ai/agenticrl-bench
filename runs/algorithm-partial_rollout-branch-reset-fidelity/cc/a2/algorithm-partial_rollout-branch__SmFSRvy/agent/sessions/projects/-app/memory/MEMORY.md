@@ -1,0 +1,1 @@
+- [Branching reset design](branching-reset-design.md) — how reset(traj, k) restores branches, its on-disk state, known limits

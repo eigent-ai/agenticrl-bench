@@ -1,0 +1,158 @@
+20:from litellm.utils import get_model_info
+79:        self._model_info = model_info
+85:                model_name, self._model_info
+95:            self._canonical_model_name, self._model_info = hosted_vllm_validation
+106:        if self._model_info is not None:
+108:                litellm.register_model({self._litellm_model_name: self._model_info})
+110:                    f"Registered custom model '{model_name}' with info: {self._model_info}"
+150:    def get_model_context_limit(self) -> int:
+159:            model_info = get_model_info(self._lookup_model_name)
+160:            max_input_tokens = model_info.get("max_input_tokens")
+162:            # Fallback to max_tokens if max_input_tokens not available
+163:            if max_input_tokens is None:
+164:                max_input_tokens = model_info.get("max_tokens")
+166:            if max_input_tokens is not None:
+167:                return max_input_tokens
+183:    def get_model_output_limit(self) -> int | None:
+190:            model_info = get_model_info(self._lookup_model_name)
+704:            max_output_tokens = self.get_model_output_limit()
+import hashlib
+import json
+from pathlib import Path
+from typing import Any, NoReturn, override
+
+import litellm
+from litellm import CustomStreamWrapper, Message
+from litellm.exceptions import (
+    AuthenticationError as LiteLLMAuthenticationError,
+)
+from litellm.exceptions import (
+    BadRequestError as LiteLLMBadRequestError,
+)
+from litellm.exceptions import (
+    ContextWindowExceededError as LiteLLMContextWindowExceededError,
+)
+from litellm.litellm_core_utils.get_supported_openai_params import (
+    get_supported_openai_params,
+)
+from litellm.utils import get_model_info
+from pydantic import BaseModel
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    retry_if_not_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
+
+from harbor.llms.base import (
+    BaseLLM,
+    ContextLengthExceededError,
+    LLMResponse,
+    OutputLengthExceededError,
+)
+from harbor.llms.utils import (
+    add_anthropic_caching,
+    split_provider_model_name,
+    validate_hosted_vllm_model_config,
+)
+from harbor.models.metric import UsageInfo
+from harbor.utils.logger import logger
+
+# This is used as a fallback for when the model does not support response_format
+
+STRUCTURED_RESPONSE_PROMPT_TEMPLATE = """
+You must respond in the following JSON format.
+
+Here is the json schema:
+
+```json
+{schema}
+```
+
+Here is the prompt:
+
+{prompt}
+"""
+
+
+class LiteLLM(BaseLLM):
+    def __init__(
+        self,
+        model_name: str,
+        temperature: float | None = None,
+        api_base: str | None = None,
+        session_id: str | None = None,
+        collect_rollout_details: bool = False,
+        max_thinking_tokens: int | None = None,
+        reasoning_effort: str | None = None,
+        model_info: dict[str, Any] | None = None,
+        use_responses_api: bool = False,
+        **kwargs,
+    ):
+        super().__init__()
+        self._model_name = model_name
+        self._llm_kwargs = kwargs
+        self._temperature = temperature
+        self._model_info = model_info
+        self._logger = logger.getChild(__name__)
+
+        hosted_vllm_validation: tuple[str, dict[str, Any]] | None = None
+        if "hosted_vllm" in model_name.lower():
+            hosted_vllm_validation = validate_hosted_vllm_model_config(
+                model_name, self._model_info
+            )
+
+        (
+            self._provider_prefix,
+            self._canonical_model_name,
+        ) = split_provider_model_name(model_name)
+
+        if hosted_vllm_validation is not None:
+            self._provider_prefix = "hosted_vllm"
+            self._canonical_model_name, self._model_info = hosted_vllm_validation
+
+        # Only use canonical model name for hosted_vllm; other providers like
+        # openrouter need the full prefixed name for LiteLLM lookups
+        self._litellm_model_name = (
+            self._canonical_model_name
+            if self._provider_prefix == "hosted_vllm"
+            else model_name
+        )
+
+        # Register custom model if model_info is provided
+        if self._model_info is not None:
+            try:
+                litellm.register_model({self._litellm_model_name: self._model_info})
+                self._logger.debug(
+                    f"Registered custom model '{model_name}' with info: {self._model_info}"
+                )
+            except Exception as e:
+                self._logger.warning(
+                    f"Failed to register custom model '{model_name}': {e}"
+                )
+
+        self._supported_params = get_supported_openai_params(self._litellm_model_name)
+        self._api_base = api_base
+        self._session_id = session_id
+        self._collect_rollout_details = collect_rollout_details
+        self._max_thinking_tokens = max_thinking_tokens
+        self._reasoning_effort = reasoning_effort
+
+        if self._supported_params is not None:
+            self._supports_response_format = "response_format" in self._supported_params
+        else:
+            self._supports_response_format = False
+
+        self._use_responses_api = use_responses_api
+        self._structured_response_prompt_template = STRUCTURED_RESPONSE_PROMPT_TEMPLATE
+
+    @property
+    def _lookup_model_name(self) -> str:
+        """Get the model name to use for lookups in LiteLLM's model database.
+
+        Returns the canonical model name (without provider prefix) if available,
+        otherwise falls back to the original model name.
+        """
+        return self._litellm_model_name or self._model_name
+

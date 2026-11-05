@@ -1,0 +1,1 @@
+SELECT @rownum := @rownum + 1 AS position, `name`, `balance` FROM `users` INNER JOIN (SELECT @rownum := 0) r ON 1 = 1 ORDER BY `balance` DESC

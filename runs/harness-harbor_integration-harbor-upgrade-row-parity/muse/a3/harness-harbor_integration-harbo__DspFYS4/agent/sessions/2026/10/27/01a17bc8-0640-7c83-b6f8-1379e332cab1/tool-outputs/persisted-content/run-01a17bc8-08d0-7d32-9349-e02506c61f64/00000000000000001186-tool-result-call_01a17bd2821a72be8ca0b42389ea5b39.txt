@@ -1,0 +1,121 @@
+Read text file `/usr/local/lib/python3.12/site-packages/sandbox_broker/protocol.py`.
+1|"""Wire format between clients and the gate daemon (platform-neutral).
+2|
+3|One JSON object per line over a Unix stream socket. A request is a single line with an
+4|``op`` field; the reply is a single line, preceded by ``{"event": ...}`` lines when the
+5|client asked an ``exec`` to stream its output. Binary data travels base64-encoded.
+6|
+7|Requests (optional fields in brackets):
+8|  ping
+9|  create     image | build_context_b64, [cpu, memory_mb, timeout_s, idle_timeout_s,
+10|             workdir, env, labels]                                     -> id, ...
+11|  exec       id, argv, [timeout_s, workdir, env, stdin_b64, stream, binary]
+12|                                                                       -> rc, stdout, stderr, timed_out
+13|  put_file   id, path, data_b64, [mode]                               (alias: put)
+14|  get_file   id, path                                                  -> data_b64 (alias: get)
+15|  terminate  id
+16|  poll       id                                                        -> running, rc
+17|  list       [all]                                                     -> sandboxes
+18|  usage                                                                -> budget and counters
+19|  policy                                                               -> effective limits
+20|  shutdown   [exit]                                                    (admin only)
+21|
+22|Successful replies carry ``"ok": true``. Errors are ``{"ok": false, "error": <message>,
+23|"error_type": <kind>}``.
+24|"""
+25|from __future__ import annotations
+26|
+27|import json
+28|from typing import Any
+29|
+30|PROTOCOL_VERSION = 1
+31|
+32|COMMON_FIELDS = {"op", "request_id"}
+33|
+34|REQUEST_FIELDS: dict[str, set[str]] = {
+35|    "ping": set(),
+36|    "create": {"image", "build_context_b64", "cpu", "memory_mb", "timeout_s", "idle_timeout_s",
+37|               "workdir", "env", "labels"},
+38|    "exec": {"id", "argv", "timeout_s", "workdir", "env", "stdin_b64", "stream", "binary"},
+39|    "put_file": {"id", "path", "data_b64", "mode"},
+40|    "get_file": {"id", "path"},
+41|    "terminate": {"id"},
+42|    "poll": {"id"},
+43|    "list": {"all"},
+44|    "usage": set(),
+45|    "policy": set(),
+46|    "shutdown": {"exit"},
+47|}
+48|
+49|ALIASES = {"put": "put_file", "get": "get_file", "status": "usage"}
+50|
+51|ADMIN_OPS = {"shutdown"}
+52|
+53|
+54|class BrokerError(Exception):
+55|    """An error reported to the client. ``kind`` is a stable machine-readable category."""
+56|
+57|    kind = "error"
+58|    detail = ""  # platform details; only admins see them (server.process)
+59|
+60|    def __init__(self, message: str, kind: str | None = None):
+61|        super().__init__(message)
+62|        if kind:
+63|            self.kind = kind
+64|
+65|
+66|class BadRequest(BrokerError):
+67|    kind = "bad_request"
+68|
+69|
+70|class PolicyDenied(BrokerError):
+71|    kind = "denied"
+72|
+73|
+74|class QuotaExceeded(BrokerError):
+75|    kind = "quota"
+76|
+77|
+78|class SandboxNotFound(BrokerError):
+79|    kind = "not_found"
+80|
+81|
+82|class BackendFailure(BrokerError):
+83|    kind = "backend"
+84|
+85|
+86|class BrokerUnavailable(BrokerError):
+87|    kind = "unavailable"
+88|
+89|
+90|ERROR_TYPES = {cls.kind: cls for cls in (BadRequest, PolicyDenied, QuotaExceeded, SandboxNotFound,
+91|                                         BackendFailure, BrokerUnavailable)}
+92|
+93|
+94|def error_from_reply(reply: dict[str, Any]) -> BrokerError:
+95|    cls = ERROR_TYPES.get(reply.get("error_type", ""), BrokerError)
+96|    return cls(str(reply.get("error", "unknown error")), reply.get("error_type"))
+97|
+98|
+99|def encode(obj: dict[str, Any]) -> bytes:
+100|    return (json.dumps(obj, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
+101|
+102|
+103|def decode(line: bytes) -> dict[str, Any]:
+104|    obj = json.loads(line)
+105|    if not isinstance(obj, dict):
+106|        raise BadRequest("request must be a JSON object")
+107|    return obj
+108|
+109|
+110|def validate_request(req: dict[str, Any]) -> str:
+111|    op = req.get("op")
+112|    if not isinstance(op, str):
+113|        raise BadRequest("missing 'op'")
+114|    op = ALIASES.get(op, op)
+115|    if op not in REQUEST_FIELDS:
+116|        raise BadRequest(f"unknown op {op!r}")
+117|    unknown = set(req) - COMMON_FIELDS - REQUEST_FIELDS[op]
+118|    if unknown:
+119|        raise BadRequest(f"unsupported field(s) for {op}: {', '.join(sorted(unknown))}")
+120|    return op

@@ -1,0 +1,95 @@
+/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/environments/base.py:123:    default_user: str | int | None
+/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/environments/base.py:196:        self.default_user = None
+/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/environments/base.py:411:    def _resolve_user(self, user: str | int | None) -> str | int | None:
+/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/environments/base.py:415:        ``self.default_user``.  This allows the orchestrator to configure a
+/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/environments/base.py:420:        return user if user is not None else self.default_user
+/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/environments/base.py:423:    def with_default_user(
+/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/environments/base.py:425:        user: str | int | None,
+/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/environments/base.py:428:        previous = self.default_user
+/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/environments/base.py:429:        self.default_user = user
+/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/environments/base.py:433:            self.default_user = previous
+/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/environments/base.py:459:        ``with_default_user``'s plain attribute save/restore). The instance
+/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/environments/base.py:487:        Unlike ``with_default_user`` (plain attribute save/restore), this uses a
+/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/environments/base.py:1175:        user: str | int | None = None,
+/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/environments/base.py:1185:            user: Username or UID to run the command as. None falls back to
+/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/environments/base.py:1186:                ``self.default_user``; if that is also None the environment's
+/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/environments/base.py:1190:    async def is_dir(self, path: str, user: str | int | None = None) -> bool:
+/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/environments/base.py:1204:    async def is_file(self, path: str, user: str | int | None = None) -> bool:
+/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/environments/base.py:1248:        user: str | int | None = None,
+/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/environments/base.py:1322:        user: str | int | None = None,
+/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/models/task/config.py:340:class AgentConfig(PhaseNetworkPolicyConfig):
+/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/models/task/config.py:342:    user: str | int | None = Field(
+/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/models/task/config.py:565:    user: str | int | None = Field(
+/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/models/task/config.py:745:    user: str | int | None = Field(
+1370:    async def run_healthcheck(
+1371-        self, healthcheck: HealthcheckConfig | None = None
+1372-    ) -> None:
+1373-        """Run a healthcheck, defaulting to the environment-level config.
+1374-
+1375-        Mirrors Docker HEALTHCHECK semantics: during the start period,
+1376-        failures don't count toward retries. After the start period,
+1377-        consecutive failures are counted and the check fails after
+1378-        exceeding the retry limit.
+1379-
+1380-        Args:
+1381-            healthcheck: Optional override. When ``None``, falls back to
+1382-                ``task_env_config.healthcheck`` (the top-level healthcheck).
+1383-                Callers pass a per-step config here to run a step-scoped
+1384-                healthcheck.
+1385-        """
+1386-        hc = (
+1387-            healthcheck if healthcheck is not None else self.task_env_config.healthcheck
+1388-        )
+1389-        if hc is None:
+1390-            return
+1391-
+1392-        self.logger.debug(f"Running healthcheck: {hc.command}")
+1393-
+1394-        start_time = time.monotonic()
+1395-        start_period_end = start_time + hc.start_period_sec
+1396-        consecutive_failures = 0
+1397-
+1398-        while True:
+1399-            now = time.monotonic()
+1400-            in_start_period = now < start_period_end
+37:class NetworkMode(str, Enum):
+70:    network_mode: NetworkMode = NetworkMode.PUBLIC
+71:    allowed_hosts: list[str] = Field(default_factory=list)
+74:    def validate_allowed_hosts(self) -> "NetworkPolicy":
+75:        if self.network_mode != NetworkMode.ALLOWLIST and self.allowed_hosts:
+77:                "allowed_hosts is only valid when network_mode='allowlist'."
+82:def normalize_allowed_hosts(hosts: list[str]) -> list[str]:
+133:    "allowed_hosts entries must be hostnames, IP addresses, or IP CIDR ranges, "
+143:            raise ValueError("allowed_hosts entries must be non-empty hostnames.")
+162:                    "allowed_hosts wildcard entries must include a hostname suffix."
+170:                    "allowed_hosts wildcard entries must target hostnames, not IP "
+175:                "allowed_hosts wildcard entries must use a leading '*.' prefix."
+182:                "allowed_hosts entries must be IP addresses, IP CIDR ranges, or "
+190:def _validate_allowed_hosts_field(hosts: list[str] | None) -> list[str] | None:
+197:    network_mode: NetworkMode | None,
+198:    allowed_hosts: list[str] | None,
+200:    if network_mode is None:
+201:        if allowed_hosts is not None:
+203:                "allowed_hosts is only valid when network_mode='allowlist'."
+207:        network_mode=network_mode,
+208:        allowed_hosts=list(allowed_hosts or []),
+213:    @field_validator("allowed_hosts")
+216:        return _validate_allowed_hosts_field(hosts)
+222:    network_mode: NetworkMode | None = Field(
+227:    allowed_hosts: list[str] | None = Field(
+230:        "wildcard patterns reachable when network_mode='allowlist'.",
+235:        _validate_network_policy_fields(self.network_mode, self.allowed_hosts)
+239:        if self.network_mode is None:
+242:            network_mode=self.network_mode,
+243:            allowed_hosts=list(self.allowed_hosts or []),
+250:    network_mode: NetworkMode = Field(
+254:    allowed_hosts: list[str] | None = Field(
+257:        "wildcard patterns reachable when network_mode='allowlist'.",
+262:        _validate_network_policy_fields(self.network_mode, self.allowed_hosts)
+267:            network_mode=self.network_mode,
+268:            allowed_hosts=list(self.allowed_hosts or []),
+474:            "Deprecated compatibility field. Use [environment].network_mode instead."
+513:                "[environment].network_mode instead.",
+908:            "network_mode" in policy_config.model_fields_set
+909:            or policy_config.allowed_hosts is not None
+912:        policy_config.network_mode = (

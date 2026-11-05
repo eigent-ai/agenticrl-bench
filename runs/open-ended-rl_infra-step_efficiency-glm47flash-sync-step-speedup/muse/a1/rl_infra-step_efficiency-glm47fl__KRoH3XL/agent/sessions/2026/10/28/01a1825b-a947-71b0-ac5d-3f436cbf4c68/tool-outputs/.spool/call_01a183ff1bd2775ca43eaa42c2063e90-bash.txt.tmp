@@ -1,0 +1,64 @@
+2566:        save_debug_train_data=None,
+2613:                "save_debug_train_data": "/tmp/details/train_data/{rollout_id}_{rank}.pt",
+2644:            {"save_debug_train_data": "train-{rollout_id}.pt"},
+2583:class TestValidateSkipActorForwardOnly:
+2584-    def test_valid_single_step_configuration_passes(self):
+2585-        validate_skip_actor_forward_only(_make_skip_actor_forward_only_args())
+2586-
+2587-    def test_zero_moe_input_jitter_passes(self):
+2588-        validate_skip_actor_forward_only(_make_skip_actor_forward_only_args(moe_input_jitter_eps=0.0))
+2589-
+2590-    def test_tis_configuration_passes(self):
+2591-        validate_skip_actor_forward_only(_make_skip_actor_forward_only_args(use_tis=True))
+2592-
+2593-    def test_rollout_logprobs_configuration_passes(self):
+2594-        validate_skip_actor_forward_only(_make_skip_actor_forward_only_args(use_rollout_logprobs=True))
+2595-
+2596-    def test_rollout_logprobs_with_mismatch_metrics_passes(self):
+2597-        validate_skip_actor_forward_only(
+2598-            _make_skip_actor_forward_only_args(
+2599-                get_mismatch_metrics=True,
+2600-                use_rollout_logprobs=True,
+2601-            )
+2602-        )
+2603-
+2604-    @pytest.mark.parametrize(
+2605-        "overrides",
+2606-        [
+2607-            {"dumper_enable": True},
+2608-            {"dumper_fwd_only": ["enable=true"]},
+2609-            {"dumper_enable": True, "dumper_fwd_only": ["enable=false"]},
+2610-            {"dump_details": "/tmp/details"},
+2611-            {
+2612-                "dump_details": "/tmp/details",
+2613-                "save_debug_train_data": "/tmp/details/train_data/{rollout_id}_{rank}.pt",
+2614-            },
+2615-        ],
+2616-    )
+2617-    def test_dumper_configuration_passes(self, overrides):
+2618-        validate_skip_actor_forward_only(_make_skip_actor_forward_only_args(**overrides))
+2619-
+2620-    @pytest.mark.parametrize(
+2621-        "overrides",
+2622-        [
+2623-            {"train_backend": "fsdp"},
+2624-            {"loss_type": "custom_loss"},
+2625-            {"compute_advantages_and_returns": False},
+2626-            {"keep_old_actor": True},
+2627-            {"kl_coef": 0.1},
+2628-            {"use_opd": True},
+2629-            {"hidden_dropout": 0.1},
+2630-            {"attention_dropout": 0.1},
+2631-            {"lora_dropout": 0.1},
+2632-            {"moe_input_jitter_eps": 0.1},
+2633-            {"moe_router_force_load_balancing": True},
+2634-            {"moe_router_force_biased": 0.0},
+2635-            {"moe_router_load_balancing_type": ["sinkhorn"]},
+2636-            {"use_rollout_entropy": True},
+2637-            {"true_on_policy_mode": True},
+2638-            {"log_correct_samples": True},
+2639-            {"rollout_data_postprocess_path": "pkg.hook"},
+2640-            {"custom_megatron_before_log_prob_hook_path": "pkg.hook"},
+2641-            {"custom_megatron_before_train_step_hook_path": "pkg.hook"},
+2642-            {"custom_model_provider_path": "pkg.model_provider"},
+2643-            {"dumper_source_patcher_config_train": "patcher.yaml"},

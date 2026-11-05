@@ -1,0 +1,166 @@
+        int,
+        "Maximum number of concurrent realtime ASR WebSocket sessions served by /v1/realtime. New connections beyond this cap are accepted, sent an error{code:too_many_sessions} frame, and closed. Default 32.",
+    ] = 32
+    preferred_sampling_params: A[
+        Optional[str],
+        Arg(
+            help="json-formatted sampling settings that will be returned in /get_model_info",
+            type_parser=json.loads,
+        ),
+    ] = None
+    allow_auto_truncate: A[
+        bool,
+        "Allow automatically truncating requests that exceed the maximum input length instead of returning an error.",
+    ] = False
+
+    # -------------------------------------------------------------------------
+    # Streaming
+    # -------------------------------------------------------------------------
+    stream_interval: A[
+        int,
+        "The interval (or buffer size) for streaming in terms of the token length. A smaller value makes streaming smoother, while a larger value makes the throughput higher",
+    ] = 1
+    batch_notify_size: A[
+        int,
+        "Number of streaming notifications to batch before yielding to the event loop. Reduces asyncio wakeup overhead under high concurrency.",
+    ] = 16
+    stream_response_default_include_usage: A[
+        bool,
+        "Include usage in every streaming response (even when stream_options is not specified).",
+    ] = False
+    incremental_streaming_output: A[
+341:        self.validate_total_tokens = True
+992:            self.validate_total_tokens
+382:        custom_tokenizer: dict | SelectTokenizerResponse | None,
+397:        self.count_function = _get_count_function(model, custom_tokenizer)
+402:    custom_tokenizer: dict | SelectTokenizerResponse | None = None,
+416:    custom_tokenizer (Optional[dict]): A custom tokenizer created with the `create_pretrained_tokenizer` or `create_tokenizer` method. Must be a dictionary with a string value for `type` and Tokenizer for `tokenizer`. Default is None.
+452:        count_function: Final = _get_count_function(model, custom_tokenizer)
+457:        params: Final = _MessageCountParams(model, custom_tokenizer)
+610:    custom_tokenizer: dict | SelectTokenizerResponse | None = None,
+612:    return _get_extrapolating_count_function(_get_exact_count_function(model, custom_tokenizer))
+617:    custom_tokenizer: dict | SelectTokenizerResponse | None = None,
+623:    if model is not None or custom_tokenizer is not None:
+624:        tokenizer_json: Final = custom_tokenizer or _select_tokenizer(model)
+673:        print_verbose("Warning: model not found. Using cl100k_base encoding.")
+674:        return "cl100k_base"
+# What is this?
+## Helper utilities for token counting
+import base64
+import io
+import struct
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from typing import Final, Literal, cast
+
+import anyio
+import anyio.lowlevel
+import httpx
+import tiktoken
+from typing_extensions import ParamSpec, TypeVar
+
+import litellm
+from litellm import verbose_logger
+from litellm._lazy_imports import _get_default_encoding
+from litellm.constants import (
+    DEFAULT_IMAGE_HEIGHT,
+    DEFAULT_IMAGE_TOKEN_COUNT,
+    DEFAULT_IMAGE_WIDTH,
+    MAX_IMAGE_URL_DOWNLOAD_SIZE_MB,
+    MAX_LONG_SIDE_FOR_IMAGE_HIGH_RES,
+    MAX_SHORT_SIDE_FOR_IMAGE_HIGH_RES,
+    MAX_TILE_HEIGHT,
+    MAX_TILE_WIDTH,
+    TIKTOKEN_ENCODE_CHUNK_SIZE_CHARS,
+    TOKEN_COUNTER_MAX_CONCURRENT_COUNTS,
+    TOKEN_COUNTER_MAX_EXACT_CHARS,
+)
+from litellm.litellm_core_utils.asyncify import asyncify
+from litellm.litellm_core_utils.tokenizer import Encoding, HuggingFace, HuggingFaceTokenizer, OpenAIEncoding
+from litellm.litellm_core_utils.url_utils import safe_get
+from litellm.llms.custom_httpx.http_handler import _get_httpx_client
+from litellm.rust_bridge.tokenizer import get_encoding
+from litellm.types.llms.anthropic import (
+    AnthropicContentParamSource,
+    AnthropicContentParamSourceFileId,
+    AnthropicContentParamSourceUrl,
+    AnthropicMessagesDocumentParam,
+    AnthropicMessagesImageParam,
+    AnthropicMessagesTextParam,
+    AnthropicMessagesToolResultParam,
+    AnthropicMessagesToolUseParam,
+)
+from litellm.types.llms.openai import (
+    AllMessageValues,
+    ChatCompletionDocumentObject,
+    ChatCompletionNamedToolChoiceParam,
+    ChatCompletionRedactedThinkingBlock,
+    ChatCompletionThinkingBlock,
+    ChatCompletionToolParam,
+    OpenAIMessageContentListBlock,
+)
+from litellm.types.utils import Message, SelectTokenizerResponse
+
+
+def get_modified_max_tokens(
+    model: str,
+    base_model: str,
+    messages: list[AllMessageValues] | None,
+    user_max_tokens: int | None,
+    buffer_perc: float | None,
+    buffer_num: float | None,
+) -> int | None:
+    """
+    Params:
+
+    Returns the user's max output tokens, adjusted for:
+    - the size of input - for models where input + output can't exceed X
+    - model max output tokens - for models where there is a separate output token limit
+    """
+    try:
+        if user_max_tokens is None:
+            return None
+
+        ## MODEL INFO
+        _model_info: Final = litellm.get_model_info(model=model)
+
+        max_output_tokens: Final = litellm.get_max_tokens(model=base_model)  # assume min context window is 4k tokens
+
+        ## UNKNOWN MAX OUTPUT TOKENS - return user defined amount
+        if max_output_tokens is None:
+            return user_max_tokens
+
+        input_tokens = litellm.token_counter(model=base_model, messages=messages)
+
+        # token buffer
+        if buffer_perc is None:
+            buffer_perc = 0.1
+        if buffer_num is None:
+            buffer_num = 10
+        token_buffer: Final = max(
+            buffer_perc * input_tokens, buffer_num
+        )  # give at least a 10 token buffer. token counting can be imprecise.
+
+        input_tokens += int(token_buffer)
+        verbose_logger.debug("max_output_tokens: %s, user_max_tokens: %s", max_output_tokens, user_max_tokens)
+        ## CASE 1: model input + output can't exceed X - happens when max input = max output, e.g. gpt-3.5-turbo
+        if _model_info["max_input_tokens"] == max_output_tokens:
+            verbose_logger.debug("input_tokens: %s, max_output_tokens: %s", input_tokens, max_output_tokens)
+            if input_tokens > max_output_tokens:
+                pass  # allow call to fail normally - don't set max_tokens to negative.
+            elif (
+                user_max_tokens + input_tokens > max_output_tokens
+            ):  # we can still modify to keep it positive but below the limit
+                verbose_logger.debug(
+                    "MODIFYING MAX TOKENS - user_max_tokens=%s, input_tokens=%s, max_output_tokens=%s",
+                    user_max_tokens,
+                    input_tokens,
+                    max_output_tokens,
+                )
+                user_max_tokens = int(max_output_tokens - input_tokens)
+        ## CASE 2: user_max_tokens> model max output tokens
+        elif user_max_tokens > max_output_tokens:
+            user_max_tokens = max_output_tokens
+
+        verbose_logger.debug(
+            "litellm.litellm_core_utils.token_counter.py::get_modified_max_tokens() - user_max_tokens: %s",
+            user_max_tokens,

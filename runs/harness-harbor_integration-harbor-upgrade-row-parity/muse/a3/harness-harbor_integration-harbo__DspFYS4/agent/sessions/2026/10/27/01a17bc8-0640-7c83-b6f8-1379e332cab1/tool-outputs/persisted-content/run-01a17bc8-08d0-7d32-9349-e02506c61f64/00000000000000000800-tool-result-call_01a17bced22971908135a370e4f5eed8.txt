@@ -1,0 +1,418 @@
+Read text file `/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/agents/base.py`.
+1|import logging
+2|import os
+3|import warnings
+4|from abc import ABC, abstractmethod
+5|from collections.abc import Mapping
+6|from pathlib import Path, PurePosixPath
+7|from typing import Any, ClassVar
+8|from uuid import UUID
+9|
+10|from pydantic import ValidationError
+11|
+12|from harbor.agents.capabilities import AgentCapabilities
+13|from harbor.agents.model_connection import (
+14|    ResolvedModelConnection,
+15|    ModelConnectionSpec,
+16|    resolve_model_connection,
+17|)
+18|from harbor.agents.options import AgentOptions, apply_env_fallbacks
+19|from harbor.environments.base import BaseEnvironment
+20|from harbor.models.agent.context import AgentContext
+21|from harbor.models.agent.name import AgentName
+22|from harbor.models.bridge import BridgeKind
+23|from harbor.models.task.config import MCPServerConfig
+24|from harbor.models.trial.paths import EnvironmentPaths
+25|from harbor.models.trial.result import AgentInfo, ModelInfo
+26|from harbor.utils.logger import logger as global_logger
+27|
+28|
+29|class BaseAgent(ABC):
+30|    """
+31|    Base class for agents that run inside an environment to complete a task.
+32|
+33|    ``session_id`` is the local unique identifier for instance within a job/trial and is
+34|    assigned by orchestration as a human-readable handle. Designed to be ephemeral which
+35|    will mostly be consumed by the user during or shortly after the trial.
+36|    For example, ``hello-world__bZZeEkw__agent``.
+37|
+38|    ``context_id`` is the globally unique identifier shared by the agent and its
+39|    related environments, allowing their records to be linked across systems.
+40|    Designed to be durable. It currently points to the trial _id, for example
+41|    ``594025f3-7d65-4655-8576-4bee95002eae``.
+42|
+43|    See ``CHANGELOG.md 2026-06-24 — Runtime identity fields`` for further information about naming conventions.
+44|    """
+45|
+46|    logs_dir: Path
+47|    # Environment-side dir mirroring the host ``logs_dir``; set per role in
+48|    # simulated-user trials so the two agents' output stays separated.
+49|    environment_logs_dir: PurePosixPath
+50|    model_name: str | None
+51|    logger: logging.Logger
+52|
+53|    session_id: str | None = None
+54|    context_id: UUID | None = None
+55|
+56|    capabilities: ClassVar[AgentCapabilities] = AgentCapabilities()
+57|    """Static features supported by this agent implementation."""
+58|
+59|    DEFAULT_SETUP_TIMEOUT_SEC: ClassVar[float] = 360.0
+60|    """Setup timeout before multipliers, unless explicitly overridden by the user."""
+61|
+62|    # Deprecated aliases retained for external agents and consumers during the
+63|    # migration to ``capabilities``.
+64|    SUPPORTS_ATIF: ClassVar[bool] = False
+65|    SUPPORTS_RESUME: ClassVar[bool] = False
+66|    SUPPORTS_LOAD_NATIVE_TRAJECTORY: ClassVar[bool] = False
+67|    SUPPORTS_LOAD_ATIF_TRAJECTORY: ClassVar[bool] = False
+68|    SUPPORTS_HANDOFF: ClassVar[bool] = False
+69|    SUPPORTS_CONFIG: ClassVar[bool] = False
+70|    SUPPORTS_WINDOWS: ClassVar[bool] = False
+71|    SUPPORTED_BRIDGES: ClassVar[frozenset[BridgeKind]] = frozenset()
+72|
+73|    MODEL_CONNECTION: ClassVar[ModelConnectionSpec | None] = None
+74|
+75|    _LEGACY_CAPABILITY_FIELDS: ClassVar[dict[str, str]] = {
+76|        "SUPPORTS_ATIF": "atif",
+77|        "SUPPORTS_RESUME": "resume",
+78|        "SUPPORTS_LOAD_NATIVE_TRAJECTORY": "load_native_trajectory",
+79|        "SUPPORTS_LOAD_ATIF_TRAJECTORY": "load_atif_trajectory",
+80|        "SUPPORTS_HANDOFF": "handoff",
+81|        "SUPPORTS_CONFIG": "native_config",
+82|        "SUPPORTS_WINDOWS": "windows",
+83|        "SUPPORTED_BRIDGES": "bridges",
+84|    }
+85|
+86|    def __init_subclass__(cls, **kwargs: Any) -> None:
+87|        super().__init_subclass__(**kwargs)
+88|        if not isinstance(cls.capabilities, AgentCapabilities):
+89|            raise TypeError(
+90|                f"Agent '{cls.__name__}' capabilities must be an AgentCapabilities"
+91|            )
+92|
+93|        legacy_flags = {
+94|            flag: cls.__dict__[flag]
+95|            for flag in cls._LEGACY_CAPABILITY_FIELDS
+96|            if flag in cls.__dict__
+97|        }
+98|        if legacy_flags:
+99|            updates = {
+100|                cls._LEGACY_CAPABILITY_FIELDS[flag]: value
+101|                for flag, value in legacy_flags.items()
+102|            }
+103|            normalized = AgentCapabilities.model_validate(
+104|                {**cls.capabilities.model_dump(), **updates}
+105|            )
+106|            if "capabilities" in cls.__dict__:
+107|                conflicts = [
+108|                    flag
+109|                    for flag in legacy_flags
+110|                    if getattr(normalized, cls._LEGACY_CAPABILITY_FIELDS[flag])
+111|                    != getattr(cls.capabilities, cls._LEGACY_CAPABILITY_FIELDS[flag])
+112|                ]
+113|                if conflicts:
+114|                    names = ", ".join(conflicts)
+115|                    raise TypeError(
+116|                        f"Agent '{cls.__name__}' declares conflicting capabilities "
+117|                        f"and legacy flags: {names}"
+118|                    )
+119|            else:
+120|                cls.capabilities = normalized
+121|
+122|            names = ", ".join(legacy_flags)
+123|            warnings.warn(
+124|                f"Agent '{cls.__name__}' declares deprecated capability flags "
+125|                f"({names}); declare capabilities = AgentCapabilities(...) instead. "
+126|                "Legacy flags will be removed in the next major release.",
+127|                DeprecationWarning,
+128|                stacklevel=2,
+129|            )
+130|
+131|        for flag, field in cls._LEGACY_CAPABILITY_FIELDS.items():
+132|            setattr(cls, flag, getattr(cls.capabilities, field))
+133|
+134|    # User-facing ``AgentConfig.kwargs`` model. Framework-injected constructor
+135|    # args are not part of this schema.
+136|    options_model: ClassVar[type[AgentOptions] | None] = None
+137|
+138|    def __init__(
+139|        self,
+140|        logs_dir: Path,
+141|        model_name: str | None = None,
+142|        logger: logging.Logger | None = None,
+143|        mcp_servers: list[MCPServerConfig]
+144|        | None = None,  # MCP servers from task config; see setup()/run() for usage
+145|        skills_dir: str | None = None,  # Skills directory path in the environment
+146|        *,
+147|        extra_env: dict[str, str] | None = None,
+148|        load_trajectory: str | Path | None = None,
+149|        environment_logs_dir: PurePosixPath | None = None,
+150|        **kwargs,
+151|    ):
+152|        self.logs_dir = logs_dir
+153|        self.environment_logs_dir = environment_logs_dir or EnvironmentPaths.agent_dir
+154|        self.model_name = model_name
+155|        self.logger = (logger or global_logger).getChild(__name__)
+156|        self.mcp_servers = mcp_servers or []
+157|        self.skills_dir = skills_dir
+158|        self.load_trajectory = (
+159|            Path(load_trajectory).expanduser() if load_trajectory else None
+160|        )
+161|        self._extra_env: dict[str, str] = dict(extra_env) if extra_env else {}
+162|        kwargs.pop("override_setup_timeout_sec", None)
+163|        self.options = type(self).parse_options(kwargs, self._extra_env)
+164|
+165|        self._init_model_info()
+166|
+167|    @classmethod
+168|    def parse_options(
+169|        cls,
+170|        kwargs: dict[str, Any] | None = None,
+171|        env: Mapping[str, str] | None = None,
+172|    ) -> AgentOptions | None:
+173|        """Parse user-facing kwargs against ``options_model``.
+174|
+175|        Used by the constructor and by ``preflight``. No model means leftover
+176|        kwargs are ignored.
+177|
+178|        Raises:
+179|            ValueError: If declared options are invalid.
+180|        """
+181|        raw = dict(kwargs) if kwargs else {}
+182|        extra_env = dict(env) if env else {}
+183|
+184|        def get_env(key: str) -> str | None:
+185|            if key in extra_env:
+186|                return extra_env[key]
+187|            return os.environ.get(key)
+188|
+189|        if cls.options_model is None:
+190|            global_logger.getChild(__name__).debug(
+191|                "Agent '%s' does not declare an options_model; leftover kwargs "
+192|                "are ignored",
+193|                cls.name(),
+194|            )
+195|            return None
+196|        try:
+197|            return cls.options_model.model_validate(
+198|                apply_env_fallbacks(cls.options_model, raw, get_env)
+199|            )
+200|        except ValidationError as exc:
+201|            messages = []
+202|            for error in exc.errors(include_url=False, include_input=False):
+203|                option = ".".join(str(part) for part in error["loc"]) or "kwargs"
+204|                message = (
+205|                    f"Unknown option '{option}'."
+206|                    if error["type"] == "extra_forbidden"
+207|                    else f"{option}: {error['msg']}"
+208|                )
+209|                messages.append(f"  {message}")
+210|            details = "\n".join(messages)
+211|            agent_ref = (
+212|                cls.name()
+213|                if cls.name() in AgentName.values()
+214|                else f"{cls.__module__}:{cls.__qualname__}"
+215|            )
+216|            raise ValueError(
+217|                f"Invalid kwargs for agent '{cls.name()}':\n{details}\n"
+218|                f"See harbor agent schema {agent_ref} for available options."
+219|            ) from None
+220|
+221|    @classmethod
+222|    def preflight(
+223|        cls,
+224|        kwargs: dict[str, Any] | None = None,
+225|        env: Mapping[str, str] | None = None,
+226|    ) -> None:
+227|        """Check agent config before queueing trials.
+228|
+229|        Called once per agent config before trials are queued. Validates
+230|        options when declared. Subclasses may override to add credential
+231|        or other checks; call ``super().preflight(...)`` to keep options
+232|        validation.
+233|
+234|        Raises:
+235|            ValueError: If declared options are invalid.
+236|        """
+237|        cls.parse_options(kwargs, env)
+238|
+239|    @classmethod
+240|    def options_schema(cls) -> dict[str, Any]:
+241|        """JSON Schema for user-facing kwargs (no ``Cli`` / ``Env`` metadata)."""
+242|        if cls.options_model is None:
+243|            raise ValueError(f"Agent '{cls.name()}' does not declare an options_model")
+244|        return cls.options_model.model_json_schema()
+245|
+246|    @property
+247|    def extra_env(self) -> dict[str, str]:
+248|        """Environment variables configured for this agent."""
+249|        return dict(self._extra_env)
+250|
+251|    def _env_sources(self) -> tuple[Mapping[str, str], ...]:
+252|        """Environment sources in runtime precedence order."""
+253|        return (
+254|            self._extra_env,
+255|            os.environ,
+256|        )
+257|
+258|    def _resolve_env(self, key: str, *alternatives: str) -> tuple[str, str] | None:
+259|        """Resolve the first name and value from the highest-precedence source."""
+260|        for source in self._env_sources():
+261|            for name in (key, *alternatives):
+262|                if name in source:
+263|                    return name, source[name]
+264|        return None
+265|
+266|    def _get_env(self, key: str, *alternatives: str) -> str | None:
+267|        """Get the first named value from the highest-precedence source."""
+268|        resolved = self._resolve_env(key, *alternatives)
+269|        return resolved[1] if resolved else None
+270|
+271|    def _get_env_prefixed(self, prefix: str) -> dict[str, str]:
+272|        """Get prefixed values using the same environment precedence."""
+273|        result: dict[str, str] = {}
+274|        for source in reversed(self._env_sources()):
+275|            for key, value in source.items():
+276|                if key.startswith(prefix):
+277|                    result[key[len(prefix) :]] = value
+278|        return result
+279|
+280|    @property
+281|    def model_connection(self) -> ResolvedModelConnection:
+282|        """Resolve the same model connection consumed by the agent runtime."""
+283|        if self.MODEL_CONNECTION is None:
+284|            return ResolvedModelConnection()
+285|        return resolve_model_connection(
+286|            self.model_name,
+287|            self.MODEL_CONNECTION,
+288|            self._resolve_env,
+289|        )
+290|
+291|    def _init_model_info(self):
+292|        self._parsed_model_provider = None
+293|        self._parsed_model_name = None
+294|
+295|        if self.model_name is None:
+296|            return
+297|
+298|        if "/" in self.model_name:
+299|            self._parsed_model_provider, self._parsed_model_name = (
+300|                self.model_name.split("/", maxsplit=1)
+301|            )
+302|            return
+303|
+304|        self._parsed_model_name = self.model_name
+305|
+306|    def to_agent_info(self) -> AgentInfo:
+307|        provider = (
+308|            self.model_connection.provider
+309|            if self.MODEL_CONNECTION is not None
+310|            else self._parsed_model_provider
+311|        )
+312|        return AgentInfo(
+313|            name=self.name(),
+314|            version=self.version() or "unknown",
+315|            model_info=(
+316|                ModelInfo(
+317|                    name=self._parsed_model_name,
+318|                    provider=provider,
+319|                )
+320|                if self._parsed_model_name
+321|                else None
+322|            ),
+323|        )
+324|
+325|    @staticmethod
+326|    @abstractmethod
+327|    def name() -> str:
+328|        """The name of the agent."""
+329|
+330|    @abstractmethod
+331|    def version(self) -> str | None:
+332|        """The version of the agent."""
+333|
+334|    @classmethod
+335|    def import_path(cls) -> str:
+336|        """
+337|        The import path of the agent. Formatted as 'some.import.path:AgentClass'.
+338|        """
+339|        return f"{cls.__module__}:{cls.__name__}"
+340|
+341|    @abstractmethod
+342|    async def setup(self, environment: BaseEnvironment) -> None:
+343|        """
+344|        Run commands to setup the agent & its tools.
+345|
+346|        This is a good place to register the MCP servers in ``self.mcp_servers`` with
+347|        the agent (e.g. by creating a .mcp.json file) and copy skills from
+348|        ``self.skills_dir`` to the agent's expected location.
+349|
+350|        The user the agent should run as is set on ``environment.default_user`` by
+351|        the orchestrator before this method is called.
+352|
+353|        Args:
+354|            environment: The environment in which to setup the agent.
+355|        """
+356|
+357|    @abstractmethod
+358|    async def run(
+359|        self,
+360|        instruction: str,
+361|        environment: BaseEnvironment,
+362|        context: AgentContext,
+363|    ) -> None:
+364|        """
+365|        Runs the agent in the environment. Be sure to populate the context with the
+366|        results of the agent execution. Ideally, populate the context as the agent
+367|        executes in case of a timeout or other error.
+368|
+369|        If necessary, register the MCP servers in ``self.mcp_servers`` with
+370|        the agent (e.g. by creating a .mcp.json file) and copy skills from
+371|        ``self.skills_dir`` to the agent's expected location.
+372|
+373|        The user the agent should run as is set on ``environment.default_user`` by
+374|        the orchestrator before this method is called.  Any call to
+375|        ``environment.exec`` that does not pass an explicit ``user`` argument will
+376|        automatically run as that user.
+377|
+378|        Args:
+379|            instruction: The task instruction.
+380|            environment: The environment in which to complete the task.
+381|            context: The context to populate with the results of the agent execution.
+382|        """
+383|
+384|    async def resume(
+385|        self,
+386|        instruction: str,
+387|        environment: BaseEnvironment,
+388|        context: AgentContext,
+389|    ) -> None:
+390|        raise NotImplementedError(f"Agent '{self.name()}' does not support resume")
+391|
+392|    async def load(
+393|        self,
+394|        instruction: str,
+395|        environment: BaseEnvironment,
+396|        context: AgentContext,
+397|    ) -> None:
+398|        """Seed the agent's session from ``self.load_trajectory`` and resume it."""
+399|        raise NotImplementedError(
+400|            f"Agent '{self.name()}' does not support loading a trajectory"
+401|        )
+402|
+403|    @classmethod
+404|    def handoff(cls, trial_dir: Path, cwd: Path) -> list[str]:
+405|        """Install a finished trial's native session for the local agent CLI.
+406|
+407|        Returns the command that resumes the session when run from ``cwd``.
+408|        """
+409|        raise NotImplementedError(f"Agent '{cls.name()}' does not support handoff")
+410|
+411|    def populate_context_post_run(self, context: AgentContext) -> None:
+412|        """Optionally backfill context after ``run()`` completes.
+413|
+414|        Agents that write logs or trajectories during execution can override this
+415|        to parse those outputs after the trial syncs logs back to the host.
+416|        """
+417|        pass

@@ -1,0 +1,5 @@
+library(modeldata)
+data(ames)
+dir.create("/data", showWarnings = FALSE)
+write.csv(ames, "/data/ames_housing.csv", row.names = FALSE)
+cat("Ames housing dataset exported:", nrow(ames), "rows,", ncol(ames), "columns\n")

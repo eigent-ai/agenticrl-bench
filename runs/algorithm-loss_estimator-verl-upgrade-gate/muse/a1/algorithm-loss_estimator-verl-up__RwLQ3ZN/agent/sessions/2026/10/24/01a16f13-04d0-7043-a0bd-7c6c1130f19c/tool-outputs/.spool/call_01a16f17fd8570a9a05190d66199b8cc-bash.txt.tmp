@@ -1,0 +1,62 @@
+178:        if self.engine_config.entropy_from_logits_with_chunking:
+179:            entropy_from_logits = verl_F.entropy_from_logits_with_chunking
+181:            entropy_from_logits = verl_F.entropy_from_logits
+183:        self.compute_entropy_from_logits = (
+184:            torch.compile(entropy_from_logits, dynamic=True)
+186:            else entropy_from_logits
+308:            # Apply Liger kernel; disable fused_linear_cross_entropy (conflicts with verl's forward patching)
+314:                    fused_linear_cross_entropy=False,
+779:    def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
+1336:        calculate_entropy = tu.get_non_tensor_data(data=micro_batch, key="calculate_entropy", default=False)
+1364:                log_probs = None
+1366:                    log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
+1367:                entropy_rmpad = output.entropy.squeeze(0) if calculate_entropy else None  # (total_nnz,)
+1392:                log_probs = None
+1397:                if calculate_entropy:
+1398:                    if not self.engine_config.entropy_checkpointing:
+1399:                        if self.engine_config.entropy_from_logits_with_chunking:
+1400:                            entropy_rmpad = self.compute_entropy_from_logits(
+1402:                                chunk_size=self.engine_config.entropy_from_logits_chunk_size,
+1405:                            entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)
+1407:                        entropy_rmpad = torch.utils.checkpoint.checkpoint(
+1408:                            self.compute_entropy_from_logits, logits_rmpad
+1426:                    if calculate_entropy:
+1428:                    log_probs = logprobs_from_logits(
+1437:                log_probs = self._gather_and_unpad_packed(log_probs, pad_size)
+1438:            if calculate_entropy:
+1439:                entropy_rmpad = self._gather_and_unpad_packed(entropy_rmpad, pad_size)
+1447:                    log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)
+1448:                if calculate_entropy:
+1449:                    entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
+1462:                    arange = torch.arange(output.log_probs.shape[1], device=output.log_probs.device)
+1465:                    log_probs = None
+1467:                        log_probs = output.log_probs[mask]
+1468:                        log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)
+1470:                    if calculate_entropy:
+1471:                        entropy = output.entropy[mask]
+1472:                        entropy = torch.nested.nested_tensor_from_jagged(entropy, cu_seqlens)
+1489:                if calculate_entropy:
+1490:                    if not self.engine_config.entropy_checkpointing:
+1491:                        entropy = verl_F.entropy_from_logits(logits)
+1493:                        entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
+1508:                    # (log_probs is also not gathered) and pad_size is only
+1520:                    log_probs = None
+1522:                        log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
+1526:                        log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)
+1527:                    if calculate_entropy:
+1528:                        entropy = torch.nested.narrow(entropy, 1, starts, seq_lengths, layout=torch.jagged)
+1529:                        entropy_rmpad = torch.cat([t for t in entropy.unbind()])
+1530:                        entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
+1541:            model_output["log_probs"] = log_probs
+1542:        if calculate_entropy:
+1543:            model_output["entropy"] = entropy
+1549:    def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
+P-1:P+R-1 (verl shift) 0.13343572616577148
+P:P+R (no shift) 0.4200785104185343
+P-2:P+R-2 0.41737900115549564
+teacher zeros frac 0.21574343740940094
+teacher slice verl zeros on masked?
+cand on mask0 first5 [-1.430348515510559, -2.768540143966675, -3.477991819381714, -1.663903832435608, -1.3678077459335327]
+cand on mask1 first5 [0.0, 0.0, -0.010004574432969093, -0.4328208863735199, 0.0]
+old on mask1 first5 [-0.2029467225074768, -0.030299300327897072, -0.0021914036478847265, -0.09298612177371979, 0.0]
+zero positions sample [450, 451, 454, 455, 458, 460, 462, 463, 467, 469, 470, 471, 472, 473, 474, 478, 480, 481, 486, 489] P= 451

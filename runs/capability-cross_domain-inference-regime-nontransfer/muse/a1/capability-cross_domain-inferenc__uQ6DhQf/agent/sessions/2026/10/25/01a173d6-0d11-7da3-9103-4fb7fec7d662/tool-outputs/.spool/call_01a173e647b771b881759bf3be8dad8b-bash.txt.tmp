@@ -1,0 +1,96 @@
+def _select_tokenizer(model: str, custom_tokenizer: CustomHuggingfaceTokenizer | None = None):
+    if custom_tokenizer is not None:
+        return _select_custom_tokenizer_helper(
+            identifier=custom_tokenizer["identifier"],
+            revision=custom_tokenizer["revision"],
+            auth_token=custom_tokenizer["auth_token"],
+            backend=_huggingface_tokenizer_backend(),
+        )
+    return _select_tokenizer_helper(model=model)
+
+
+def _huggingface_tokenizer_backend() -> Decision:
+    """The backend `tokenizer_dispatch.from_str` / `from_pretrained` will select right now.
+
+    Cached HuggingFace tokenizers are keyed on it, so flipping `LITELLM_RUST` or
+    `litellm.rust(...)` reaches a fresh object instead of the other backend's."""
+    return decision(tokenizer_dispatch.HUGGINGFACE_CONTEXT)
+
+
+@lru_cache(maxsize=DEFAULT_MAX_LRU_CACHE_SIZE)
+def _select_custom_tokenizer_helper(
+    identifier: str, revision: str, auth_token: str | None, backend: Decision
+) -> SelectTokenizerResponse:
+    verbose_logger.debug("Loading custom HuggingFace tokenizer %s (revision %s)", identifier, revision)
+    return create_pretrained_tokenizer(identifier=identifier, revision=revision, auth_token=auth_token)
+
+
+def _select_tokenizer_helper(model: str) -> SelectTokenizerResponse:
+    if litellm.disable_hf_tokenizer_download is True:
+        return _return_openai_tokenizer(model)
+
+    try:
+        result: Final = _return_huggingface_tokenizer(model)
+        if result is not None:
+            return result
+    except Exception as e:
+        from litellm.rust_bridge.fork_guard import ForkedAfterNativeRuntimeStarted, ProcessReservedForForking
+
+        if isinstance(e, (ForkedAfterNativeRuntimeStarted, ProcessReservedForForking)):
+            raise
+        verbose_logger.debug("Error selecting tokenizer: %s", e)
+
+    # default - tiktoken
+    return _return_openai_tokenizer(model)
+
+
+def _return_openai_tokenizer(model: str) -> SelectTokenizerResponse:
+    return {"type": "openai_tokenizer", "tokenizer": _get_default_encoding()}
+
+
+def uses_anthropic_tokenizer(model: str) -> bool:
+    return model in litellm.anthropic_models and "claude-3" not in model
+
+
+HuggingFaceTokenizerKind = Literal["cohere", "anthropic", "llama2", "llama3"]
+
+
+def huggingface_tokenizer_kind(model: str) -> HuggingFaceTokenizerKind | None:
+    """Which HuggingFace tokenizer `token_counter` selects for a model; `None` means tiktoken."""
+    if model in litellm.cohere_models and "command-r" in model:
+        return "cohere"
+    if uses_anthropic_tokenizer(model):
+        return "anthropic"
+    if "llama-2" in model.lower() or "replicate" in model.lower():
+        return "llama2"
+    if "llama-3" in model.lower():
+        return "llama3"
+    return None
+
+
+def _return_huggingface_tokenizer(model: str) -> SelectTokenizerResponse | None:
+    kind: Final = huggingface_tokenizer_kind(model)
+    if kind is None:
+        return None
+    return {
+        "type": "huggingface_tokenizer",
+        "tokenizer": _load_huggingface_tokenizer(kind, _huggingface_tokenizer_backend()),
+    }
+
+
+@lru_cache(maxsize=DEFAULT_MAX_LRU_CACHE_SIZE)
+def _load_huggingface_tokenizer(kind: HuggingFaceTokenizerKind, backend: Decision) -> HuggingFace:
+    """One tokenizer per kind and backend; `backend` is the cache key, the dispatch re-derives it."""
+    match kind:
+        case "cohere":
+            return tokenizer_dispatch.from_pretrained("Xenova/c4ai-command-r-v01-tokenizer")
+        case "anthropic":
+            return tokenizer_dispatch.anthropic()
+        case "llama2":
+            return tokenizer_dispatch.from_pretrained("hf-internal-testing/llama-tokenizer")
+        case "llama3":
+            return tokenizer_dispatch.from_pretrained("Xenova/llama-3-tokenizer")
+        case _:
+            assert_never(kind)
+
+

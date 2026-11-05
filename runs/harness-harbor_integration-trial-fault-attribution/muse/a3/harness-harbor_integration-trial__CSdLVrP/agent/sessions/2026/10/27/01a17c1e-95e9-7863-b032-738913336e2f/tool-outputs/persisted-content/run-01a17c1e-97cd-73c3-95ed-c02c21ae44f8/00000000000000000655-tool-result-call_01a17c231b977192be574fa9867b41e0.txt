@@ -1,0 +1,357 @@
+Read text file `/app/reference/harbor-0.23.0/harbor/agents/installed/mini_swe_agent.py`.
+(498 line(s) above)
+499|class MiniSweAgent(BaseInstalledAgent):
+500|    """
+501|    The Mini SWE Agent uses the mini-swe-agent tool to solve tasks.
+502|
+503|    For Modal Server sticky routing, pass
+504|    ``--ak 'session_id_headers=["Modal-Session-ID"]'``.
+505|    """
+506|
+507|    capabilities = AgentCapabilities(atif=True)
+508|    MODEL_CONNECTION = ModelConnectionSpec(
+509|        api_key_envs=("MSWEA_API_KEY",),
+510|        base_url_envs=("OPENAI_BASE_URL", "OPENAI_API_BASE"),
+511|        passthrough=True,
+512|    )
+513|
+514|    @property
+515|    @override
+516|    def model_connection(self) -> ResolvedModelConnection:
+517|        # mini-swe accepts either OpenAI base-URL alias; export both when set.
+518|        access = super().model_connection
+519|        url = access.configured_base_url
+520|        if url is None or not any(
+521|            key in access.env for key in ("OPENAI_BASE_URL", "OPENAI_API_BASE")
+522|        ):
+523|            return access
+524|        return replace(
+525|            access,
+526|            env={**access.env, "OPENAI_BASE_URL": url, "OPENAI_API_BASE": url},
+527|        )
+528|
+529|    options_model = MiniSweAgentOptions
+530|    options: MiniSweAgentOptions
+531|
+532|    def __init__(
+533|        self,
+534|        reasoning_effort: str | None = None,
+535|        max_tokens: int | None = None,
+536|        config_file: str | None = None,
+537|        config: dict[str, Any] | None = None,
+538|        litellm_model_registry_file: str | None = None,
+539|        litellm_model_registry: dict[str, Any] | None = None,
+540|        session_id_headers: list[str] | None = None,
+541|        *args: Any,
+542|        **kwargs: Any,
+543|    ) -> None:
+544|        coerced_max_tokens = self._coerce_max_tokens(max_tokens)
+545|        if config is not None and not isinstance(config, dict):
+546|            raise ValueError(
+547|                "Invalid value for 'config': expected a mapping, "
+548|                f"got {config.__class__.__name__}"
+549|            )
+550|        if config is not None and config_file is not None:
+551|            raise ValueError("'config' and 'config_file' are mutually exclusive")
+552|        config_yaml: str | None = None
+553|        if config is not None:
+554|            config_yaml = yaml.safe_dump(config, sort_keys=False)
+555|        elif config_file:
+556|            config_yaml = Path(config_file).read_text()
+557|        # LiteLLM model registry entries (litellm.utils.register_model format),
+558|        # e.g. to mark a model missing from LiteLLM's bundled model map as
+559|        # supporting reasoning_effort so it isn't silently dropped under
+560|        # drop_params. Named for the mini-swe-agent config key it feeds,
+561|        # `model.litellm_model_registry`, and to stay clear of harbor's own
+562|        # dataset/package registries.
+563|        litellm_model_registry_json: str | None = None
+564|        if litellm_model_registry is not None and litellm_model_registry_file:
+565|            raise ValueError(
+566|                "'litellm_model_registry' and 'litellm_model_registry_file' "
+567|                "are mutually exclusive"
+568|            )
+569|        if litellm_model_registry is not None or litellm_model_registry_file:
+570|            source = (
+571|                "litellm_model_registry_file"
+572|                if litellm_model_registry_file
+573|                else "litellm_model_registry"
+574|            )
+575|            # Decode the file on the host so a malformed registry fails here
+576|            # rather than silently no-opping in the container: mini-swe-agent
+577|            # only registers when the path parses as a model map.
+578|            registry = (
+579|                json.loads(Path(litellm_model_registry_file).read_text())
+580|                if litellm_model_registry_file
+581|                else litellm_model_registry
+582|            )
+583|            if not isinstance(registry, dict):
+584|                raise ValueError(
+585|                    f"Invalid value for {source!r}: expected a mapping, "
+586|                    f"got {registry.__class__.__name__}"
+587|                )
+588|            litellm_model_registry_json = json.dumps(registry, indent=2)
+589|        super().__init__(
+590|            *args,
+591|            reasoning_effort=reasoning_effort,
+592|            max_tokens=coerced_max_tokens,
+593|            config_file=config_file,
+594|            litellm_model_registry_file=litellm_model_registry_file,
+595|            litellm_model_registry=litellm_model_registry,
+596|            session_id_headers=session_id_headers,
+597|            **kwargs,
+598|        )
+599|        self._session_id_headers = validate_session_id_headers(
+600|            self.options.session_id_headers
+601|        )
+602|        self._config_yaml = config_yaml
+603|        self._litellm_model_registry_json = litellm_model_registry_json
+604|
+605|    @staticmethod
+606|    def _coerce_max_tokens(value: int | None) -> int | None:
+607|        if value is None:
+608|            return None
+609|        if isinstance(value, bool) or not isinstance(value, int):
+610|            raise ValueError("Invalid value for 'max_tokens': expected int")
+611|        if value <= 0:
+612|            raise ValueError("Invalid value for 'max_tokens': must be greater than 0")
+613|        return value
+614|
+615|    @staticmethod
+616|    @override
+617|    def name() -> str:
+618|        return AgentName.MINI_SWE_AGENT.value
+619|
+620|    @override
+621|    def get_version_command(self) -> str | None:
+622|        return (
+623|            'if [ -f "$HOME/.local/bin/env" ]; then . "$HOME/.local/bin/env"; '
+624|            'else export PATH="$HOME/.local/bin:$PATH"; fi; '
+625|            "uv tool list 2>/dev/null | grep mini-swe-agent"
+626|        )
+627|
+628|    @override
+629|    def parse_version(self, stdout: str) -> str:
+630|        # Output: "mini-swe-agent v0.1.2"
+631|        import re
+632|
+633|        match = re.search(r"(\d+\.\d+\S*)", stdout)
+634|        return match.group(1) if match else stdout.strip()
+635|
+636|    @override
+637|    async def install(self, environment: BaseEnvironment) -> None:
+638|        await self.ensure_system_dependencies(
+639|            environment,
+640|            ("curl", "bash", "build_tools", "git"),
+641|        )
+642|        version_spec = f"=={self._version}" if self._version else ""
+643|        python_version = shlex.quote(_MINI_SWE_AGENT_PYTHON_VERSION)
+644|        await self.exec_as_agent(
+645|            environment,
+646|            command=(
+647|                "set -euo pipefail; "
+648|                "if ! command -v uv >/dev/null 2>&1; then"
+649|                "  curl -LsSf https://astral.sh/uv/install.sh | sh;"
+650|                " fi && "
+651|                'if ! grep -q \'export PATH="$HOME/.local/bin:$PATH"\' "$HOME/.bashrc" 2>/dev/null; then'
+652|                '  echo \'export PATH="$HOME/.local/bin:$PATH"\' >> "$HOME/.bashrc";'
+653|                " fi && "
+654|                'if [ -f "$HOME/.local/bin/env" ]; then source "$HOME/.local/bin/env"; fi && '
+655|                'export PATH="$HOME/.local/bin:$PATH" && '
+656|                # Keep the agent toolchain independent from a task image's
+657|                # default Python; current dependencies require modern stdlib
+658|                # typing features.
+659|                f"uv python install {python_version} && "
+660|                # litellm's `proxy` extra is the only thing that pulls
+661|                # pyroscope-io, which publishes no musllinux wheel and whose
+662|                # sdist cannot be built standalone (its Cargo.toml points at
+663|                # ../../ffikit and ../../../ crates that the sdist omits). That
+664|                # makes agent setup fail on musl task images (Alpine). The extra
+665|                # was added for orjson/fastapi on the LiteLLM tools path, so
+666|                # request those directly instead of the whole extra.
+667|                f"uv tool install --python {python_version} "
+668|                f"mini-swe-agent{version_spec} "
+669|                "--with litellm --with orjson --with fastapi && "
+670|                "mini-swe-agent --help"
+671|            ),
+672|        )
+673|
+674|    @property
+675|    def _mini_swe_agent_trajectory_path(self) -> PurePosixPath:
+676|        """Path where mini-swe-agent writes its own trajectory format."""
+677|        return EnvironmentPaths.agent_dir / "mini-swe-agent.trajectory.json"
+678|
+679|    @property
+680|    def _atif_trajectory_path(self) -> PurePosixPath:
+681|        """Path where we write the ATIF-formatted trajectory."""
+682|        return EnvironmentPaths.agent_dir / "trajectory.json"
+683|
+684|    @override
+685|    def populate_context_post_run(self, context: AgentContext) -> None:
+686|        # Read the mini-swe-agent trajectory
+687|        mini_trajectory_path = self.logs_dir / "mini-swe-agent.trajectory.json"
+688|
+689|        if not mini_trajectory_path.exists():
+690|            self.logger.debug(
+691|                f"Mini-swe-agent trajectory file {mini_trajectory_path} does not exist"
+692|            )
+693|            return
+694|
+695|        try:
+696|            mini_trajectory = json.loads(mini_trajectory_path.read_text())
+697|        except Exception as e:
+698|            self.logger.debug(f"Failed to load mini-swe-agent trajectory: {e}")
+699|            return
+700|
+701|        # Extract token usage from mini-swe-agent format
+702|        n_input_tokens = 0
+703|        n_output_tokens = 0
+704|        n_cache_tokens = 0
+705|        total_cost = ((mini_trajectory.get("info") or {}).get("model_stats") or {}).get(
+706|            "instance_cost"
+707|        ) or 0
+708|        for message in mini_trajectory.get("messages") or []:
+709|            usage = _message_usage(message)
+710|            n_cache_tokens += usage["prompt_tokens_details"].get("cached_tokens") or 0
+711|            n_input_tokens += usage["prompt_tokens"]
+712|            n_output_tokens += usage["completion_tokens"]
+713|
+714|        context.n_input_tokens = n_input_tokens
+715|        context.n_output_tokens = n_output_tokens
+716|        context.n_cache_tokens = n_cache_tokens
+717|        context.cost_usd = total_cost
+718|
+719|        # Convert mini-swe-agent trajectory to ATIF format
+720|        atif_trajectory_path = self.logs_dir / "trajectory.json"
+721|        session_id = self.session_id or str(uuid.uuid4())
+722|        try:
+723|            convert_and_save_trajectory(
+724|                mini_swe_agent_trajectory_path=mini_trajectory_path,
+725|                atif_trajectory_path=atif_trajectory_path,
+726|                session_id=session_id,
+727|            )
+728|        except Exception as e:
+729|            self.logger.debug(f"Failed to convert trajectory to ATIF format: {e}")
+730|
+731|    @with_prompt_template
+732|    async def run(
+733|        self, instruction: str, environment: BaseEnvironment, context: AgentContext
+734|    ) -> None:
+735|        augmented_instruction = instruction
+736|        if self.mcp_servers:
+737|            mcp_info = "\n\nMCP Servers:\nThe following MCP servers are available for this task.\n"
+738|            for s in self.mcp_servers:
+739|                if s.transport == "stdio":
+740|                    args_str = " ".join(s.args)
+741|                    mcp_info += f"- {s.name}: stdio transport, command: {s.command} {args_str}\n"
+742|                else:
+743|                    mcp_info += f"- {s.name}: {s.transport} transport, url: {s.url}\n"
+744|            augmented_instruction = instruction + mcp_info
+745|
+746|        escaped_instruction = shlex.quote(augmented_instruction)
+747|
+748|        if not self.model_name or "/" not in self.model_name:
+749|            raise ValueError("Model name must be in the format provider/model_name")
+750|
+751|        access = self.model_connection
+752|        env = {
+753|            **access.env,
+754|            "MSWEA_CONFIGURED": "true",  # Disable interactive setup
+755|            "MSWEA_COST_TRACKING": "ignore_errors",  # Ignore unknown model costs
+756|        }
+757|
+758|        if access.api_key is None:
+759|            raise ValueError(
+760|                f"No API key found for model {self.model_name!r}. "
+761|                "Please set MSWEA_API_KEY or the provider's API key variable."
+762|            )
+763|
+764|        cli_flags = self.build_cli_flags()
+765|        extra_flags = (cli_flags + " ") if cli_flags else ""
+766|
+767|        # LiteLLM's chat-completion fallback is 600 seconds. We set it higher.
+768|        config_flags = f"-c model.model_kwargs.timeout={_DEFAULT_LITELLM_TIMEOUT_SEC} "
+769|
+770|        # Write custom config into the container if provided
+771|        if self._config_yaml:
+772|            config_path = "/tmp/mswea-config/custom.yaml"
+773|            heredoc_marker = f"MSWEA_CONFIG_EOF_{uuid.uuid4().hex[:8]}"
+774|            write_config_cmd = (
+775|                f"mkdir -p /tmp/mswea-config\n"
+776|                f"cat > '{config_path}' << '{heredoc_marker}'\n"
+777|                f"{self._config_yaml}\n"
+778|                f"{heredoc_marker}\n"
+779|            )
+780|            await self.exec_as_agent(environment, command=write_config_cmd, env=env)
+781|            config_flags += f"-c {config_path} "
+782|        if self._litellm_model_registry_json:
+783|            registry_path = "/tmp/mswea-config/registry.json"
+784|            heredoc_marker = f"MSWEA_REGISTRY_EOF_{uuid.uuid4().hex[:8]}"
+785|            write_registry_cmd = (
+786|                f"mkdir -p /tmp/mswea-config\n"
+787|                f"cat > '{registry_path}' << '{heredoc_marker}'\n"
+788|                f"{self._litellm_model_registry_json}\n"
+789|                f"{heredoc_marker}\n"
+790|            )
+791|            await self.exec_as_agent(environment, command=write_registry_cmd, env=env)
+792|            config_flags += f"-c model.litellm_model_registry={registry_path} "
+793|
+794|        if self.session_id:
+795|            header_names = (
+796|                self._session_id_headers
+797|                if self._session_id_headers is not None
+798|                else ["X-Session-ID"]
+799|            )
+800|            for header_name in header_names:
+801|                session_header_config = (
+802|                    f"model.model_kwargs.extra_headers.{header_name}={self.session_id}"
+803|                )
+804|                config_flags += f"-c {shlex.quote(session_header_config)} "
+805|
+806|        if self.options.reasoning_effort:
+807|            eff = shlex.quote(self.options.reasoning_effort)
+808|            if self.model_name.startswith("openai/"):
+809|                # OpenAI gpt-5.x rejects tools+reasoning_effort on
+810|                # /v1/chat/completions ("use /v1/responses instead").
+811|                # mini-swe-agent's LitellmResponseModel routes via
+812|                # litellm.responses(); effort is reasoning.effort there.
+813|                config_flags += (
+814|                    "-c model.model_class=litellm_response "
+815|                    f"-c model.model_kwargs.reasoning.effort={eff} "
+816|                )
+817|            else:
+818|                # LiteLLM maps top-level reasoning_effort to provider-native
+819|                # params (Anthropic output_config/thinking, Gemini
+820|                # thinking_level, etc.). Nesting under extra_body forwards a
+821|                # literal field that providers like Gemini reject.
+822|                config_flags += f"-c model.model_kwargs.reasoning_effort={eff} "
+823|
+824|        if self.options.max_tokens is not None:
+825|            token_key = (
+826|                "max_output_tokens"
+827|                if self.model_name.startswith("openai/")
+828|                and self.options.reasoning_effort
+829|                else "max_tokens"
+830|            )
+831|            config_flags += (
+832|                f"-c model.model_kwargs.{token_key}={self.options.max_tokens} "
+833|            )
+834|
+835|        # mini-swe-agent v2's -c is a *spec list*, not a merge-over-defaults:
+836|        # any -c suppresses the packaged config/mini.yaml (system_template etc).
+837|        # Prepend the builtin so dotted/file overrides layer on top of it.
+838|        # Bare "mini" resolves via mini-swe's own get_config_path() to
+839|        # builtin_config_dir/mini.yaml regardless of install location.
+840|        config_flags = "-c mini " + config_flags
+841|
+842|        await self.exec_as_agent(
+843|            environment,
+844|            command=(
+845|                'if [ -f "$HOME/.local/bin/env" ]; then . "$HOME/.local/bin/env"; '
+846|                'else export PATH="$HOME/.local/bin:$PATH"; fi; '
+847|                f"mini-swe-agent --yolo --model={self.model_name} --task={escaped_instruction} "
+848|                f"--output={self._mini_swe_agent_trajectory_path} {extra_flags}"
+849|                f"{config_flags}"
+850|                f"--exit-immediately 2>&1 </dev/null | tee /logs/agent/mini-swe-agent.txt"
+851|            ),
+852|            env=env,
+853|        )

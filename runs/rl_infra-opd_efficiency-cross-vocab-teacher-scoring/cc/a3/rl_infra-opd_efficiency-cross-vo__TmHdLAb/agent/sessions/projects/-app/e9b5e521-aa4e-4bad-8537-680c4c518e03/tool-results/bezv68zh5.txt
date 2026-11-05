@@ -1,0 +1,585 @@
+=== check_books.py
+"""Hooks' cross-vocab teacher_log_probs vs. a local recomputation with the fake teacher's ScoreFn (seed 0)."""
+import asyncio, sys, torch, time, math
+sys.path.insert(0, '/app/miles'); sys.path.insert(0, '/app/tools')
+import replay_opd, fake_teacher
+from miles.utils.types import Sample
+from examples.terminal_opd import teacher_scoring as ts
+score = fake_teacher.ScoreFn(0)
+reward_func, post = replay_opd.load_hooks()
+port = {'qwen3': 30020, 'falcon': 30021}
+for teacher, cfgs in [('qwen3', {'mswea': 'qwen3-8b', 'terminus_think': 'qwen3-8b-think', 'sql': 'qwen3-8b'}),
+                      ('falcon', {'mswea': 'falcon-h1r-7b', 'terminus_think': 'falcon-h1r-7b', 'sql': 'falcon-h1r-7b'})]:
+    for kind, cfg in cfgs.items():
+        rows = torch.load(f'/app/data/rollouts/{kind}/rollout_0.pt', map_location='cpu', weights_only=True)['samples']
+        samples = [Sample.from_dict(r) for r in rows]
+        args = replay_opd.build_args(f'/app/launch/teachers/{cfg}.yaml', f'http://127.0.0.1:{port[teacher]}/generate')
+        t0 = time.time()
+        asyncio.run(replay_opd.score_all(args, samples, reward_func))
+        stats = [s.reward['teacher'] for s in samples]
+        raw, rew = post(args, samples)
+        dt = time.time() - t0
+        tok = ts._tokenizers(args.hf_checkpoint, args.teacher_tokenizer_path)
+        worst = 0.0; n_req = 0; n_turns = 0
+        for s, st in zip(samples, stats):
+            msgs, tools = ts._conversation(args, s); turns = ts._turns(s, msgs)
+            views = ts._views(tok, msgs, tools, dict(args.opd_teacher_chat_template_kwargs or {}), turns)
+            scores = []
+            for v in views:
+                lp = score(v.prompt_ids + v.turn_ids)
+                scores.append([float(x) for x in lp[len(v.prompt_ids):]])
+            expected, judged = ts._teacher_log_probs(tok, s, turns, views, scores)
+            got = s.teacher_log_probs.tolist()
+            assert len(got) == s.response_length == len(expected)
+            worst = max(worst, max(abs(a - b) for a, b in zip(got, torch.tensor(expected, dtype=torch.float32).tolist())))
+            assert judged == st['judged_tokens']
+            n_req += st['requests']; n_turns += len(turns)
+        cov = [s.metadata['opd_teacher_coverage'] for s in samples]
+        print(f'{teacher:6s} {kind:15s} {len(samples)} samples {dt:5.1f}s  max|diff|={worst:.2e}  turns={n_turns} requests={n_req}  coverage mean={sum(cov)/len(cov):.4f} min={min(cov):.4f}')
+=== check_pairs.py
+import sys, json, torch, collections
+sys.path.insert(0, '/app/miles'); sys.path.insert(0, '/app/tools')
+import replay_opd
+from miles.utils.types import Sample
+from examples.terminal_opd import teacher_scoring as ts, token_alignment as ta
+cfg_for = {'mswea': sys.argv[2], 'terminus_think': sys.argv[3], 'sql': sys.argv[2]}
+tpath = sys.argv[1]
+glue = collections.Counter(); kinds = collections.Counter()
+for kind in ['mswea', 'terminus_think', 'sql']:
+    args = replay_opd.build_args(f'/app/launch/teachers/{cfg_for[kind]}.yaml', 'x')
+    tok = ts._tokenizers(args.hf_checkpoint, args.teacher_tokenizer_path)
+    rows = torch.load(f'/app/data/rollouts/{kind}/rollout_0.pt', map_location='cpu', weights_only=True)['samples']
+    for r in rows:
+        s = Sample.from_dict(r)
+        msgs, tools = ts._conversation(args, s)
+        turns = ts._turns(s, msgs)
+        views = ts._views(tok, msgs, tools, dict(args.opd_teacher_chat_template_kwargs or {}), turns)
+        P0 = len(s.tokens) - s.response_length
+        for t, v in zip(turns, views):
+            sp = ta.token_bytes(tok.student, s.tokens[P0 + t.start:P0 + t.end]); tp = ta.token_bytes(tok.teacher, v.turn_ids)
+            pairs = ta.chunks(ta.boundaries(sp), ta.boundaries(tp), ta.matching_blocks(b''.join(sp), b''.join(tp)))
+            for sl, sh, tl, th in pairs:
+                sb = b''.join(sp[sl:sh]); tb = b''.join(tp[tl:th])
+                if sb == tb:
+                    kinds['equal'] += 1
+                else:
+                    assert tb.endswith(sb), (sb, tb)
+                    glue[(tb[:-len(sb)] if sb else tb, sb[:20])] += 1
+                    kinds['glued'] += 1
+print(tpath, dict(kinds))
+for (ins, follow), n in glue.most_common(20):
+    print(f'   inserted {ins!r} before {follow!r}: {n}')
+=== check_runs.py
+import torch, json, collections, sys
+from transformers import AutoTokenizer
+tok = AutoTokenizer.from_pretrained('/models/Qwen3.5-2B')
+for kind in ['mswea', 'terminus_think', 'sql']:
+    d = torch.load(f'/app/data/rollouts/{kind}/rollout_0.pt', map_location='cpu', weights_only=True)
+    stats = collections.Counter()
+    for si, r in enumerate(d['samples']):
+        toks = r['tokens']; R = r['response_length']; P = len(toks) - R
+        lm = r['loss_mask']; lps = r['rollout_log_probs']
+        runs = []
+        k = 0
+        while k < R:
+            if lm[k]:
+                a = k
+                while k < R and lm[k]: k += 1
+                runs.append((a, k))
+            else:
+                k += 1
+        msgs = r['metadata']['messages']
+        asst = [m for m in msgs if m['role'] == 'assistant']
+        # first assistant message index vs prompt
+        first_asst = next(i for i, m in enumerate(msgs) if m['role'] == 'assistant')
+        stats['samples'] += 1
+        stats['status:' + r['status']] += 1
+        if len(runs) != len(asst):
+            stats['runs!=asst'] += 1
+            print(kind, si, 'runs', len(runs), 'asst', len(asst), 'status', r['status'], 'last msg role', msgs[-1]['role'])
+        # masked positions log probs
+        masked_lp = [lps[i] for i in range(R) if not lm[i]]
+        stats['masked_lp_nonzero'] += sum(1 for x in masked_lp if x != 0.0)
+        stats['trained_lp_pos'] += sum(1 for i in range(R) if lm[i] and lps[i] > 0)
+        for (a, b), m in zip(runs, asst):
+            text = tok.decode(toks[P + a:P + b])
+            c = m.get('content') or ''
+            rc = m.get('reasoning_content')
+            ends_eos = toks[P + b - 1] == tok.convert_tokens_to_ids('<|im_end|>')
+            stats['turn'] += 1
+            stats['turn_ends_eos'] += ends_eos
+            if c and c not in text:
+                stats['content_not_in_run'] += 1
+                if stats['content_not_in_run'] <= 3:
+                    print('  CONTENT MISMATCH', kind, si, repr(c[:200]), '|||', repr(text[:200]))
+            if rc and rc not in text:
+                stats['reasoning_not_in_run'] += 1
+                if stats['reasoning_not_in_run'] <= 3:
+                    print('  REASONING MISMATCH', kind, si, repr(rc[:120]), '|||', repr(text[:120]))
+            if rc is not None:
+                stats['has_reasoning_field'] += 1
+                if text.startswith(rc + '</think>' + c) : stats['exact_r_think_c'] += 1
+            elif not m.get('tool_calls'):
+                if text == c + '<|im_end|>': stats['exact_c_eos'] += 1
+                elif text == c: stats['exact_c'] += 1
+        # check the prompt part = rendering of messages before first assistant
+    print(kind, dict(stats))
+=== check_same.py
+"""Same-tokenizer teacher: new hooks vs today's token-id path, bit for bit."""
+import asyncio, sys, torch, copy
+sys.path.insert(0, '/app/miles'); sys.path.insert(0, '/app/tools')
+import replay_opd
+from miles.utils.types import Sample
+from miles.rollout import on_policy_distillation as opd
+reward_func, post = replay_opd.load_hooks()
+url = 'http://127.0.0.1:30022/generate'
+for kind in ['mswea', 'terminus_think', 'sql']:
+    rows = torch.load(f'/app/data/rollouts/{kind}/rollout_0.pt', map_location='cpu', weights_only=True)['samples']
+    new = [Sample.from_dict(r) for r in rows]
+    ref = [Sample.from_dict(r) for r in rows]
+    args_new = replay_opd.build_args('/app/launch/teachers/qwen3.5-9b.yaml', url)
+    args_today = replay_opd.build_args(None, url)  # today's runs: no teacher YAML
+    asyncio.run(replay_opd.score_all(args_new, new, reward_func))
+    raw_new, rew_new = post(args_new, new)
+    async def today():
+        return await asyncio.gather(*(opd.reward_func(args_today, s) for s in ref))
+    replies = asyncio.run(today())
+    ok = 0
+    for s, s_ref, reply in zip(new, ref, replies):
+        expected = opd._teacher_sampled_log_probs(reply, s_ref.response_length)
+        assert torch.equal(s.teacher_log_probs, expected), (kind, s.index)
+        assert s.teacher_log_probs.dtype == torch.float32
+        ok += 1
+    # and the verdict rewards are untouched
+    ref2 = [Sample.from_dict(r) for r in rows]
+    for s, r in zip(ref2, replies): s.reward = {"verdict": float((s.metadata or {}).get("reward", 0.0) or 0.0), "teacher": r}
+    raw_ref, rew_ref = post(args_today, ref2)
+    assert raw_ref == raw_new and rew_ref == rew_new
+    print(kind, 'identical for', ok, 'samples; rewards identical')
+=== ends.py
+import sys, json, torch, collections
+sys.path.insert(0, '/app/miles'); sys.path.insert(0, '/app/tools')
+import replay_opd
+from miles.utils.types import Sample
+from examples.terminal_opd import teacher_scoring as ts, token_alignment as ta
+tpath_cfg = sys.argv[1]; kind = sys.argv[2]
+args = replay_opd.build_args(f'/app/launch/teachers/{tpath_cfg}.yaml', 'x')
+tok = ts._tokenizers(args.hf_checkpoint, args.teacher_tokenizer_path)
+rows = torch.load(f'/app/data/rollouts/{kind}/rollout_0.pt', map_location='cpu', weights_only=True)['samples']
+endings = collections.Counter(); eos_judged = collections.Counter()
+for r in rows:
+    s = Sample.from_dict(r)
+    msgs, tools = ts._conversation(args, s); turns = ts._turns(s, msgs)
+    views = ts._views(tok, msgs, tools, dict(args.opd_teacher_chat_template_kwargs or {}), turns)
+    P0 = len(s.tokens) - s.response_length
+    for t, v in zip(turns, views):
+        sp = ta.token_bytes(tok.student, s.tokens[P0 + t.start:P0 + t.end]); tp = ta.token_bytes(tok.teacher, v.turn_ids)
+        pairs = ta.chunks(ta.boundaries(sp), ta.boundaries(tp), ta.matching_blocks(b''.join(sp), b''.join(tp)))
+        last = len(sp) - 1
+        covered = {q: (sl, sh, tl, th) for sl, sh, tl, th in pairs for q in range(sl, sh)}
+        key = (sp[-2:] if len(sp) > 1 else sp, tuple(tp[-3:]))
+        endings[(tuple(x.decode('utf-8','replace') for x in sp[-2:]), tuple(x.decode('utf-8','replace') for x in tp[-3:]), last in covered, (last - 1) in covered)] += 1
+for k, n in endings.most_common(12):
+    print(n, k)
+=== eos_probe.py
+import json, sys, urllib.request, torch
+sys.path.insert(0, '/app/miles'); sys.path.insert(0, '/app/tools')
+import replay_opd
+from miles.utils.types import Sample
+from examples.terminal_opd import teacher_scoring as ts
+args = replay_opd.build_args('/app/launch/teachers/falcon-h1r-7b.yaml', 'http://127.0.0.1:30000/generate')
+tok = ts._tokenizers(args.hf_checkpoint, args.teacher_tokenizer_path)
+def post(ids, start):
+    p = {"input_ids": ids, "sampling_params": {"temperature": 0, "max_new_tokens": 0}, "return_logprob": True, "logprob_start_len": start}
+    req = urllib.request.Request(args.rm_url, data=json.dumps(p).encode(), headers={'Content-Type': 'application/json'})
+    return json.loads(urllib.request.urlopen(req, timeout=300).read())['meta_info']['input_token_logprobs']
+nl, eot = tok.teacher.encode('\n', add_special_tokens=False), tok.teacher.convert_tokens_to_ids('<|im_end|>')
+for kind, si in [('terminus_think', 0), ('mswea', 0), ('mswea', 6), ('sql', 0)]:
+    s = Sample.from_dict(torch.load(f'/app/data/rollouts/{kind}/rollout_0.pt', map_location='cpu', weights_only=True)['samples'][si])
+    msgs, tools = ts._conversation(args, s); turns = ts._turns(s, msgs)
+    views = ts._views(tok, msgs, tools, {}, turns)
+    rows = []
+    for k in range(min(4, len(views))):
+        v = views[k]
+        body = v.prompt_ids + v.turn_ids[:-1]  # without the teacher's <|im_end|>
+        assert v.turn_ids[-1] == eot
+        a = post(body + [eot], len(body) - 1)
+        b = post(body + nl + [eot], len(body) - 1)
+        rows.append((round(a[1][0], 2), round(b[1][0], 2), round(b[2][0], 2)))
+    print(kind, si, '[lp(<|im_end|>) , lp(\\n), lp(<|im_end|> after \\n)] per turn:', rows)
+=== live_small.py
+import asyncio, sys, torch, time
+sys.path.insert(0, '/app/miles'); sys.path.insert(0, '/app/tools')
+import replay_opd
+from miles.utils.types import Sample
+from examples.terminal_opd import teacher_scoring as ts
+reward_func, post = replay_opd.load_hooks()
+n = int(sys.argv[1]); conc = int(sys.argv[2])
+rec = {'prompt': 0, 'cached': 0, 'requests': 0, 'time': 0.0}
+orig = ts._post
+async def wrapped(args, payload):
+    t0 = time.time()
+    out = await orig(args, payload)
+    rec['time'] += time.time() - t0
+    if out is not None:
+        rec['prompt'] += out['meta_info'].get('prompt_tokens', 0); rec['cached'] += out['meta_info'].get('cached_tokens', 0); rec['requests'] += 1
+    return out
+ts._post = wrapped
+for kind in ['mswea', 'terminus_think', 'sql']:
+    rows = torch.load(f'/app/data/rollouts/{kind}/rollout_0.pt', map_location='cpu', weights_only=True)['samples'][:n]
+    samples = [Sample.from_dict(r) for r in rows]
+    args = replay_opd.build_args('/app/launch/teachers/falcon-h1r-7b.yaml', 'http://127.0.0.1:30000/generate')
+    for k in rec: rec[k] = 0
+    t0 = time.time()
+    asyncio.run(replay_opd.score_all(args, samples, reward_func, concurrency=conc))
+    raw, rew = post(args, samples)
+    dt = time.time() - t0
+    cov = [s.metadata['opd_teacher_coverage'] for s in samples]
+    d = [ (r - t) for s in samples for r, t, m in zip(s.rollout_log_probs, s.teacher_log_probs.tolist(), s.loss_mask) if m]
+    print(f'{kind:15s} {len(samples)} eps {dt:6.1f}s  requests={rec["requests"]} prompt_tokens={rec["prompt"]} cached={rec["cached"]} ({rec["cached"]/max(rec["prompt"],1):.2f})  tok/s={(rec["prompt"]-rec["cached"])/dt:.0f}  coverage={sum(cov)/len(cov):.4f}  mean(student-teacher) on trained={sum(d)/len(d):.3f}')
+=== live_tokens.py
+import asyncio, sys, torch
+sys.path.insert(0, '/app/miles'); sys.path.insert(0, '/app/tools')
+import replay_opd
+from miles.utils.types import Sample
+from transformers import AutoTokenizer
+reward_func, post = replay_opd.load_hooks()
+st = AutoTokenizer.from_pretrained('/models/Qwen3.5-2B')
+kind, si, turns = sys.argv[1], int(sys.argv[2]), [int(x) for x in sys.argv[3].split(',')]
+rows = torch.load(f'/app/data/rollouts/{kind}/rollout_0.pt', map_location='cpu', weights_only=True)['samples'][si:si+1]
+samples = [Sample.from_dict(r) for r in rows]
+args = replay_opd.build_args('/app/launch/teachers/falcon-h1r-7b.yaml', 'http://127.0.0.1:30000/generate')
+asyncio.run(replay_opd.score_all(args, samples, reward_func)); post(args, samples)
+s = samples[0]; P0 = len(s.tokens) - s.response_length
+runs = []; k = 0
+while k < s.response_length:
+    if s.loss_mask[k]:
+        a = k
+        while k < s.response_length and s.loss_mask[k]: k += 1
+        runs.append((a, k))
+    else: k += 1
+for ti in turns:
+    a, b = runs[ti]
+    print(f'--- turn {ti}: token | student lp | teacher lp')
+    idx = list(range(a, min(b, a + 14))) + ([None] if b - a > 24 else []) + list(range(max(a + 14, b - 10), b))
+    for p in idx:
+        if p is None: print('   ...'); continue
+        t = s.teacher_log_probs[p].item(); r = s.rollout_log_probs[p]
+        print(f'   {st.decode([s.tokens[P0 + p]])!r:28s} {r:8.3f} {t:8.3f}{"   (no signal)" if t == r else ""}')
+=== odd.py
+import torch, json
+from transformers import AutoTokenizer
+tok = AutoTokenizer.from_pretrained('/models/Qwen3.5-2B')
+def runs_of(lm):
+    R = len(lm); runs = []; k = 0
+    while k < R:
+        if lm[k]:
+            a = k
+            while k < R and lm[k]: k += 1
+            runs.append((a, k))
+        else: k += 1
+    return runs
+for kind in ['mswea', 'terminus_think', 'sql']:
+    d = torch.load(f'/app/data/rollouts/{kind}/rollout_0.pt', map_location='cpu', weights_only=True)
+    shown = 0
+    for si, r in enumerate(d['samples']):
+        toks = r['tokens']; R = r['response_length']; P = len(toks) - R
+        asst = [m for m in r['metadata']['messages'] if m['role'] == 'assistant']
+        for ti, ((a, b), m) in enumerate(zip(runs_of(r['loss_mask']), asst)):
+            text = tok.decode(toks[P + a:P + b])
+            c = m.get('content') or ''; rc = m.get('reasoning_content')
+            odd = False
+            if kind == 'terminus_think' and not text.startswith((rc or '') + '</think>' + c): odd = True
+            if kind != 'terminus_think' and rc is not None: odd = True
+            if odd and shown < 6:
+                shown += 1
+                print('====', kind, 'sample', si, 'turn', ti, 'status', r['status'], 'run len', b - a, 'keys', list(m.keys()))
+                print('  RUN :', repr(text[:300]), '...', repr(text[-150:]))
+                print('  RC  :', repr((rc or '')[:200]), '...', repr((rc or '')[-80:]))
+                print('  C   :', repr(c[:200]), '...', repr(c[-80:]))
+                if m.get('tool_calls'): print('  TC  :', json.dumps(m['tool_calls'])[:300])
+=== proto_align.py
+import sys, json, torch, time, collections
+sys.path.insert(0, '/app/miles')
+from transformers import AutoTokenizer
+from transformers.convert_slow_tokenizer import bytes_to_unicode
+from examples.terminal_opd import token_alignment as ta
+assert ta._bytes_to_unicode() == bytes_to_unicode()
+kind, tpath, kw = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
+limit = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+st = AutoTokenizer.from_pretrained('/models/Qwen3.5-2B')
+tt = AutoTokenizer.from_pretrained(tpath)
+eos = {tt.eos_token_id}
+try:
+    g = json.load(open(tpath + '/generation_config.json'))['eos_token_id']; eos |= set(g if isinstance(g, list) else [g])
+except FileNotFoundError: pass
+d = torch.load(f'/app/data/rollouts/{kind}/rollout_0.pt', map_location='cpu', weights_only=True)
+rows = d['samples'][:limit] if limit else d['samples']
+tot = collections.Counter(); t_align = t_render = t_tok = 0.0; maxlen = 0; total_view_tokens = 0
+worst = []
+for si, r in enumerate(rows):
+    msgs = r['metadata']['messages']; tools = r['metadata']['tools']
+    toks = r['tokens']; R = r['response_length']; P0 = len(toks) - R; lm = r['loss_mask']; lps = r['rollout_log_probs']
+    runs = []; k = 0
+    while k < R:
+        if lm[k]:
+            a = k
+            while k < R and lm[k]: k += 1
+            runs.append((a, k))
+        else: k += 1
+    asst = [i for i, m in enumerate(msgs) if m['role'] == 'assistant']
+    render = lambda m, gen: tt.apply_chat_template(m, tools=tools, tokenize=False, add_generation_prompt=gen, **kw)
+    pu = {'role': 'user', 'content': '?'}
+    bare = render([pu], False); gp = render([pu], True)[len(bare):]
+    for (a, b), m in zip(runs, asst):
+        t0 = time.time()
+        P = render(msgs[:m], True); assert P.endswith(gp)
+        turn = render([pu, msgs[m]], False)[len(bare):]
+        c = 0
+        while c < min(len(turn), len(gp)) and turn[c] == gp[c]: c += 1
+        C = turn[c:]
+        t1 = time.time()
+        pids = tt.encode(P, add_special_tokens=False); cids = tt.encode(C, add_special_tokens=False)
+        last = max([q for q, x in enumerate(cids) if x in eos], default=None)
+        if last is not None: cids = cids[:last + 1]
+        t2 = time.time()
+        maxlen = max(maxlen, len(pids) + len(cids)); total_view_tokens += len(pids) + len(cids)
+        sb = ta.token_bytes(st, toks[P0 + a:P0 + b]); tb = ta.token_bytes(tt, cids)
+        S = b''.join(sb); T = b''.join(tb)
+        blocks = ta.matching_blocks(S, T)
+        pairs = ta.chunks(ta.boundaries(sb), ta.boundaries(tb), blocks)
+        t3 = time.time()
+        t_render += t1 - t0; t_tok += t2 - t1; t_align += t3 - t2
+        n_cov = sum(sh - sl for sl, sh, _, _ in pairs)
+        n11 = sum(1 for sl, sh, tl, th in pairs if sh - sl == 1 and th - tl == 1)
+        tot['turns'] += 1; tot['student_tokens'] += b - a; tot['covered'] += n_cov; tot['pairs_1to1'] += n11
+        tot['pairs'] += len(pairs)
+        worst.append((n_cov / (b - a), si, m, b - a))
+        if t3 - t2 > 0.5: print('slow align', si, m, round(t3 - t2, 2), len(S), len(T))
+print(kind, tpath, dict(tot), 'coverage %.4f' % (tot['covered'] / tot['student_tokens']))
+print('time render %.2f tok %.2f align %.2f' % (t_render, t_tok, t_align), 'max view len', maxlen, 'total view tokens', total_view_tokens)
+worst.sort()
+print('worst turns', worst[:8])
+=== proto_views.py
+import sys, json, torch, time
+from transformers import AutoTokenizer
+kind, si, tpath, kw = sys.argv[1], int(sys.argv[2]), sys.argv[3], json.loads(sys.argv[4])
+turns_to_show = [int(x) for x in sys.argv[5].split(',')]
+st = AutoTokenizer.from_pretrained('/models/Qwen3.5-2B')
+tt = AutoTokenizer.from_pretrained(tpath)
+d = torch.load(f'/app/data/rollouts/{kind}/rollout_0.pt', map_location='cpu', weights_only=True)
+r = d['samples'][si]
+msgs = r['metadata']['messages']; tools = r['metadata']['tools']
+def render(m, gen):
+    return tt.apply_chat_template(m, tools=tools, tokenize=False, add_generation_prompt=gen, **kw)
+probe_u = {'role': 'user', 'content': '?'}
+bare = render([probe_u], False); gen = render([probe_u], True)
+assert gen.startswith(bare); gp = gen[len(bare):]
+print('GEN PROMPT', repr(gp))
+asst = [i for i, m in enumerate(msgs) if m['role'] == 'assistant']
+t0 = time.time()
+for ti, m in enumerate(asst):
+    P = render(msgs[:m], True)
+    assert P.endswith(gp), (ti, repr(P[-80:]))
+    F = render([probe_u, msgs[m]], False)
+    assert F.startswith(bare)
+    turn = F[len(bare):]
+    k = 0
+    while k < min(len(turn), len(gp)) and turn[k] == gp[k]: k += 1
+    C = turn[k:]
+    if ti in turns_to_show:
+        print(f'--- turn {ti} (msg {m}) P tail:', repr(P[-150:]))
+        print('    C:', repr(C[:400]), '...', repr(C[-120:]))
+print('render time', time.time() - t0, 'turns', len(asst))
+=== show_align.py
+import sys, json, torch
+sys.path.insert(0, '/app/miles')
+from transformers import AutoTokenizer
+from examples.terminal_opd import token_alignment as ta
+kind, si, ti, tpath, kw = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4], json.loads(sys.argv[5])
+st = AutoTokenizer.from_pretrained('/models/Qwen3.5-2B'); tt = AutoTokenizer.from_pretrained(tpath)
+eos = {tt.eos_token_id}
+try:
+    g = json.load(open(tpath + '/generation_config.json'))['eos_token_id']; eos |= set(g if isinstance(g, list) else [g])
+except FileNotFoundError: pass
+r = torch.load(f'/app/data/rollouts/{kind}/rollout_0.pt', map_location='cpu', weights_only=True)['samples'][si]
+msgs = r['metadata']['messages']; tools = r['metadata']['tools']
+toks = r['tokens']; R = r['response_length']; P0 = len(toks) - R; lm = r['loss_mask']
+runs = []; k = 0
+while k < R:
+    if lm[k]:
+        a = k
+        while k < R and lm[k]: k += 1
+        runs.append((a, k))
+    else: k += 1
+asst = [i for i, m in enumerate(msgs) if m['role'] == 'assistant']
+render = lambda m, gen: tt.apply_chat_template(m, tools=tools, tokenize=False, add_generation_prompt=gen, **kw)
+pu = {'role': 'user', 'content': '?'}
+bare = render([pu], False); gp = render([pu], True)[len(bare):]
+(a, b), m = runs[ti], asst[ti]
+turn = render([pu, msgs[m]], False)[len(bare):]
+c = 0
+while c < min(len(turn), len(gp)) and turn[c] == gp[c]: c += 1
+C = turn[c:]
+cids = tt.encode(C, add_special_tokens=False)
+last = max([q for q, x in enumerate(cids) if x in eos], default=None)
+if last is not None: cids = cids[:last + 1]
+sb = ta.token_bytes(st, toks[P0 + a:P0 + b]); tb = ta.token_bytes(tt, cids)
+S = b''.join(sb); T = b''.join(tb)
+blocks = ta.matching_blocks(S, T)
+print('BLOCKS', [(i, j, n, S[i:i+n][:30]) for i, j, n in blocks])
+pairs = ta.chunks(ta.boundaries(sb), ta.boundaries(tb), blocks)
+cov = {}
+for sl, sh, tl, th in pairs:
+    for q in range(sl, sh): cov[q] = (sl, sh, tl, th)
+out = []
+for q, piece in enumerate(sb):
+    if q in cov:
+        sl, sh, tl, th = cov[q]
+        tag = '' if (sh - sl == 1 and th - tl == 1) else f'[{sh-sl}:{th-tl}]'
+        out.append(f'\033[32m{piece.decode("utf-8", "replace")!r}{tag}\033[0m')
+    else:
+        out.append(f'\033[31m{piece.decode("utf-8", "replace")!r}\033[0m')
+print(' '.join(out))
+print('TEACHER:', ' '.join(repr(p.decode('utf-8', 'replace')) for p in tb))
+=== show.py
+import sys, json, torch
+from transformers import AutoTokenizer
+kind, idx = sys.argv[1], int(sys.argv[2])
+tok = AutoTokenizer.from_pretrained('/models/Qwen3.5-2B')
+d = torch.load(f'/app/data/rollouts/{kind}/rollout_0.pt', map_location='cpu', weights_only=True)
+r = d['samples'][idx]
+md = r['metadata']
+print('prompt type', type(r['prompt']), repr(r['prompt'])[:300])
+print('meta:', {k: v for k, v in md.items() if k not in ('messages', 'tools')})
+print('tools:', json.dumps(md['tools'])[:1500])
+print('n messages', len(md['messages']))
+for i, m in enumerate(md['messages']):
+    print(f'--- msg {i} role={m.get("role")} keys={list(m.keys())}')
+    for k, v in m.items():
+        if k == 'role': continue
+        print(f'   {k}: {json.dumps(v)[:600]}')
+toks = r['tokens']; R = r['response_length']; P = len(toks) - R
+print('prompt len', P, 'resp len', R)
+print('PROMPT TEXT (repr, tail):', repr(tok.decode(toks[:P]))[-600:])
+# segments of response by loss mask
+lm = r['loss_mask']
+segs = []
+start = 0
+for k in range(1, R + 1):
+    if k == R or lm[k] != lm[start]:
+        segs.append((start, k, lm[start]))
+        start = k
+for a, b, m in segs[:int(sys.argv[3]) if len(sys.argv) > 3 else 12]:
+    print(f'[{a}:{b}] mask={m} :', repr(tok.decode(toks[P + a:P + b]))[:800])
+=== sim_teacher.py
+"""Run the cross-vocab hooks with a simulated teacher: a real tokenizer with another family's chat template."""
+import asyncio, sys, torch, dataclasses, json
+sys.path.insert(0, '/app/miles'); sys.path.insert(0, '/app/tools')
+import replay_opd, fake_teacher
+from miles.utils.types import Sample
+from examples.terminal_opd import teacher_scoring as ts
+tok_path, template_path, eos_text, kind = sys.argv[1:5]
+limit = int(sys.argv[5]) if len(sys.argv) > 5 else 4
+args = replay_opd.build_args(None, 'local')
+args.teacher_tokenizer_path = tok_path; args.opd_teacher_chat_template_kwargs = {}
+base = ts._tokenizers(args.hf_checkpoint, tok_path)
+import copy
+teacher = copy.deepcopy(base.teacher); teacher.chat_template = open(template_path).read()
+eos_id = teacher.convert_tokens_to_ids(eos_text)
+sim = dataclasses.replace(base, teacher=teacher, teacher_eos_ids=frozenset([eos_id]), teacher_eos_texts=frozenset([eos_text]))
+ts._tokenizers = lambda *a: sim
+score = fake_teacher.ScoreFn(0)
+async def local_post(args, payload):
+    ids, s = payload['input_ids'], payload['logprob_start_len']
+    lp = score(ids)
+    e = [[float(lp[i]), ids[i], None] for i in range(s, len(ids))]; e[0][0] = None
+    return {'meta_info': {'input_token_logprobs': e}}
+ts._post = local_post
+rows = torch.load(f'/app/data/rollouts/{kind}/rollout_0.pt', map_location='cpu', weights_only=True)['samples'][:limit]
+for r in rows:
+    s = Sample.from_dict(r)
+    try:
+        out = asyncio.run(ts.reward_func_cross_vocab(args, s))
+    except Exception as e:
+        print('index', s.index, 'ERROR', type(e).__name__, str(e)[:150]); continue
+    msgs, tools = ts._conversation(args, s); turns = ts._turns(s, msgs)
+    views = ts._views(sim, msgs, tools, {}, turns)
+    print('index', s.index, 'turns', len(turns), 'requests', out['requests'], 'coverage %.4f' % (out['judged_tokens'] / out['trained_tokens']))
+v = views[min(1, len(views) - 1)]
+print('PROMPT tail:', repr(teacher.decode(v.prompt_ids)[-160:]))
+print('TURN:', repr(teacher.decode(v.turn_ids)[:200]), '...', repr(teacher.decode(v.turn_ids)[-60:]))
+print('PROMPT head:', repr(teacher.decode(v.prompt_ids[:12])))
+=== slow.py
+import torch, json, sys, time
+sys.path.insert(0, '/app/miles')
+from transformers import AutoTokenizer
+from examples.terminal_opd import token_alignment as ta
+st = AutoTokenizer.from_pretrained('/models/Qwen3.5-2B'); tt = AutoTokenizer.from_pretrained('/models/Qwen3-8B')
+d = torch.load('/app/data/rollouts/mswea/rollout_0.pt', map_location='cpu', weights_only=True)
+pu = {'role': 'user', 'content': '?'}
+render = lambda ms, gen: tt.apply_chat_template(ms, tokenize=False, add_generation_prompt=gen, enable_thinking=False)
+bare = render([pu], False); gp = render([pu], True)[len(bare):]
+for si, r in enumerate(d['samples']):
+    msgs = r['metadata']['messages']
+    toks = r['tokens']; R = r['response_length']; P0 = len(toks) - R; lm = r['loss_mask']
+    runs = []; k = 0
+    while k < R:
+        if lm[k]:
+            a = k
+            while k < R and lm[k]: k += 1
+            runs.append((a, k))
+        else: k += 1
+    asst = [i for i, mm in enumerate(msgs) if mm['role'] == 'assistant']
+    for ti, ((a, b), mi) in enumerate(zip(runs, asst)):
+        sb = ta.token_bytes(st, toks[P0+a:P0+b]); S = b''.join(sb)
+        turn = render([pu, msgs[mi]], False)[len(bare):]
+        c = 0
+        while c < min(len(turn), len(gp)) and turn[c] == gp[c]: c += 1
+        T = b''.join(ta.token_bytes(tt, tt.encode(turn[c:], add_special_tokens=False)))
+        t0 = time.time(); bl = ta.matching_blocks(S, T); dt = time.time() - t0
+        if dt > 0.1:
+            h = 0
+            while h < min(len(S), len(T)) and S[h] == T[h]: h += 1
+            print(si, ti, mi, 'dt %.2f' % dt, len(S), len(T), 'blocks', len(bl), bl[:6])
+            print('   S@head', repr(S[max(0,h-60):h+80]))
+            print('   T@head', repr(T[max(0,h-60):h+80]))
+=== uncovered.py
+import sys, json, torch, collections
+sys.path.insert(0, '/app/miles'); sys.path.insert(0, '/app/tools')
+import replay_opd
+from miles.utils.types import Sample
+from examples.terminal_opd import teacher_scoring as ts, token_alignment as ta
+cfg, kind = sys.argv[1], sys.argv[2]
+args = replay_opd.build_args(f'/app/launch/teachers/{cfg}.yaml', 'x')
+tok = ts._tokenizers(args.hf_checkpoint, args.teacher_tokenizer_path)
+rows = torch.load(f'/app/data/rollouts/{kind}/rollout_0.pt', map_location='cpu', weights_only=True)['samples']
+unc = collections.Counter(); tot = 0; n_unc = 0
+for r in rows:
+    s = Sample.from_dict(r)
+    msgs, tools = ts._conversation(args, s); turns = ts._turns(s, msgs)
+    views = ts._views(tok, msgs, tools, dict(args.opd_teacher_chat_template_kwargs or {}), turns)
+    P0 = len(s.tokens) - s.response_length
+    for t, v in zip(turns, views):
+        sp = ta.token_bytes(tok.student, s.tokens[P0 + t.start:P0 + t.end]); tp = ta.token_bytes(tok.teacher, v.turn_ids)
+        pairs = ta.chunks(ta.boundaries(sp), ta.boundaries(tp), ta.matching_blocks(b''.join(sp), b''.join(tp)))
+        cov = {q for sl, sh, _, _ in pairs for q in range(sl, sh)}
+        for q, p in enumerate(sp):
+            tot += 1
+            if q not in cov:
+                n_unc += 1; unc[p.decode('utf-8', 'replace')] += 1
+print(cfg, kind, 'uncovered', n_unc, 'of', tot)
+print(unc.most_common(40))
+/tmp/work/orig:
+total 0
+drwxrwxr-x 1 agent agent  80 Oct 24 22:19 .
+drwxrwxr-x 1 agent agent 480 Oct 24 22:56 ..
+drwxr-xr-x 1 agent agent 120 Oct 20 18:03 teachers
+drwxr-xr-x 1 agent agent 180 Oct 20 18:03 terminal_opd
+
+/tmp/work/templates:
+total 6
+drwxrwxr-x 1 agent agent   80 Oct 24 22:52 .
+drwxrwxr-x 1 agent agent  480 Oct 24 22:56 ..
+-rw-rw-r-- 1 agent agent 2709 Oct 24 22:52 glm45.jinja
+-rw-rw-r-- 1 agent agent 2668 Oct 24 22:51 llama31.jinja

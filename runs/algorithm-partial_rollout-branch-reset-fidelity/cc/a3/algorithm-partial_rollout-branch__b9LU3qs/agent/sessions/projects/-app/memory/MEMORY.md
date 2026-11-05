@@ -1,0 +1,1 @@
+- [Branching reset design](branching-reset-design.md) — how reset(traj, k) restores exact rollout steps, its cache, expected verdicts and caveats

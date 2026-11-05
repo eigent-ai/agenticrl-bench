@@ -1,0 +1,1 @@
+- [TB2.1 deployment eval fixed](tb21-deployment-eval-fixed.md) — launcher rebuilt 2026-10-24; older deployment numbers invalid; base 2B needs re-run

@@ -1,0 +1,103 @@
+# Copyright 2024 PRIME team and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import asyncio
+import json
+import os
+
+import pytest
+
+from verl.utils.reward_score import default_compute_score, sandbox_fusion
+from verl.workers.reward_manager.prime import parallel_compute_score_async
+
+prime_math_answers = [
+    """\\begin{bmatrix}\n -7 & 6 & -8 \\\\\n 11 & -9 & 12 \\\\\n 15 & -16 & 19 \n \\end{bmatrix}""",
+    """\\frac{\\sqrt{505}}{7}""",
+    """x^2 + y^2 + 4x - 6y + 13""",
+]
+prime_math_gts = [
+    """\\begin{pmatrix}\n -7 & 6 & -8 \\\\\n 11 & -9 & 12 \\\\\n 15 & -16 & 19\n \\end{pmatrix}""",  # mat test
+    """\\frac{\\sqrt{505}}{7}""",  # frac test
+    """(x + 2)^2 + (y - 3)^2 """,  # symbolic test
+]
+
+prime_code_answers = [
+    """import sys
+from collections import deque
+
+def main():
+    data = sys.stdin.read().split()
+    it = iter(data)
+    
+    # Read start and target positions
+    x0, y0, x1, y1 = int(next(it)), int(next(it)), int(next(it)), int(next(it))
+    
+    n = int(next(it))
+    allowed = set()
+    # The total number of allowed cells is at most 10^5.
+    for _ in range(n):
+        r = int(next(it))
+        a = int(next(it))
+        b = int(next(it))
+        for c in range(a, b + 1):
+            allowed.add((r, c))
+    
+    # Directions for the king (8 neighboring cells)
+    directions = [(-1, -1), (-1, 0), (-1, 1),
+                  (0, -1),           (0, 1),
+                  (1, -1),  (1, 0),  (1, 1)]
+    
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import unittest
+from unittest.mock import patch
+
+from verl.utils.tracking import _MlflowLoggingAdapter
+
+
+class TestMlflowLoggingAdapter(unittest.TestCase):
+    def test_sanitize_key_and_warning(self):
+        """Test key sanitization for invalid characters and consecutive slashes with warnings."""
+        adapter = _MlflowLoggingAdapter()
+        data = {
+            "valid_key": 1.0,
+            "invalid@key!": 2.0,
+            "another/valid-key": 3.0,
+            "bad key#": 4.0,
+            "val-aux//reward/mean_at_1": 5.0,
+            "val-core///acc/best_at_5": 6.0,
+            "metric////with/many////slashes": 7.0,
+        }
+        # Patch mlflow.log_metrics to capture the metrics actually sent
+        with (
+            patch("mlflow.log_metrics") as mock_log_metrics,
+            patch.object(adapter, "logger") as mock_logger,
+        ):
+            adapter.log(data, step=5)
+            # Check that invalid characters are sanitized
+The task's tests failed (exit code 1). Test output:
+
+x SECRET

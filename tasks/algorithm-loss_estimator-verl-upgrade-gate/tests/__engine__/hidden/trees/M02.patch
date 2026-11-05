@@ -1,0 +1,179 @@
+diff -ruN '--exclude=__pycache__' base/verl/trainer/config/_generated_ppo_megatron_trainer.yaml M02/verl/trainer/config/_generated_ppo_megatron_trainer.yaml
+--- base/verl/trainer/config/_generated_ppo_megatron_trainer.yaml	2026-10-12 11:39:31.000000000 +0000
++++ M02/verl/trainer/config/_generated_ppo_megatron_trainer.yaml	2026-10-12 12:10:24.749067105 +0000
+@@ -654,7 +654,6 @@
+   data_loader_seed: ${oc.select:actor_rollout_ref.actor.data_loader_seed,null}
+   cliprange_value: 0.5
+   loss_agg_mode: ${oc.select:actor_rollout_ref.actor.loss_agg_mode,token-mean}
+-  loss_scale_factor: ${oc.select:actor_rollout_ref.actor.loss_scale_factor,null}
+   checkpoint:
+     _target_: verl.workers.config.McoreCheckpointConfig
+     save_contents:
+diff -ruN '--exclude=__pycache__' base/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml M02/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml
+--- base/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml	2026-10-12 11:39:31.000000000 +0000
++++ M02/verl/trainer/config/_generated_ppo_torchtitan_trainer.yaml	2026-10-12 12:10:24.749067105 +0000
+@@ -551,7 +551,6 @@
+   data_loader_seed: ${oc.select:actor_rollout_ref.actor.data_loader_seed,null}
+   cliprange_value: 0.5
+   loss_agg_mode: ${oc.select:actor_rollout_ref.actor.loss_agg_mode,token-mean}
+-  loss_scale_factor: ${oc.select:actor_rollout_ref.actor.loss_scale_factor,null}
+   checkpoint:
+     _target_: verl.trainer.config.CheckpointConfig
+     save_contents:
+diff -ruN '--exclude=__pycache__' base/verl/trainer/config/_generated_ppo_trainer.yaml M02/verl/trainer/config/_generated_ppo_trainer.yaml
+--- base/verl/trainer/config/_generated_ppo_trainer.yaml	2026-10-12 11:39:31.000000000 +0000
++++ M02/verl/trainer/config/_generated_ppo_trainer.yaml	2026-10-12 12:10:24.749067105 +0000
+@@ -616,7 +616,6 @@
+   data_loader_seed: 42
+   cliprange_value: 0.5
+   loss_agg_mode: ${oc.select:actor_rollout_ref.actor.loss_agg_mode,token-mean}
+-  loss_scale_factor: ${oc.select:actor_rollout_ref.actor.loss_scale_factor,null}
+   checkpoint:
+     _target_: verl.trainer.config.CheckpointConfig
+     save_contents:
+diff -ruN '--exclude=__pycache__' base/verl/trainer/config/_generated_ppo_veomni_trainer.yaml M02/verl/trainer/config/_generated_ppo_veomni_trainer.yaml
+--- base/verl/trainer/config/_generated_ppo_veomni_trainer.yaml	2026-10-12 11:39:31.000000000 +0000
++++ M02/verl/trainer/config/_generated_ppo_veomni_trainer.yaml	2026-10-12 12:10:24.749067105 +0000
+@@ -591,7 +591,6 @@
+   data_loader_seed: ${oc.select:actor_rollout_ref.actor.data_loader_seed,null}
+   cliprange_value: 0.5
+   loss_agg_mode: ${oc.select:actor_rollout_ref.actor.loss_agg_mode,token-mean}
+-  loss_scale_factor: ${oc.select:actor_rollout_ref.actor.loss_scale_factor,null}
+   checkpoint:
+     _target_: verl.trainer.config.CheckpointConfig
+     save_contents:
+diff -ruN '--exclude=__pycache__' base/verl/trainer/config/critic/critic.yaml M02/verl/trainer/config/critic/critic.yaml
+--- base/verl/trainer/config/critic/critic.yaml	2026-10-12 11:39:31.000000000 +0000
++++ M02/verl/trainer/config/critic/critic.yaml	2026-10-12 12:10:24.749067105 +0000
+@@ -63,10 +63,6 @@
+ # Loss aggregation mode: "token-mean", "seq-mean-token-sum", or "seq-mean-token-mean"
+ loss_agg_mode: ${oc.select:actor_rollout_ref.actor.loss_agg_mode,token-mean}
+ 
+-# Scale factor for "seq-mean-token-sum-norm" loss aggregation mode.
+-# If null, uses response_length. Set to a constant to ensure consistent normalization.
+-loss_scale_factor: ${oc.select:actor_rollout_ref.actor.loss_scale_factor,null}
+-
+ # checkpoint configs
+ checkpoint:
+ 
+diff -ruN '--exclude=__pycache__' base/verl/trainer/ppo/core_algos.py M02/verl/trainer/ppo/core_algos.py
+--- base/verl/trainer/ppo/core_algos.py	2026-10-12 11:39:31.000000000 +0000
++++ M02/verl/trainer/ppo/core_algos.py	2026-10-12 12:10:24.749067105 +0000
+@@ -2129,10 +2129,6 @@
+     response_mask: torch.Tensor,
+     cliprange_value: float,
+     loss_agg_mode: str = "token-mean",
+-    dp_size: int = 1,
+-    batch_num_tokens: Optional[int] = None,
+-    global_batch_size: Optional[int] = None,
+-    loss_scale_factor: Optional[int] = None,
+ ):
+     """
+     Compute the clipped value-function loss for PPO.
+@@ -2152,15 +2148,6 @@
+             Clip range for value prediction updates.
+         loss_agg_mode (str, optional):
+             Aggregation mode for `agg_loss`. Defaults to "token-mean".
+-        dp_size (int, optional):
+-            Data parallel size, forwarded to `agg_loss` for global-batch normalization. Defaults to 1.
+-        batch_num_tokens (Optional[int], optional):
+-            Number of valid tokens in the global batch, forwarded to `agg_loss`. Defaults to None
+-            (normalize by the local micro-batch token count).
+-        global_batch_size (Optional[int], optional):
+-            Global batch size, forwarded to `agg_loss` for the seq-mean modes. Defaults to None.
+-        loss_scale_factor (Optional[int], optional):
+-            Scale factor for the "seq-mean-token-sum-norm" mode, forwarded to `agg_loss`. Defaults to None.
+ 
+     Returns:
+         vf_loss (torch.FloatTensor):
+@@ -2172,15 +2159,7 @@
+     vf_losses1 = (vpreds - returns) ** 2
+     vf_losses2 = (vpredclipped - returns) ** 2
+     clipped_vf_losses = torch.max(vf_losses1, vf_losses2)
+-    vf_loss = 0.5 * agg_loss(
+-        loss_mat=clipped_vf_losses,
+-        loss_mask=response_mask,
+-        loss_agg_mode=loss_agg_mode,
+-        dp_size=dp_size,
+-        batch_num_tokens=batch_num_tokens,
+-        global_batch_size=global_batch_size,
+-        loss_scale_factor=loss_scale_factor,
+-    )
++    vf_loss = 0.5 * agg_loss(loss_mat=clipped_vf_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+     vf_clipfrac = verl_F.masked_mean(torch.gt(vf_losses2, vf_losses1).float(), response_mask)
+     return vf_loss, vf_clipfrac
+ 
+diff -ruN '--exclude=__pycache__' base/verl/workers/config/critic.py M02/verl/workers/config/critic.py
+--- base/verl/workers/config/critic.py	2026-10-12 11:39:31.000000000 +0000
++++ M02/verl/workers/config/critic.py	2026-10-12 12:10:24.749067105 +0000
+@@ -62,7 +62,6 @@
+         shuffle (bool): Shuffle training data across PPO epochs.
+         cliprange_value (float): PPO value function clipping range.
+         loss_agg_mode (str): Loss aggregation mode.
+-        loss_scale_factor (Optional[int]): Scale factor for 'seq-mean-token-sum-norm' loss aggregation mode.
+         checkpoint (Dict[str, Any]): Checkpoint configuration.
+         profiler (Dict[str, Any]): Profiler configuration.
+         enable (Optional[bool]): Whether to enable the critic.
+@@ -92,7 +91,6 @@
+     shuffle: bool = True
+     cliprange_value: float = 0.5
+     loss_agg_mode: str = "token-mean"
+-    loss_scale_factor: Optional[int] = None
+     ppo_micro_batch_size: Optional[int] = None
+     engine: BaseConfig = field(default_factory=BaseConfig)
+     optim: OptimizerConfig = field(default_factory=OptimizerConfig)
+diff -ruN '--exclude=__pycache__' base/verl/workers/utils/losses.py M02/verl/workers/utils/losses.py
+--- base/verl/workers/utils/losses.py	2026-10-12 11:39:31.000000000 +0000
++++ M02/verl/workers/utils/losses.py	2026-10-12 12:10:24.749067105 +0000
+@@ -158,25 +158,6 @@
+     """
+     vpreds = no_padding_2_padding(model_output["values"], data)  # (bsz, response_length)
+ 
+-    # Normalize the value loss over the global mini-batch (dp_size / batch_num_tokens /
+-    # global_batch_size) instead of the local micro-batch, so the accumulated critic gradient is
+-    # invariant to how the mini-batch is split into micro-batches (as the actor's ppo_loss does).
+-    dp_size = data["dp_size"]
+-    batch_num_tokens = data["batch_num_tokens"]
+-    global_batch_size = data["global_batch_size"]
+-
+-    # When the loss is normalized over the global batch, each micro-batch contributes a partial sum,
+-    # so the loss metric must be aggregated with SUM to reflect the global-batch mean.
+-    if (
+-        dp_size > 1
+-        or batch_num_tokens is not None
+-        or global_batch_size is not None
+-        or config.loss_scale_factor is not None
+-    ):
+-        metric_aggregation = AggregationType.SUM
+-    else:
+-        metric_aggregation = AggregationType.MEAN
+-
+     # select fields and convert to padded tensor
+     data = data.select("values", "returns", "response_mask").to_padded_tensor()
+     values = data["values"]
+@@ -190,16 +171,16 @@
+         response_mask=response_mask,
+         cliprange_value=config.cliprange_value,
+         loss_agg_mode=config.loss_agg_mode,
+-        dp_size=dp_size,
+-        batch_num_tokens=batch_num_tokens,
+-        global_batch_size=global_batch_size,
+-        loss_scale_factor=config.loss_scale_factor,
+     )
+ 
+-    metrics = {
+-        "critic/vf_loss": Metric(value=vf_loss, aggregation=metric_aggregation),
+-        "critic/vf_clipfrac": vf_clipfrac.detach().item(),
+-        "critic/vpred_mean": masked_mean(vpreds, response_mask).detach().item(),
+-    }
++    metrics = {}
++
++    metrics.update(
++        {
++            "critic/vf_loss": vf_loss.detach().item(),
++            "critic/vf_clipfrac": vf_clipfrac.detach().item(),
++            "critic/vpred_mean": masked_mean(vpreds, response_mask).detach().item(),
++        }
++    )
+ 
+     return vf_loss, metrics

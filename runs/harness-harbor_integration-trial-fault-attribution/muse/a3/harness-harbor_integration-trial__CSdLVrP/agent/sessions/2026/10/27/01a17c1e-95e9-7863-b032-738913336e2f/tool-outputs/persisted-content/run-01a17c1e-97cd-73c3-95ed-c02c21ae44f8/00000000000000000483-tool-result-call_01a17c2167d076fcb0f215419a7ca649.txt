@@ -1,0 +1,502 @@
+Read text file `/app/reference/harbor-0.23.0/harbor/llms/lite_llm.py`.
+1|import hashlib
+2|import json
+3|from pathlib import Path
+4|from typing import Any, NoReturn, override
+5|
+6|import litellm
+7|from litellm import CustomStreamWrapper, Message
+8|from litellm.exceptions import (
+9|    AuthenticationError as LiteLLMAuthenticationError,
+10|)
+11|from litellm.exceptions import (
+12|    BadRequestError as LiteLLMBadRequestError,
+13|)
+14|from litellm.exceptions import (
+15|    ContextWindowExceededError as LiteLLMContextWindowExceededError,
+16|)
+17|from litellm.litellm_core_utils.get_supported_openai_params import (
+18|    get_supported_openai_params,
+19|)
+20|from litellm.utils import get_model_info
+21|from pydantic import BaseModel
+22|from tenacity import (
+23|    retry,
+24|    retry_if_exception_type,
+25|    retry_if_not_exception_type,
+26|    stop_after_attempt,
+27|    wait_exponential,
+28|)
+29|
+30|from harbor.llms.base import (
+31|    BaseLLM,
+32|    ContextLengthExceededError,
+33|    LLMResponse,
+34|    OutputLengthExceededError,
+35|)
+36|from harbor.llms.utils import (
+37|    add_anthropic_caching,
+38|    split_provider_model_name,
+39|    validate_hosted_vllm_model_config,
+40|)
+41|from harbor.models.metric import UsageInfo
+42|from harbor.utils.logger import logger
+43|
+44|# This is used as a fallback for when the model does not support response_format
+45|
+46|STRUCTURED_RESPONSE_PROMPT_TEMPLATE = """
+47|You must respond in the following JSON format.
+48|
+49|Here is the json schema:
+50|
+51|```json
+52|{schema}
+53|```
+54|
+55|Here is the prompt:
+56|
+57|{prompt}
+58|"""
+59|
+60|
+61|class LiteLLM(BaseLLM):
+62|    def __init__(
+63|        self,
+64|        model_name: str,
+65|        temperature: float | None = None,
+66|        api_base: str | None = None,
+67|        session_id: str | None = None,
+68|        collect_rollout_details: bool = False,
+69|        max_thinking_tokens: int | None = None,
+70|        reasoning_effort: str | None = None,
+71|        model_info: dict[str, Any] | None = None,
+72|        use_responses_api: bool = False,
+73|        **kwargs,
+74|    ):
+75|        super().__init__()
+76|        self._model_name = model_name
+77|        self._llm_kwargs = kwargs
+78|        self._temperature = temperature
+79|        self._model_info = model_info
+80|        self._logger = logger.getChild(__name__)
+81|
+82|        hosted_vllm_validation: tuple[str, dict[str, Any]] | None = None
+83|        if "hosted_vllm" in model_name.lower():
+84|            hosted_vllm_validation = validate_hosted_vllm_model_config(
+85|                model_name, self._model_info
+86|            )
+87|
+88|        (
+89|            self._provider_prefix,
+90|            self._canonical_model_name,
+91|        ) = split_provider_model_name(model_name)
+92|
+93|        if hosted_vllm_validation is not None:
+94|            self._provider_prefix = "hosted_vllm"
+95|            self._canonical_model_name, self._model_info = hosted_vllm_validation
+96|
+97|        # Only use canonical model name for hosted_vllm; other providers like
+98|        # openrouter need the full prefixed name for LiteLLM lookups
+99|        self._litellm_model_name = (
+100|            self._canonical_model_name
+101|            if self._provider_prefix == "hosted_vllm"
+102|            else model_name
+103|        )
+104|
+105|        # Register custom model if model_info is provided
+106|        if self._model_info is not None:
+107|            try:
+108|                litellm.register_model({self._litellm_model_name: self._model_info})
+109|                self._logger.debug(
+110|                    f"Registered custom model '{model_name}' with info: {self._model_info}"
+111|                )
+112|            except Exception as e:
+113|                self._logger.warning(
+114|                    f"Failed to register custom model '{model_name}': {e}"
+115|                )
+116|
+117|        self._supported_params = get_supported_openai_params(self._litellm_model_name)
+118|        self._api_base = api_base
+119|        self._session_id = session_id
+120|        self._collect_rollout_details = collect_rollout_details
+121|        self._max_thinking_tokens = max_thinking_tokens
+122|        self._reasoning_effort = reasoning_effort
+123|
+124|        if self._supported_params is not None:
+125|            self._supports_response_format = "response_format" in self._supported_params
+126|        else:
+127|            self._supports_response_format = False
+128|
+129|        self._use_responses_api = use_responses_api
+130|        self._structured_response_prompt_template = STRUCTURED_RESPONSE_PROMPT_TEMPLATE
+131|
+132|    @property
+133|    def _lookup_model_name(self) -> str:
+134|        """Get the model name to use for lookups in LiteLLM's model database.
+135|
+136|        Returns the canonical model name (without provider prefix) if available,
+137|        otherwise falls back to the original model name.
+138|        """
+139|        return self._litellm_model_name or self._model_name
+140|
+141|    @property
+142|    def _display_name(self) -> str:
+143|        """Get a display name for logging that shows both canonical and original names if different."""
+144|        lookup_name = self._lookup_model_name
+145|        if lookup_name != self._model_name:
+146|            return f"{lookup_name} (from '{self._model_name}')"
+147|        return lookup_name
+148|
+149|    @override
+150|    def get_model_context_limit(self) -> int:
+151|        """Get the context limit (max input tokens) for the current model.
+152|
+153|        Returns:
+154|            int: The maximum input tokens the model can accept, or a fallback value if unavailable.
+155|        """
+156|        fallback_context_limit = 1000000
+157|
+158|        try:
+159|            model_info = get_model_info(self._lookup_model_name)
+160|            max_input_tokens = model_info.get("max_input_tokens")
+161|
+162|            # Fallback to max_tokens if max_input_tokens not available
+163|            if max_input_tokens is None:
+164|                max_input_tokens = model_info.get("max_tokens")
+165|
+166|            if max_input_tokens is not None:
+167|                return max_input_tokens
+168|
+169|            # Model info exists but doesn't have context limit info
+170|            self._logger.warning(
+171|                f"Model '{self._display_name}' info found but missing context limit fields. "
+172|                f"Using fallback context limit: {fallback_context_limit}"
+173|            )
+174|        except Exception as e:
+175|            self._logger.debug(
+176|                f"Failed to retrieve model info for '{self._display_name}': {e}. "
+177|                f"Using fallback context limit: {fallback_context_limit}"
+178|            )
+179|
+180|        return fallback_context_limit
+181|
+182|    @override
+183|    def get_model_output_limit(self) -> int | None:
+184|        """Get the output limit (max output tokens) for the current model.
+185|
+186|        Returns:
+187|            int | None: The maximum output tokens the model can generate, or None if unavailable.
+188|        """
+189|        try:
+190|            model_info = get_model_info(self._lookup_model_name)
+191|            max_output_tokens = model_info.get("max_output_tokens")
+192|
+193|            if max_output_tokens is None:
+194|                # Model info exists but doesn't have max_output_tokens
+195|                self._logger.debug(
+196|                    f"Model '{self._display_name}' info found but missing max_output_tokens field."
+197|                )
+198|
+199|            return max_output_tokens
+200|        except Exception as e:
+201|            self._logger.debug(
+202|                f"Failed to retrieve model info for '{self._display_name}': {e}."
+203|            )
+204|            return None
+205|
+206|    def _clean_value(self, value):
+207|        match value:
+208|            case _ if callable(value):
+209|                return None
+210|            case dict():
+211|                return {
+212|                    k: v
+213|                    for k, v in {
+214|                        k: self._clean_value(v) for k, v in value.items()
+215|                    }.items()
+216|                    if v is not None
+217|                }
+218|            case list():
+219|                return [
+220|                    self._clean_value(v)
+221|                    for v in value
+222|                    if self._clean_value(v) is not None
+223|                ]
+224|            case str() | int() | float() | bool():
+225|                return value
+226|            case _:
+227|                return str(value)
+228|
+229|    def _init_logger_fn(self, logging_path: Path):
+230|        def logger_fn(model_call_dict: dict[str, Any]):
+231|            clean_dict = self._clean_value(model_call_dict)
+232|            if isinstance(clean_dict, dict) and "api_key" in clean_dict:
+233|                hash_key = hashlib.sha256(clean_dict["api_key"].encode()).hexdigest()
+234|                clean_dict["api_key_sha256"] = hash_key
+235|                del clean_dict["api_key"]
+236|
+237|            if isinstance(clean_dict, dict) and "x-api-key" in clean_dict:
+238|                hash_key = hashlib.sha256(clean_dict["x-api-key"].encode()).hexdigest()
+239|                clean_dict["x-api-key_sha256"] = hash_key
+240|                del clean_dict["x-api-key"]
+241|
+242|            # Only save post_api_call (response) to preserve logprobs
+243|            # logger_fn is called multiple times with different event types, and
+244|            # write_text() overwrites the file each time. By filtering for
+245|            # post_api_call only, we ensure the response with logprobs is saved.
+246|            log_event_type = clean_dict.get("log_event_type", "unknown")
+247|            if log_event_type == "post_api_call":
+248|                logging_path.write_text(
+249|                    json.dumps(
+250|                        clean_dict,
+251|                        indent=4,
+252|                    )
+253|                )
+254|
+255|        return logger_fn
+256|
+257|    @retry(
+258|        stop=stop_after_attempt(3),
+259|        wait=wait_exponential(multiplier=1, min=4, max=15),
+260|        retry=(
+261|            # To avoid asyncio.CancelledError retries which inherits from BaseException
+262|            # rather than Exception
+263|            retry_if_exception_type(Exception)
+264|            & retry_if_not_exception_type(
+265|                (
+266|                    ContextLengthExceededError,
+267|                    OutputLengthExceededError,
+268|                    LiteLLMAuthenticationError,
+269|                )
+270|            )
+271|        ),
+272|        reraise=True,
+273|    )
+274|    @override
+275|    async def call(
+276|        self,
+277|        prompt: str,
+278|        message_history: list[dict[str, Any] | Message] = [],
+279|        response_format: dict[str, Any] | type[BaseModel] | None = None,
+280|        logging_path: Path | None = None,
+281|        **kwargs,
+282|    ) -> LLMResponse:
+283|        if self._use_responses_api:
+284|            return await self._call_responses(
+285|                prompt, message_history, response_format, logging_path, **kwargs
+286|            )
+287|
+288|        if response_format is not None and not self._supports_response_format:
+289|            if isinstance(response_format, dict):
+290|                schema = json.dumps(response_format, indent=2)
+291|            else:
+292|                schema = json.dumps(response_format.model_json_schema(), indent=2)
+293|            prompt = self._structured_response_prompt_template.format(
+294|                schema=schema, prompt=prompt
+295|            )
+296|            response_format = None
+297|
+298|        # Prepare messages with caching for Anthropic models
+299|        messages = message_history + [{"role": "user", "content": prompt}]
+300|        messages = add_anthropic_caching(messages, self._model_name)
+301|
+302|        try:
+303|            # Build completion_kwargs with all parameters
+304|            completion_kwargs = {
+305|                **self._build_base_kwargs(logging_path),
+306|                "messages": messages,
+307|                "response_format": response_format,
+308|                "reasoning_effort": self._reasoning_effort,
+309|            }
+310|            if self._temperature is not None:
+311|                completion_kwargs["temperature"] = self._temperature
+312|
+313|            # Add logprobs and return_token_ids if rollout details collection is enabled
+314|            if self._collect_rollout_details:
+315|                completion_kwargs["logprobs"] = True
+316|                # Request token IDs from provider (supported by vLLM)
+317|                # Note: Some providers (e.g., OpenAI) will reject this parameter, but we'll catch and retry without it
+318|                if "extra_body" not in completion_kwargs:
+319|                    completion_kwargs["extra_body"] = {}
+320|                extra_body: dict[str, Any] = completion_kwargs["extra_body"]  # ty: ignore[invalid-assignment]
+321|                extra_body["return_token_ids"] = True
+322|
+323|            # Add any additional kwargs, deep-merging extra_body to preserve
+324|            # internally-set fields (e.g., return_token_ids) when caller also
+325|            # passes extra_body via llm_call_kwargs.
+326|            if "extra_body" in completion_kwargs and "extra_body" in kwargs:
+327|                existing_extra_body: dict[str, Any] = completion_kwargs["extra_body"]  # ty: ignore[invalid-assignment]
+328|                new_extra_body: dict[str, Any] = kwargs.pop("extra_body")
+329|                completion_kwargs["extra_body"] = {
+330|                    **existing_extra_body,
+331|                    **new_extra_body,
+332|                }
+333|            elif "extra_body" in kwargs:
+334|                kwargs["extra_body"] = {**kwargs["extra_body"]}
+335|            completion_kwargs.update(kwargs)
+336|
+337|            # Add thinking parameter for Anthropic models if max_thinking_tokens is set
+338|            if self._max_thinking_tokens is not None and (
+339|                "anthropic" in self._model_name.lower()
+340|                or "claude" in self._model_name.lower()
+341|            ):
+342|                budget = self._max_thinking_tokens
+343|                if budget < 1024:
+344|                    self._logger.warning(
+345|                        f"max_thinking_tokens={budget} is below minimum of 1024. "
+346|                        "Using minimum value of 1024."
+347|                    )
+348|                    budget = 1024
+349|                completion_kwargs["thinking"] = {
+350|                    "type": "enabled",
+351|                    "budget_tokens": budget,
+352|                }
+353|
+354|            # Add session_id to extra_body if available
+355|            if self._session_id is not None:
+356|                if "extra_body" not in completion_kwargs:
+357|                    completion_kwargs["extra_body"] = {}
+358|                extra_body: dict[str, Any] = completion_kwargs["extra_body"]  # ty: ignore[invalid-assignment]
+359|                extra_body["session_id"] = self._session_id
+360|
+361|                # Also send the session id as the X-Session-ID HTTP header. Some routers like
+362|                # vLLM router (consistent_hash policy) key session affinity on this
+363|                # header
+364|                if "extra_headers" not in completion_kwargs:
+365|                    completion_kwargs["extra_headers"] = {}
+366|                extra_headers: dict[str, Any] = completion_kwargs["extra_headers"]  # ty: ignore[invalid-assignment]
+367|                extra_headers["X-Session-ID"] = self._session_id
+368|
+369|            try:
+370|                response = await litellm.acompletion(**completion_kwargs)
+371|            except LiteLLMBadRequestError as e:
+372|                # If provider (e.g., OpenAI) rejects extra_body parameters, retry without them
+373|                # Some providers reject custom parameters like: return_token_ids, session_id, etc.
+374|                error_msg = str(e)
+375|                if (
+376|                    "Unrecognized request argument" in error_msg
+377|                    and "extra_body" in completion_kwargs
+378|                ):
+379|                    rejected_params = []
+380|                    if "return_token_ids" in error_msg:
+381|                        rejected_params.append("return_token_ids")
+382|                    if "session_id" in error_msg:
+383|                        rejected_params.append("session_id")
+384|
+385|                    if rejected_params:
+386|                        self._logger.warning(
+387|                            f"Provider {self._model_name} rejected extra_body parameters: {', '.join(rejected_params)}. "
+388|                            f"Retrying without them. Token IDs will not be available."
+389|                        )
+390|                        extra_body_val = completion_kwargs.get("extra_body")
+391|                        if extra_body_val and isinstance(extra_body_val, dict):
+392|                            extra_body: dict[str, Any] = extra_body_val
+393|                            for param in rejected_params:
+394|                                if param in extra_body:
+395|                                    del extra_body[param]
+396|
+397|                            if not extra_body:
+398|                                del completion_kwargs["extra_body"]
+399|
+400|                        response = await litellm.acompletion(**completion_kwargs)
+401|                    else:
+402|                        raise e
+403|                else:
+404|                    raise e
+405|        except Exception as e:
+406|            self._handle_litellm_error(e)
+407|
+408|        if isinstance(response, CustomStreamWrapper):
+409|            raise NotImplementedError("Streaming is not supported for T bench yet")
+410|
+411|        # Extract usage information
+412|        usage_info = self._extract_usage_info(response)
+413|
+414|        # Extract and process token IDs if rollout details collection is enabled
+415|        prompt_token_ids = None
+416|        completion_token_ids = None
+417|        logprobs = None
+418|        extra = None
+419|
+420|        if self._collect_rollout_details:
+421|            prompt_token_ids, completion_token_ids = self._extract_token_ids(response)
+422|            logprobs = self._extract_logprobs(response)
+423|            extra = self._extract_provider_extra(response)
+424|
+425|        choice = response["choices"][0]
+426|        message = choice["message"]
+427|        content = message.get("content") or ""
+428|        reasoning_content = message.get("reasoning_content")
+429|
+430|        # Sometimes the LLM returns a response with a finish reason of "length"
+431|        # This typically means we hit the max_tokens limit, not the context window
+432|        if choice.get("finish_reason") == "length":
+433|            # Create exception with truncated response attached
+434|            exc = OutputLengthExceededError(
+435|                f"Model {self._model_name} hit max_tokens limit. "
+436|                f"Response was truncated. Consider increasing max_tokens if possible.",
+437|                truncated_response=content,
+438|            )
+439|            raise exc
+440|
+441|        return LLMResponse(
+442|            content=content,
+443|            reasoning_content=reasoning_content,
+444|            model_name=response.get("model"),
+445|            usage=usage_info,
+446|            prompt_token_ids=prompt_token_ids,
+447|            completion_token_ids=completion_token_ids,
+448|            logprobs=logprobs,
+449|            extra=extra,
+450|        )
+451|
+452|    def _extract_token_ids(self, response) -> tuple[list[int] | None, list[int] | None]:
+453|        """Extract token IDs from a response.
+454|
+455|        Returns:
+456|            Tuple of (prompt_token_ids, completion_token_ids) where:
+457|            - prompt_token_ids: Full prompt token IDs including conversation history
+458|            - completion_token_ids: Token IDs for the generated completion as provided by the provider
+459|        """
+460|        try:
+461|            # Extract completion token IDs
+462|            completion_token_ids = None
+463|            choices = response.get("choices", [])
+464|            if choices:
+465|                choice = choices[0]
+466|                if (
+467|                    hasattr(choice, "provider_specific_fields")
+468|                    and choice.provider_specific_fields
+469|                ):
+470|                    provider_token_ids = choice.provider_specific_fields.get(
+471|                        "token_ids"
+472|                    )
+473|                    if provider_token_ids and isinstance(provider_token_ids, list):
+474|                        completion_token_ids = provider_token_ids
+475|
+476|            # Extract full prompt token IDs (including conversation history)
+477|            prompt_token_ids = getattr(response, "prompt_token_ids", None)
+478|
+479|            return prompt_token_ids, completion_token_ids
+480|
+481|        except Exception as e:
+482|            self._logger.debug(f"Error extracting token IDs: {e}")
+483|            return None, None
+484|
+485|    def _extract_logprobs(self, response) -> list[float] | None:
+486|        """Extract logprobs from a response.
+487|
+488|        Args:
+489|            response: The LLM response object
+490|
+491|        Returns:
+492|            List of log probabilities for each token, or None if not available.
+493|        """
+494|        try:
+495|            choices = response.get("choices", [])
+496|            if not choices:
+497|                return None
+498|
+499|            logprobs_data = choices[0].get("logprobs")
+500|            if not logprobs_data:
+(more lines below)

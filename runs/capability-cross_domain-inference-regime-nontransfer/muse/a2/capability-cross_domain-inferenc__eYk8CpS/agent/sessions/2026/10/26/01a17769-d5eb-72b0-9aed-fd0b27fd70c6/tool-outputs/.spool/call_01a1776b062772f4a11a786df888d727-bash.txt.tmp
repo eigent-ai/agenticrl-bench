@@ -1,0 +1,204 @@
+32:    ContextLengthExceededError,
+35:    OutputLengthExceededError,
+40:from harbor.models.agent.context import AgentContext
+75:    """Metrics for subagent operations (summarization, etc.)."""
+116:    enable_summarize: bool = Field(
+118:        description="Enable context summarization.",
+120:    proactive_summarization_threshold: int = Field(
+122:        description="Free-token threshold for proactive summarization. 0 disables it.",
+152:    interleaved_thinking: bool = Field(
+172:    llm_call_kwargs: dict[str, Any] | None = Field(
+174:        description="Extra LLM call kwargs (e.g. extra_body).",
+277:        enable_summarize: bool = True,
+278:        proactive_summarization_threshold: int = 8000,
+286:        interleaved_thinking: bool = False,
+291:        llm_call_kwargs: dict[str, Any] | None = None,
+308:                NOTE: Rollout details will be incomplete if context summarization occurs.
+313:            enable_summarize: Whether to enable context summarization (default: True)
+314:            proactive_summarization_threshold: Number of free tokens below which to trigger
+315:                proactive summarization. Set to 0 to disable proactive summarization. (default: 8000)
+320:                - max_input_tokens: Maximum input tokens (context length)
+321:                - max_output_tokens: Maximum output tokens
+329:                - linear_history (bool): If True, split trajectory into separate files when context
+330:                  summarization occurs, ensuring each trajectory represents a continuous linear
+338:            interleaved_thinking: Whether to include reasoning content in chat history
+349:            llm_call_kwargs: Extra kwargs to forward to LLM calls (e.g., extra_body).
+367:            enable_summarize=enable_summarize,
+368:            proactive_summarization_threshold=proactive_summarization_threshold,
+376:            interleaved_thinking=interleaved_thinking,
+381:            llm_call_kwargs=llm_call_kwargs,
+442:        self._context: AgentContext | None = None
+454:        self._llm_call_kwargs = copy.deepcopy(self.options.llm_call_kwargs or {})
+456:        self._summarization_count: int = (
+457:            0  # Track number of summarization subagents created
+479:                "`max_input_tokens`, `max_output_tokens`, and cost fields. "
+480:                "Falling back to LiteLLM defaults, which may cause context or pricing issues."
+693:    def _unwind_messages_to_free_tokens(
+694:        self, chat: Chat, target_free_tokens: int = 4000
+697:        context_limit = self._llm.get_model_context_limit()
+701:            free_tokens = context_limit - current_tokens
+703:            if free_tokens >= target_free_tokens:
+713:        free_tokens = context_limit - self._count_total_tokens(chat)
+716:            f"Free tokens: approximately {free_tokens}"
+794:        summary_text: str,
+810:            message_history: The message history to provide context
+813:            agent_name: Name of the subagent (e.g., "terminus-2-summarization-summary")
+814:            filename_suffix: Suffix for trajectory filename (e.g., "summary", "questions", "answers")
+815:            summary_text: Human-readable summary for the trajectory ref
+837:            **self._llm_call_kwargs,
+860:            summary_text=summary_text,
+865:    async def _summarize(
+868:        """Create a summary of the agent's work to pass to a new agent instance.
+870:        This method implements a three-step context summarization process using separate
+874:        - Message history: Unwound chat.messages (limited context after token freeing)
+875:        - Prompt: Generate comprehensive summary of all work completed so far
+876:        - Response: summary_response.content (detailed narrative of progress)
+879:        - Message history: [] (fresh start, no conversation context)
+880:        - Prompt: Given the original task, summary from Step 1, and current terminal screen,
+881:        generate questions about information missing from the summary.
+885:        - Message history: chat.messages + [summary_prompt, summary_response] (extended context)
+890:        - Chat history replaced with: [system, question_prompt (which includes summary from step 1), model_questions]
+891:        - Result: Compressed context that preserves critical task-specific information, allowing
+892:        the main agent to continue working on the task without losing context.
+894:        **Why three steps?** This question-answer approach ensures the summarization doesn't
+896:        subagent (with full context) fills them in.
+906:                - subagent_trajectory_refs: List of 3 SubagentTrajectoryRef objects, or None if summarization failed
+911:        # Increment summarization count
+912:        self._summarization_count += 1
+916:        summary_session_id = (
+917:            f"{self._session_id}-summarization-{self._summarization_count}-summary"
+927:        summary_steps, step_id_counter = self._prepare_copied_trajectory_steps(
+931:        summary_prompt = f"""You are about to hand off your work to another AI agent.
+932:            Please provide a comprehensive summary of what you have
+937:Based on the conversation history, please provide a detailed summary covering:
+940:2. **Important Information Learned** - A summary of crucial findings, file
+950:        summary_response, summary_trajectory_ref = await self._run_subagent(
+951:            prompt=summary_prompt,
+953:            steps=summary_steps,
+954:            session_id=summary_session_id,
+955:            agent_name="terminus-2-summarization-summary",
+956:            filename_suffix="summary",
+957:            summary_text=f"Context summarization {self._summarization_count}: Step 1 - Summary generation",
+958:            subagent_name_for_logging="summary generation LLM call",
+960:        subagent_trajectory_refs.append(summary_trajectory_ref)
+965:            f"{self._session_id}-summarization-{self._summarization_count}-questions"
+974:{summary_response.content}
+980:about the current state of the solution that are not answered in the summary
+989:            agent_name="terminus-2-summarization-questions",
+991:            summary_text=f"Context summarization {self._summarization_count}: Step 2 - Question asking",
+999:            f"{self._session_id}-summarization-{self._summarization_count}-answers"
+1002:        # Reuse the actual trajectory steps (same as summary subagent)
+1003:        # At this point, chat.messages has the same unwound history as in summary subagent
+1008:        # Add the summary prompt and response steps that are part of the message history
+1009:        # Mark these as copied context since they were already part of the summary subagent trajectory
+1015:                message=summary_prompt,
+1016:                is_copied_context=True,
+1026:                model_name=summary_response.model_name or self._model_name,
+1027:                message=summary_response.content,
+1028:                reasoning_content=summary_response.reasoning_content,
+1029:                is_copied_context=True,
+1031:                    "note": "Copied from summary subagent - metrics already recorded there"
+1042:        # The answer subagent should see: unwound chat history + summary prompt + summary response
+1044:            {"role": "user", "content": summary_prompt},
+1045:            {"role": "assistant", "content": summary_response.content},
+1053:            agent_name="terminus-2-summarization-answers",
+1055:            summary_text=f"Context summarization {self._summarization_count}: Step 3 - Answer providing",
+1060:        # Update chat history with the handoff context
+1081:    async def _check_proactive_summarization(
+1084:        """Check if we should proactively summarize due to token usage.
+1087:            tuple: (summary_prompt, subagent_trajectory_ref) if summarization occurred, None otherwise
+1089:        context_limit = self._llm.get_model_context_limit()
+1091:        free_tokens = context_limit - current_tokens
+1093:        if free_tokens < self.options.proactive_summarization_threshold:
+1095:                f"Proactively summarizing. Free tokens: approximately {free_tokens}"
+1098:                summary_prompt, subagent_trajectory_refs = await self._summarize(
+1101:                return (summary_prompt, subagent_trajectory_refs)
+1103:                self.logger.error(f"Error in proactively summarizing: {e}")
+1109:        # Do not retry since it is only raised when summarization is OFF, and we will
+1110:        # likely hit the context length limit again despite retrying.
+1112:            retry_if_not_exception_type(ContextLengthExceededError)
+1130:                **self._llm_call_kwargs,
+1138:        except ContextLengthExceededError:
+1139:            # First, we check whether we want to summarize or not
+1140:            if not self.options.enable_summarize:
+1141:                self.logger.debug("Context length exceeded and summarization is OFF.")
+1144:            self.logger.debug("Context length exceeded. Using fallback summarization.")
+1147:                raise RuntimeError("Cannot handle context length error without session")
+1149:            self._unwind_messages_to_free_tokens(chat, target_free_tokens=4000)
+1151:            summary_prompt = None
+1152:            # Fallback 1: Try full summary
+1154:                self.logger.debug("SUMMARIZATION: Attempting full summary")
+1155:                summary_prompt, subagent_trajectory_refs = await self._summarize(
+1161:                self._pending_handoff_prompt = summary_prompt
+1162:                self.logger.debug("SUMMARIZATION: Full summary succeeded")
+1164:                self.logger.debug(f"SUMMARIZATION: Full summary failed: {e}")
+1166:            # Fallback 2: Try short summary
+1167:            if summary_prompt is None:
+1169:                    self.logger.debug("SUMMARIZATION: Attempting short summary")
+1177:                        **self._llm_call_kwargs,
+1179:                    summary_prompt = f"{original_instruction}\n\nSummary: {short_llm_response.content}"
+1180:                    self.logger.debug("SUMMARIZATION: Short summary succeeded")
+1182:                    self.logger.error(f"SUMMARIZATION: Short summary failed: {e}")
+1185:            if summary_prompt is None:
+1189:                summary_prompt = (
+1196:                    summary_prompt,
+1197:                    **self._llm_call_kwargs,
+1211:        except OutputLengthExceededError as e:
+1361:        if self._context is None:
+1362:            raise RuntimeError("Agent context is not set. This should never happen.")
+1366:        self._context.n_input_tokens = 0
+1367:        self._context.n_output_tokens = 0
+1368:        self._context.n_cache_tokens = 0
+1369:        self._context.cost_usd = None
+1384:            if original_instruction and self.options.enable_summarize:
+1385:                proactive_summary_result = await self._check_proactive_summarization(
+1390:                if proactive_summary_result:
+1391:                    prompt, subagent_refs = proactive_summary_result
+1423:                        message="Performed context summarization and handoff to continue task.",
+1432:                            "context_management": {
+1446:                    self._split_trajectory_on_summarization(
+1474:            self._context.n_input_tokens = chat.total_input_tokens
+1475:            self._context.n_output_tokens = chat.total_output_tokens
+1476:            self._context.n_cache_tokens = chat.total_cache_tokens
+1477:            self._context.cost_usd = chat.total_cost if chat.total_cost > 0 else None
+1499:                        reasoning_content=llm_response.reasoning_content,
+1634:                    reasoning_content=llm_response.reasoning_content,
+1674:        self._summarization_count = 0
+1687:            extra_headers = self._llm_call_kwargs.setdefault("extra_headers", {})
+1689:                raise ValueError("llm_call_kwargs.extra_headers must be a mapping")
+1697:        context: AgentContext,
+1701:            self._llm, interleaved_thinking=self.options.interleaved_thinking
+1703:        self._context = context
+1751:            context.rollout_details = (
+1755:            # Include subagent metrics in context totals
+1756:            context.n_input_tokens = (
+1760:            context.n_output_tokens = (
+1764:            context.n_cache_tokens = (
+1769:            context.cost_usd = total_cost if total_cost > 0 else None
+1770:            context.metadata = {
+1773:                "summarization_count": self._summarization_count,
+1776:                context.metadata["all_messages"] = self._chat.messages
+1785:        """Remove metrics from copied trajectory steps and mark as copied context.
+1791:            # Mark all copied steps with is_copied_context=True
+1792:            step.is_copied_context = True
+1844:                    reasoning_content=response.reasoning_content,
+1867:                    reasoning_content=response.reasoning_content,
+1878:        summary_text: str,
+1884:            agent_name: Name of the subagent (e.g., "terminus-2-summarization-summary")
+1887:            filename_suffix: Suffix for trajectory filename (e.g., "summary", "questions", "answers")
+1888:            summary_text: Human-readable summary for the trajectory ref extra field
+1905:                    "summarization_index": self._summarization_count,
+1919:            / f"trajectory.summarization-{self._summarization_count}-{filename_suffix}.json"
+1935:            extra={"summary": summary_text},
+1949:            mark_as_copied: If True, mark all steps with is_copied_context=True (for continuation trajectories)
+1978:            # Mark as copied context if this is for a continuation trajectory
+1980:                step.is_copied_context = True
+1998:    def _split_trajectory_on_summarization(self, handoff_prompt: str) -> None:
+1999:        """Split trajectory on summarization when linear_history is enabled.
+2007:        # When _summarization_count is 1, dump to trajectory.json (continuation_index = 0)
+2008:        # When _summarization_count is 2, dump to trajectory.cont-1.json (continuation_index = 1)
+2009:        self._dump_trajectory_with_continuation_index(self._summarization_count - 1)
+  2101 /opt/verifier-tools/venv/lib/python3.12/site-packages/harbor/agents/terminus_2/terminus_2.py
+   778 /opt/verifier-tools/venv/lib/python3.12/site-packages/harbor/llms/lite_llm.py
+   155 /opt/verifier-tools/venv/lib/python3.12/site-packages/harbor/llms/chat.py
+  3034 total

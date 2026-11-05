@@ -1,0 +1,24 @@
+10:    use_rollout_sampling_mask: bool = False,
+24:        store_prefix: Prefix to prepend to stored output keys.
+26:        use_rollout_sampling_mask: Whether to score over each rollout token's
+27:            captured sampling support.
+49:        forward_only_keys = [
+58:        if use_rollout_sampling_mask:
+59:            forward_only_keys.extend(["rollout_sampling_mask_ids", "rollout_sampling_mask_offsets"])
+60:        batch = get_batch(
+62:            forward_only_keys,
+72:        rollout_sampling_mask = get_rollout_sampling_masks(batch) if use_rollout_sampling_mask else None
+86:            **(filter_keys(batch, ["witness_ids"]) if args.enable_witness else {}),
+99:        if use_rollout_sampling_mask:
+100:            callback_kwargs["rollout_sampling_mask"] = rollout_sampling_mask
+    sampling_mask_keys = (
+        ("rollout_sampling_mask_ids", "rollout_sampling_mask_offsets")
+        if args.use_sampling_support_replay and args.loss_type == "policy_loss"
+        else ()
+    )
+
+    @dumper_phase_util.wrap_forward_step
+    def forward_step(data_iterator: DataIterator, model: GPTModel, return_schedule_plan: bool = False) -> tuple[
+        torch.Tensor,
+        Callable[[torch.Tensor], tuple[torch.Tensor, int, dict]],
+    ]:

@@ -1,0 +1,83 @@
+#!/bin/bash
+# jobctl — memory-aware job controller
+
+JOBS_DIR="/jobs"
+LOG_DIR="/var/log/jobctl"
+RUN_DIR="/var/run/jobctl"
+MEMORY_THRESHOLD_KB=524288
+
+mkdir -p "$LOG_DIR" "$RUN_DIR"
+
+check_memory() {
+    grep '^MemFree:' /proc/meminfo | awk '{print $2}'
+}
+
+list_jobs() {
+    pgrep -a python3 2>/dev/null || echo "No jobs running"
+}
+
+kill_job() {
+    local pattern="$1"
+    if [ -z "$pattern" ]; then
+        echo "Usage: jobctl kill <pattern>" >&2
+        return 1
+    fi
+    if pkill "$pattern" 2>/dev/null; then
+        echo "Killed jobs matching: $pattern"
+    else
+        echo "No jobs matched: $pattern" >&2
+        return 1
+    fi
+}
+
+submit_job() {
+    local script="$1"
+    shift
+
+    if [ ! -f "$JOBS_DIR/$script" ] && [ ! -f "$script" ]; then
+        echo "Error: script not found: $script" >&2
+        return 1
+    fi
+
+    local script_path
+    if [ -f "$JOBS_DIR/$script" ]; then
+        script_path="$JOBS_DIR/$script"
+    else
+        script_path="$script"
+    fi
+
+    local avail_kb
+    avail_kb=$(check_memory)
+
+    if [ "$avail_kb" -lt "$MEMORY_THRESHOLD_KB" ]; then
+        echo "Rejected: only ${avail_kb} kB available (need ${MEMORY_THRESHOLD_KB} kB)" >&2
+        return 1
+    fi
+
+    nohup python3 "$script_path" "$@" > "$LOG_DIR/$(basename "$script_path" .py).out" 2>&1 &
+    local pid=$!
+    echo "$pid $script_path" >> "$RUN_DIR/active_jobs"
+    echo "Submitted $script_path [PID $pid]"
+}
+
+case "${1:-}" in
+    check-memory)
+        avail=$(check_memory)
+        echo "Available memory: ${avail} kB"
+        ;;
+    list)
+        list_jobs
+        ;;
+    submit)
+        shift
+        submit_job "$@"
+        ;;
+    kill)
+        shift
+        kill_job "$@"
+        ;;
+    *)
+        echo "Usage: jobctl {check-memory|list|submit <script>|kill <pattern>}" >&2
+        exit 1
+        ;;
+esac

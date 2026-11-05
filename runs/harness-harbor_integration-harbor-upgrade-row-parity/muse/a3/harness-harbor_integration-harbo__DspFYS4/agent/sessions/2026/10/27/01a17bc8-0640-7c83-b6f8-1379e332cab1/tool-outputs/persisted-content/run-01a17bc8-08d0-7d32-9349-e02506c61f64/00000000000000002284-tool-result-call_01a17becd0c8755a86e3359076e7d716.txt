@@ -1,0 +1,83 @@
+Read text file `/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/agents/terminus_2/tmux_session.py`.
+(329 line(s) above)
+330|                timeout_sec=self._TOOL_INSTALL_TIMEOUT_SEC,
+331|            )
+332|
+333|            # Verify installation
+334|            verify_result = await self.environment.exec(
+335|                command="tmux -V || /usr/local/bin/tmux -V", user="root"
+336|            )
+337|            if verify_result.return_code == 0:
+338|                self._logger.debug("tmux successfully built and installed from source")
+339|            else:
+340|                self._logger.error("Failed to install tmux from source")
+341|
+342|        except Exception as e:
+343|            self._logger.error(f"Failed to build tmux from source: {e}")
+344|
+345|    async def _install_asciinema_with_pip(self) -> None:
+346|        """
+347|        Install asciinema using pip as a fallback.
+348|        """
+349|        try:
+350|            # Try to install python3-pip first - with non-interactive flags
+351|            pip_install_commands = [
+352|                "DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip",
+353|                "yum install -y python3-pip",
+354|                "dnf install -y python3-pip",
+355|                "apk add --no-cache python3 py3-pip",
+356|            ]
+357|
+358|            # Try to install pip
+359|            for cmd in pip_install_commands:
+360|                result = await self.environment.exec(
+361|                    command=cmd,
+362|                    user="root",
+363|                    timeout_sec=self._TOOL_INSTALL_TIMEOUT_SEC,
+364|                )
+365|                if result.return_code == 0:
+366|                    break
+367|
+368|            # Install asciinema using pip
+369|            pip_commands = ["pip3 install asciinema", "pip install asciinema"]
+370|
+371|            for cmd in pip_commands:
+372|                result = await self.environment.exec(
+373|                    command=cmd,
+374|                    user="root",
+375|                    timeout_sec=self._TOOL_INSTALL_TIMEOUT_SEC,
+376|                )
+377|                if result.return_code == 0:
+378|                    # Verify installation
+379|                    verify_result = await self.environment.exec(
+380|                        command="asciinema --version", user="root"
+381|                    )
+382|                    if verify_result.return_code == 0:
+383|                        self._logger.debug("asciinema successfully installed using pip")
+384|                        return
+385|
+386|            self._logger.error("Failed to install asciinema using pip")
+387|
+388|        except Exception as e:
+389|            self._logger.error(f"Failed to install asciinema with pip: {e}")
+390|
+391|    @property
+392|    def _tmux_start_session(self) -> str:
+393|        # Build environment variable options for tmux new-session -e KEY=value
+394|        env_options = "".join(
+395|            f"-e {shlex.quote(f'{key}={value}')} "
+396|            for key, value in self._extra_env.items()
+397|        )
+398|
+399|        return (
+400|            f"export TERM=xterm-256color && "
+401|            f"export SHELL=/bin/bash && "
+402|            f"tmux new-session {env_options}-x {self._pane_width} -y {self._pane_height} -d -s {self._session_name} 'bash --login' \\; "
+403|            f"pipe-pane -t {self._session_name} "
+404|            f"'cat > {self._logging_path}'"
+405|        )
+406|
+407|    @staticmethod
+408|    def _utf8_len(s: str) -> int:
+409|        """Return the UTF-8 byte length of *s*.
+(more lines below)

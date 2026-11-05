@@ -1,0 +1,502 @@
+Read text file `/opt/verl/verl/utils/torch_functional.py`.
+1|# Copyright 2024 Bytedance Ltd. and/or its affiliates
+2|#
+3|# Licensed under the Apache License, Version 2.0 (the "License");
+4|# you may not use this file except in compliance with the License.
+5|# You may obtain a copy of the License at
+6|#
+7|#     http://www.apache.org/licenses/LICENSE-2.0
+8|#
+9|# Unless required by applicable law or agreed to in writing, software
+10|# distributed under the License is distributed on an "AS IS" BASIS,
+11|# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+12|# See the License for the specific language governing permissions and
+13|# limitations under the License.
+14|"""
+15|Contain small torch utilities
+16|"""
+17|
+18|import math
+19|import os
+20|from contextlib import contextmanager
+21|from typing import Optional
+22|
+23|import torch
+24|import torch.distributed
+25|import torch.nn.functional as F
+26|from tensordict import TensorDict
+27|from torch import nn
+28|from torch.optim import Optimizer
+29|from torch.optim.lr_scheduler import LambdaLR
+30|from transformers import PreTrainedTokenizer
+31|
+32|from verl.utils.device import get_device_name, get_torch_device
+33|
+34|try:
+35|    from flash_attn.ops.triton.cross_entropy import cross_entropy_loss
+36|
+37|    FLAH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE = True
+38|except ImportError:
+39|    FLAH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE = False
+40|
+41|
+42|try:
+43|    import torch_npu
+44|
+45|    NPU_CROSS_ENTROPY_LOSS_AVAILABLE = hasattr(torch_npu, "npu_cross_entropy_loss")
+46|except ImportError:
+47|    NPU_CROSS_ENTROPY_LOSS_AVAILABLE = False
+48|
+49|
+50|def gather_from_labels(data: torch.Tensor, label: torch.Tensor) -> torch.Tensor:
+51|    """Gather values from data tensor at positions specified by label indices.
+52|
+53|    Selects elements from the last dimension of `data` based on indices in `label`.
+54|    Commonly used to extract log-probabilities for specific token IDs from a
+55|    vocabulary distribution.
+56|
+57|    Args:
+58|        data: Input tensor of shape (..., vocab_size) containing values to gather from.
+59|        label: Index tensor of shape (...,) with values in range [0, vocab_size).
+60|
+61|    Returns:
+62|        torch.Tensor: Gathered values with shape (...,), same as label shape.
+63|
+64|    Example:
+65|        >>> logits = torch.randn(2, 3, 100)  # [batch, seq, vocab]
+66|        >>> labels = torch.randint(0, 100, (2, 3))  # [batch, seq]
+67|        >>> gathered = gather_from_labels(logits, labels)  # [batch, seq]
+68|    """
+69|    output = torch.gather(data, -1, label.unsqueeze(-1)).squeeze(-1)
+70|    return output
+71|
+72|
+73|def logprobs_from_logits(logits, labels, inplace_backward=True):
+74|    """
+75|    Compute per-token log-probabilities for the given labels.
+76|
+77|    Uses a Flash-Attention–based cross-entropy (if available) for efficient backward,
+78|    otherwise falls back to a standard log-softmax+gather approach.
+79|
+80|    See: https://github.com/pytorch/pytorch/issues/563#issuecomment-330103591
+81|
+82|    Args:
+83|        logits (Tensor): Model outputs of shape (..., vocab_size).
+84|        labels (LongTensor): True class indices of shape matching logits[..., :-1].
+85|        inplace_backward (bool): If True and Flash-Attn is available, perform backward in-place.
+86|
+87|    Returns:
+88|        Tensor: Log-probabilities of the target labels, shape logits.shape[:-1].
+89|    """
+90|    # The flash-attn Triton cross-entropy kernel's reduction may be non-deterministic
+91|    # and is NOT controlled by FLASH_ATTENTION_DETERMINISTIC (that only governs the
+92|    # attention kernels) nor by torch.use_deterministic_algorithms (Triton custom ops
+93|    # don't trigger warn_only). Set VERL_DISABLE_FLASH_ATTN_CE=1 to force the pure
+94|    # PyTorch log_softmax+gather path for bitwise-reproducible log_probs.
+95|    _use_flash_ce = FLAH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE and os.environ.get("VERL_DISABLE_FLASH_ATTN_CE", "0") != "1"
+96|    if _use_flash_ce:
+97|        batch_dim = logits.shape[:-1]
+98|        last_dim = logits.shape[-1]
+99|        logits = logits.reshape(-1, last_dim)
+100|        labels = labels.reshape(-1)
+101|        output = logprobs_from_logits_flash_attn(logits, labels, inplace_backward=inplace_backward)
+102|        output = output.view(*batch_dim)
+103|    elif NPU_CROSS_ENTROPY_LOSS_AVAILABLE:
+104|        output = logprobs_from_logits_torch_npu(logits, labels)
+105|    else:
+106|        output = logprobs_from_logits_v2(logits, labels)
+107|    return output
+108|
+109|
+110|def logprobs_from_logits_flash_attn(
+111|    logits: torch.Tensor, labels: torch.Tensor, inplace_backward: bool = True
+112|) -> torch.Tensor:
+113|    """Compute log-probabilities using Flash Attention's optimized cross-entropy.
+114|
+115|    Uses the Flash Attention library's Triton-based cross-entropy implementation
+116|    for efficient computation on NVIDIA GPUs.
+117|
+118|    Args:
+119|        logits: Model output logits of shape (batch_size, vocab_size).
+120|        labels: Target token indices of shape (batch_size,).
+121|        inplace_backward: If True, perform backward pass in-place for memory efficiency.
+122|
+123|    Returns:
+124|        torch.Tensor: Log-probabilities for target labels, shape (batch_size,).
+125|
+126|    Raises:
+127|        AssertionError: If flash-attn version < 2.4.3 (different return format).
+128|    """
+129|    output = cross_entropy_loss(logits, labels, inplace_backward=inplace_backward)
+130|    assert isinstance(output, tuple), (
+131|        "please make sure flash-attn>=2.4.3 where cross_entropy_loss returns Tuple[losses, z_losses]."
+132|    )
+133|    return -output[0]
+134|
+135|
+136|def logprobs_from_logits_torch_npu(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+137|    """Compute log-probabilities using Ascend NPU's optimized cross-entropy.
+138|
+139|    Uses torch_npu's native cross-entropy implementation for efficient
+140|    computation on Huawei Ascend NPU devices.
+141|
+142|    Args:
+143|        logits: Model output logits of shape (..., vocab_size).
+144|        labels: Target token indices of shape (...,).
+145|
+146|    Returns:
+147|        torch.Tensor: Log-probabilities for target labels, same shape as labels.
+148|    """
+149|    batch_dim = logits.shape[:-1]
+150|    logits = logits.reshape(-1, logits.shape[-1])
+151|    loss, _, _, _ = torch_npu.npu_cross_entropy_loss(logits, labels.reshape(-1), reduction="none")
+152|    return -loss.view(*batch_dim)
+153|
+154|
+155|def logprobs_from_logits_naive(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+156|    """Compute log-probabilities using standard log-softmax approach.
+157|
+158|    Simple implementation using PyTorch's log_softmax followed by gathering.
+159|    Less memory-efficient than specialized implementations but works on all devices.
+160|
+161|    Args:
+162|        logits: Model output logits of shape (..., vocab_size).
+163|        labels: Target token indices of shape (...,).
+164|
+165|    Returns:
+166|        torch.Tensor: Log-probabilities for target labels, same shape as labels.
+167|    """
+168|    logp = F.log_softmax(logits, dim=-1)
+169|    logpy = gather_from_labels(logp, labels)
+170|    return logpy
+171|
+172|
+173|def logprobs_from_logits_v2(logits: torch.FloatTensor, labels: torch.Tensor) -> torch.Tensor:
+174|    """Memory-efficient log-probability computation using row-wise processing.
+175|
+176|    Computes log-probabilities by processing one row at a time to reduce peak
+177|    memory consumption. Uses logsumexp for float32/float64, falls back to
+178|    log_softmax for bfloat16 due to numerical stability concerns.
+179|
+180|    The mathematical identity used is: log_softmax(x_i) = x_i - logsumexp(x)
+181|
+182|    Args:
+183|        logits: Model output logits of shape (batch_size, seq_len, vocab_size)
+184|            or (batch_size, vocab_size).
+185|        labels: Target token indices matching logits shape without vocab dimension.
+186|
+187|    Returns:
+188|        torch.Tensor: Log-probabilities for target labels.
+189|
+190|    Note:
+191|        This implementation trades compute for memory by iterating over batch
+192|        dimension, making it suitable for large vocabulary sizes.
+193|    """
+194|    if logits.dtype in [torch.float32, torch.float64]:
+195|        logits_labels = torch.gather(logits, dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
+196|        # loop to reduce peak mem consumption
+197|        logsumexp_values = torch.stack([torch.logsumexp(logit, dim=-1) for logit in logits])
+198|        logprobs_labels = logits_labels - logsumexp_values  # log_softmax(x_i) = x_i - logsumexp(x)
+199|    else:
+200|        # logsumexp approach is unstable with bfloat16, fall back to slightly less efficent approach
+201|        logprobs_labels = []
+202|        for row_logits, row_labels in zip(logits, labels, strict=True):  # loop to reduce peak mem consumption
+203|            row_logprobs = F.log_softmax(row_logits, dim=-1)
+204|            row_logprobs_labels = row_logprobs.gather(dim=-1, index=row_labels.unsqueeze(-1)).squeeze(-1)
+205|            logprobs_labels.append(row_logprobs_labels)
+206|        logprobs_labels = torch.stack(logprobs_labels)
+207|    return logprobs_labels
+208|
+209|
+210|def clip_by_value(x: torch.Tensor, tensor_min: torch.Tensor, tensor_max: torch.Tensor) -> torch.Tensor:
+211|    """Clip tensor values to a range defined by tensor bounds.
+212|
+213|    Extension of torch.clamp that supports tensor-valued min/max bounds
+214|    instead of only scalar bounds.
+215|
+216|    Args:
+217|        x: Input tensor to clip.
+218|        tensor_min: Minimum bound tensor (broadcastable to x).
+219|        tensor_max: Maximum bound tensor (broadcastable to x).
+220|
+221|    Returns:
+222|        torch.Tensor: Clipped tensor with values in [tensor_min, tensor_max].
+223|
+224|    See Also:
+225|        https://github.com/pytorch/pytorch/issues/2793#issuecomment-428784713
+226|    """
+227|    clipped = torch.max(torch.min(x, tensor_max), tensor_min)
+228|    return clipped
+229|
+230|
+231|def entropy_from_logits(logits: torch.Tensor) -> torch.Tensor:
+232|    """Calculate Shannon entropy from unnormalized logits.
+233|
+234|    Computes H(p) = -sum(p * log(p)) using the numerically stable formula:
+235|    entropy = logsumexp(logits) - sum(softmax(logits) * logits)
+236|
+237|    Args:
+238|        logits: Unnormalized log-probabilities of shape (..., vocab_size).
+239|
+240|    Returns:
+241|        torch.Tensor: Entropy values with shape (...,), one per distribution.
+242|    """
+243|    pd = torch.nn.functional.softmax(logits, dim=-1)
+244|    entropy = torch.logsumexp(logits, dim=-1) - torch.sum(pd * logits, dim=-1)
+245|    return entropy
+246|
+247|
+248|def entropy_from_logits_with_chunking(logits: torch.Tensor, chunk_size: int = 2048) -> torch.Tensor:
+249|    """Memory-efficient entropy calculation using chunked processing.
+250|
+251|    Computes entropy by processing the batch in chunks to reduce peak memory
+252|    usage. Useful for large batch sizes or when memory is constrained.
+253|
+254|    Args:
+255|        logits: Unnormalized log-probabilities of shape (batch_size, vocab_size).
+256|        chunk_size: Number of samples to process at once. Defaults to 2048.
+257|
+258|    Returns:
+259|        torch.Tensor: Entropy values with shape (batch_size,).
+260|
+261|    Note:
+262|        Converts chunks to float32 for numerical stability during computation.
+263|    """
+264|    entropy = torch.zeros(logits.shape[0], device=logits.device)
+265|    for i in range(0, logits.shape[0], chunk_size):
+266|        logits_chunk = logits[i : i + chunk_size].float()
+267|        pd_chunk = torch.nn.functional.softmax(logits_chunk, dim=-1)
+268|        entropy_chunk = torch.logsumexp(logits_chunk, dim=-1) - torch.sum(pd_chunk * logits_chunk, dim=-1)
+269|        entropy[i : i + chunk_size] = entropy_chunk
+270|    return entropy
+271|
+272|
+273|def masked_sum(values: torch.Tensor, mask: torch.Tensor, axis: int | tuple[int, ...] | None = None) -> torch.Tensor:
+274|    """Compute sum of tensor values where mask is True.
+275|
+276|    NaN values outside the mask are replaced with zeros to prevent
+277|    contaminating the sum.
+278|
+279|    Args:
+280|        values: Input tensor containing values to sum.
+281|        mask: Boolean or numeric mask tensor (same shape as values).
+282|            Non-zero values indicate elements to include.
+283|        axis: Dimension(s) along which to sum. None sums all elements.
+284|
+285|    Returns:
+286|        torch.Tensor: Sum of masked values, reduced along specified axis.
+287|    """
+288|    # If NaNs exist out of mask, replace NaNs in values with a value that
+289|    # won't affect the sum (e.g., 0 for masked regions)
+290|    valid_values = torch.where(mask.bool(), values, 0.0)
+291|    return (valid_values * mask).sum(axis=axis)
+292|
+293|
+294|def masked_mean(values, mask, axis=None):
+295|    """
+296|    Compute the mean of `values` over elements selected by `mask`.
+297|
+298|    Args:
+299|        values (Tensor): Input tensor.
+300|        mask (Tensor): Boolean or numeric mask of the same shape as `values`.
+301|        axis (int or tuple of int, optional): Dimension(s) along which to compute the mean.
+302|            Defaults to None (over all elements).
+303|
+304|    Returns:
+305|        Tensor: Masked mean, with shape equal to `values` reduced over `axis`.
+306|    """
+307|    s = masked_sum(values, mask, axis)
+308|    return s / (mask.sum(axis=axis) + 1e-8)
+309|
+310|
+311|def masked_var(values, mask, unbiased=True):
+312|    """Compute variance of tensor with masked values."""
+313|    mean = masked_mean(values, mask)
+314|    centered_values = values - mean
+315|    variance = masked_mean(centered_values**2, mask)
+316|    if unbiased:
+317|        mask_sum = mask.sum()
+318|        if mask_sum == 0:
+319|            raise ValueError("At least one element in the mask has to be 1.")
+320|        # note that if mask_sum == 1, then there is a division by zero issue
+321|        # to avoid it you just need to use a larger minibatch_size
+322|        if mask_sum == 1:
+323|            raise ValueError("The sum of the mask is one, which can cause a division by zero.")
+324|        bessel_correction = mask_sum / (mask_sum - 1)
+325|        variance = variance * bessel_correction
+326|    return variance
+327|
+328|
+329|def masked_whiten(values, mask, shift_mean=True):
+330|    """
+331|    Whiten `values` by normalizing with mean and variance computed over `mask`.
+332|
+333|    Args:
+334|        values (torch.Tensor): Input tensor.
+335|        mask (torch.Tensor): Boolean tensor of same shape, selects elements for stats.
+336|        shift_mean (bool): If True (default), output is zero-mean;
+337|                           if False, the original mean is re-added after scaling.
+338|
+339|    Returns:
+340|        torch.Tensor: Whitened tensor of same shape as `values`.
+341|    """
+342|    mean, var = masked_mean(values, mask), masked_var(values, mask)
+343|    whitened = (values - mean) * torch.rsqrt(var + 1e-8)
+344|    if not shift_mean:
+345|        whitened += mean
+346|    return whitened
+347|
+348|
+349|def get_response_mask(response_id: torch.Tensor, eos_token: int | list[int] = 2, dtype=torch.int64):
+350|    """
+351|    end of sentence token can be int or list: 1 or [1, 2]
+352|    e.g.
+353|    response_id = torch.tensor([[20, 10, 34, 1, 0, 0, 0],
+354|                                [78, 0, 76, 2, 1, 0, 0],
+355|                                [23, 98, 1, 0, 0, 0, 0],
+356|                                [33, 3, 98, 45, 1, 0, 0]])
+357|    #eos_token=1
+358|    response_mask:  tensor([[1, 1, 1, 1, 0, 0, 0],
+359|                            [1, 1, 1, 1, 1, 0, 0],
+360|                            [1, 1, 1, 0, 0, 0, 0],
+361|                            [1, 1, 1, 1, 1, 0, 0]])
+362|    #eos_token=[1,2]
+363|    response_mask:  tensor([[1, 1, 1, 1, 0, 0, 0],
+364|                            [1, 1, 1, 1, 0, 0, 0],
+365|                            [1, 1, 1, 0, 0, 0, 0],
+366|                            [1, 1, 1, 1, 1, 0, 0]])
+367|    """
+368|    eos_mask = torch.isin(response_id, torch.tensor(eos_token, device=response_id.device)).int()
+369|    return (eos_mask.cumsum(dim=1) - eos_mask).eq(0).to(dtype)
+370|
+371|
+372|def compute_grad_norm(model: nn.Module) -> float:
+373|    """Compute the squared L2 norm of all gradients in a model.
+374|
+375|    Sums the squared values of all gradient tensors across all parameters.
+376|    Useful for monitoring gradient magnitudes during training.
+377|
+378|    Args:
+379|        model: PyTorch model with computed gradients.
+380|
+381|    Returns:
+382|        float: Sum of squared gradient values (not the square root).
+383|
+384|    Note:
+385|        Returns the squared norm, not the norm itself. To get the actual
+386|        L2 norm, take the square root of the returned value.
+387|    """
+388|    total_grad_square = 0
+389|    for param in model.parameters():
+390|        if param.grad is not None:
+391|            total_grad_square += torch.sum(torch.square(param.grad.detach())).item()
+392|    return total_grad_square
+393|
+394|
+395|def broadcast_dict_tensor(tensors: dict[str, torch.Tensor] | TensorDict, src: int, group) -> None:
+396|    """Broadcast all tensors in a dictionary from source rank to all ranks.
+397|
+398|    Iterates over all tensors in the dictionary and broadcasts each one
+399|    from the source rank to all other ranks in the process group.
+400|
+401|    Args:
+402|        tensors: Dictionary or TensorDict containing tensors to broadcast.
+403|        src: Source rank from which to broadcast.
+404|        group: Process group for the broadcast operation.
+405|
+406|    Note:
+407|        This implementation broadcasts tensors one at a time. Could be optimized
+408|        to use a single broadcast with packed tensors.
+409|    """
+410|    for key in tensors.sorted_keys:
+411|        torch.distributed.broadcast(tensors[key], src=src, group=group, async_op=False)
+412|
+413|
+414|def allgather_dict_tensors(
+415|    tensors: dict[str, torch.Tensor] | TensorDict, size: int, group, dim: int = 0
+416|) -> dict[str, torch.Tensor] | TensorDict:
+417|    """Gather tensors from all ranks and concatenate them.
+418|
+419|    Performs all_gather on each tensor in the dictionary and concatenates
+420|    the results along the specified dimension.
+421|
+422|    Args:
+423|        tensors: Dictionary or TensorDict containing tensors to gather.
+424|        size: Number of ranks in the process group.
+425|        group: Process group for the all_gather operation.
+426|        dim: Dimension along which to concatenate gathered tensors. Defaults to 0.
+427|
+428|    Returns:
+429|        Dictionary or TensorDict (matching input type) with gathered and
+430|        concatenated tensors. Each tensor's size along `dim` is multiplied by `size`.
+431|
+432|    Note:
+433|        This implementation gathers tensors one at a time synchronously.
+434|        Could be optimized using async ops or packed all_gather.
+435|    """
+436|    if isinstance(tensors, TensorDict):
+437|        is_tensor_dict = True
+438|        tensors_as_dict = tensors.to_dict()
+439|    else:
+440|        tensors_as_dict = tensors
+441|        is_tensor_dict = False
+442|
+443|    output = {}
+444|    sorted_keys = sorted(tensors_as_dict.keys())
+445|    for key in sorted_keys:
+446|        val = tensors_as_dict[key]
+447|        output[key] = [torch.empty_like(val) for _ in range(size)]
+448|        torch.distributed.all_gather(output[key], val, group=group, async_op=False)
+449|        output[key] = torch.cat(output[key], dim=dim)
+450|
+451|    if is_tensor_dict:
+452|        output = TensorDict(source=output, batch_size=tensors.batch_size[0] * size)
+453|
+454|    return output
+455|
+456|
+457|def allgather_dict_into_dict(data: dict, group=None) -> dict:
+458|    """allgather a dict into a dict of list
+459|
+460|    Args:
+461|        data: a dict
+462|        group: the process group to allgather
+463|
+464|    Returns: dict containing a list of the results from allgather
+465|
+466|    """
+467|    assert isinstance(data, dict), f"Expect data to be a dictionary, Got {type(data)}"
+468|
+469|    group_size = torch.distributed.get_world_size(group=group)
+470|
+471|    final_metrics = {}
+472|    all_metrics_lst = [None for _ in range(group_size)]
+473|    torch.distributed.all_gather_object(all_metrics_lst, data, group=group)
+474|
+475|    for all_metrics in all_metrics_lst:
+476|        for key, val in all_metrics.items():
+477|            if key not in final_metrics:
+478|                final_metrics[key] = []
+479|            final_metrics[key].append(val)
+480|    return final_metrics
+481|
+482|
+483|def split_dict_tensor_into_batches(tensors: TensorDict, batch_size) -> list[TensorDict]:
+484|    assert tensors.batch_size[0] % batch_size == 0, (
+485|        f"input data batch size: {tensors.batch_size[0]}, split batch size: {batch_size}"
+486|    )
+487|    return tensors.split(batch_size)
+488|
+489|
+490|def pad_2d_list_to_length(response, pad_token_id, max_length=None):
+491|    """
+492|    pad a 2D list (e.g. responses, logprobs) to a 2D tensor.
+493|    """
+494|    response_length = max(len(sub_list) for sub_list in response)
+495|    target_length = max_length if max_length is not None and max_length > response_length else response_length
+496|    padded_response = [tuple(sub_list) + (pad_token_id,) * (target_length - len(sub_list)) for sub_list in response]
+497|    tensor = torch.tensor(padded_response)
+498|    return tensor
+499|
+500|
+(more lines below)

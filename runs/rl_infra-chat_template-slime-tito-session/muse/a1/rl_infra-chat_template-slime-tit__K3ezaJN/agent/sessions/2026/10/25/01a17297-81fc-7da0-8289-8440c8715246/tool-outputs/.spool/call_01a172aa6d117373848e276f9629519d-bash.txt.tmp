@@ -1,0 +1,221 @@
+            # Note: This is a simplified regex approach consistent with vLLM
+            raw_tool_calls = self.tool_call_regex.findall(text)
+            if not raw_tool_calls:
+                # Fallback: maybe the whole text is inside the tag or tags are stripped
+                if self.tool_call_prefix in text:
+                    raw_tool_calls = [text]
+
+            tool_idx = 0
+            for tool_content in raw_tool_calls:
+                # Find function calls
+                funcs = self.tool_call_function_regex.findall(tool_content)
+                for func_match in funcs:
+                    func_body = func_match[0] or func_match[1]
+                    if ">" not in func_body:
+                        continue
+
+                    name_end = func_body.index(">")
+                    func_name = func_body[:name_end]
+                    params_str = func_body[name_end + 1 :]
+
+                    param_config = self._get_arguments_config(func_name, tools)
+                    parsed_params = {}
+
+                    for p_match in self.tool_call_parameter_regex.findall(params_str):
+                        if ">" not in p_match:
+                            continue
+                        p_idx = p_match.index(">")
+                        p_name = p_match[:p_idx]
+                        p_val = p_match[p_idx + 1 :]
+                        # Remove prefixing and trailing \n
+                        if p_val.startswith("\n"):
+                            p_val = p_val[1:]
+                        if p_val.endswith("\n"):
+                            p_val = p_val[:-1]
+
+                        parsed_params[p_name] = self._convert_param_value(
+                            p_val, p_name, param_config, func_name
+                        )
+
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=tool_idx,
+                            name=func_name,
+                            parameters=json.dumps(parsed_params, ensure_ascii=False),
+                        )
+                    )
+                    tool_idx += 1
+
+            # Determine normal text (text before the first tool call)
+            start_idx = text.find(self.tool_call_start_token)
+            if start_idx == -1:
+                start_idx = text.find(self.tool_call_prefix)
+            normal_text = text[:start_idx] if start_idx > 0 else ""
+
+            return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+        except Exception as e:
+            logger.error(f"Error in detect_and_parse: {e}")
+            return StreamingParseResult(normal_text=text)
+
+    def parse_streaming_increment(
+        self, new_text: str, tools: List[Tool]
+    ) -> StreamingParseResult:
+        """
+        Robust cursor-based streaming parser.
+        """
+        self._buffer += new_text
+
+        # Guard against empty buffer
+        if not self._buffer:
+            return StreamingParseResult()
+
+        calls = []
+        normal_text_chunks = []
+
+        while True:
+            # Working text slice
+            current_slice = self._buffer[self.parsed_pos :]
+
+            # Optimization: If almost empty, wait for more
+            if not current_slice:
+                break
+
+            # -------------------------------------------------------
+            # 1. Priority detection: check if it's the start of Tool Call
+            # -------------------------------------------------------
+            if current_slice.startswith(self.tool_call_start_token):
+                self.parsed_pos += len(self.tool_call_start_token)
+                self.is_inside_tool_call = True
+                continue
+
+            # -------------------------------------------------------
+            # 2. Function Name: <function=name>
+            # -------------------------------------------------------
+            if current_slice.startswith(self.tool_call_prefix):
+                end_angle = current_slice.find(">")
+                if end_angle != -1:
+                    func_name = current_slice[len(self.tool_call_prefix) : end_angle]
+
+                    self.current_tool_id += 1
+                    self.current_tool_name_sent = True
+import ast
+import json
+import logging
+import re
+from typing import List
+
+from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.environ import envs
+from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+from sglang.srt.function_call.core_types import (
+    StreamingParseResult,
+    ToolCallItem,
+    _GetInfoFunc,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class PythonicDetector(BaseFormatDetector):
+    """
+    Detector for Llama-4 models with Pythonic tool call format.
+
+    The Pythonic format uses Python function call syntax within square brackets,
+    with arguments as Python literals rather than JSON.
+
+    Format Structure:
+    ```
+    [tool1(arg1=val1, arg2=val2), tool2(arg1=val3)]
+    ```
+
+    Reference: https://huggingface.co/meta-llama/Llama-4-Scout-17B-16E-Instruct?chat_template=default
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.tool_call_regex = re.compile(
+            r"\[([a-zA-Z]+\w*\(([a-zA-Z]+\w*=.*,\s*)*([a-zA-Z]+\w*=.*\s)?\),\s*)*([a-zA-Z]+\w*\(([a-zA-Z]+\w*=.*,\s*)*([a-zA-Z]+\w*=.*\s*)?\)\s*)+\]",
+            re.DOTALL,
+        )
+
+    @staticmethod
+    def _text_strip(text: str) -> str:
+        # Llama 4 model sometime will output <|python_start|> and <|python_end|> tokens
+        # remove those tokens
+        text = text.replace("<|python_start|>", "")
+        text = text.replace("<|python_end|>", "")
+        return text
+
+    def has_tool_call(self, text: str) -> bool:
+        return bool(self.tool_call_regex.search(self._text_strip(text.strip())))
+
+    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+        # Try parsing the text as a Python list of function calls
+        text = text.strip()
+
+        # Remove unexpected <|python_start|> and <|python_end|> for llama4
+        text = self._text_strip(text)
+
+        match = self.tool_call_regex.search(text)
+        if match is None:
+            return StreamingParseResult(normal_text=text, calls=[])
+
+        # Extract the tool call part and any text before/after it
+        tool_call_start = match.start()
+        tool_call_end = match.end()
+
+        normal_text_before = text[:tool_call_start] if tool_call_start > 0 else ""
+        tool_call_text = text[tool_call_start:tool_call_end]
+        normal_text_after = text[tool_call_end:] if tool_call_end < len(text) else ""
+
+        # Combine normal text
+        normal_text = normal_text_before + normal_text_after
+
+        try:
+            module = ast.parse(tool_call_text)
+            parsed = getattr(module.body[0], "value", None)
+            if not (
+                isinstance(parsed, ast.List)
+                and all(isinstance(e, ast.Call) for e in parsed.elts)
+            ):
+                return StreamingParseResult(normal_text=normal_text, calls=[])
+
+            calls = []
+            tool_indices = self._get_tool_indices(tools)
+            for call_index, call in enumerate(parsed.elts):
+                if not isinstance(call.func, ast.Name):
+                    continue
+                function_name = call.func.id
+                # Validate that the function exists in the tools
+                if function_name not in tool_indices:
+                    logger.warning(
+                        f"Model attempted to call undefined function: {function_name}"
+                    )
+                    if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+                        continue  # Skip unknown tools (default legacy behavior)
+
+                arguments = {}
+                for keyword in call.keywords:
+                    arguments[keyword.arg] = self._get_parameter_value(keyword.value)
+                calls.append(
+                    ToolCallItem(
+                        tool_index=call_index,  # Use the call index in the response, not tool position
+                        name=function_name,
+                        parameters=json.dumps(arguments, ensure_ascii=False),
+                    )
+                )
+
+            return StreamingParseResult(normal_text=normal_text, calls=calls)
+        except Exception:
+            logger.exception("Error in pythonic tool call parsing.")
+            return StreamingParseResult(normal_text=normal_text, calls=[])
+
+    def _find_matching_bracket(self, buffer: str, start: int) -> int:
+        """
+        Find the matching closing bracket for the opening bracket at start position.
+        Properly handles nested brackets.
+
+        Args:
+            buffer: The text buffer to search in
+            start: Position of the opening bracket '['

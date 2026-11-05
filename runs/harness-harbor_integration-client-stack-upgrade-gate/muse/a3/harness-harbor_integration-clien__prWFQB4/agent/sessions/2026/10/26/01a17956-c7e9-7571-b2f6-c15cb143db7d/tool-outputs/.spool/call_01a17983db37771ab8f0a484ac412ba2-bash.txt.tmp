@@ -1,0 +1,282 @@
+    def __init__(
+        self,
+        session_name: str,
+        environment: BaseEnvironment,
+        logging_path: Path | PurePosixPath,
+        local_asciinema_recording_path: Path | None,
+        remote_asciinema_recording_path: Path | PurePosixPath | None,
+        pane_width: int = 160,
+        pane_height: int = 40,
+        extra_env: dict[str, str] | None = None,
+        user: str | int | None = None,
+    ):
+        try:
+            self._pane_width = int(pane_width)
+            self._pane_height = int(pane_height)
+        except (ValueError, TypeError):
+            raise ValueError("pane_width and pane_height must be valid integers.")
+        if self._pane_width <= 0 or self._pane_height <= 0:
+            raise ValueError("pane_width and pane_height must be positive integers.")
+        self._logging_path = logging_path
+        self._local_asciinema_recording_path = local_asciinema_recording_path
+        self._remote_asciinema_recording_path = remote_asciinema_recording_path
+        self._session_name = session_name
+        self._logger = logger
+        self._previous_buffer: str | None = None
+        self._disable_recording = False
+        self.environment = environment
+        self._markers: list[tuple[float, str]] = []
+        self._extra_env: dict[str, str] = extra_env or {}
+        self._user = user
+
+    # TODO: Add asciinema logging
+    # @property
+    # def logging_path(self) -> Path:
+    #     return (
+    #         Path(DockerComposeManager.CONTAINER_SESSION_LOGS_PATH)
+    #         / f"{self._session_name}.log"
+    #     )
+
+    # @property
+    # def _recording_path(self) -> Path | None:
+    #     if self._disable_recording:
+    #         return None
+    #     return (
+    #         Path(DockerComposeManager.CONTAINER_SESSION_LOGS_PATH)
+    #         / f"{self._session_name}.cast"
+    #     )
+
+    async def _attempt_tmux_installation(self) -> None:
+    def _tmux_capture_pane(self, capture_entire: bool = False) -> str:
+        if capture_entire:
+            extra_args = ["-S", "-"]
+        else:
+            extra_args = []
+
+        return " ".join(
+            [
+                "tmux",
+                "capture-pane",
+                "-p",
+                *extra_args,
+                "-t",
+                self._session_name,
+            ]
+        )
+
+    async def start(self) -> None:
+        await self._attempt_tmux_installation()
+        start_session_result = await self.environment.exec(
+            command=self._tmux_start_session, user=self._user
+        )
+        if start_session_result.return_code != 0:
+            raise RuntimeError(
+                f"Failed to start tmux session. Error: {start_session_result.stderr}"
+            )
+
+        history_limit = 10_000_000
+        command = f"tmux set-option -g history-limit {history_limit}"
+        set_history_result = await self.environment.exec(
+            command=command, user=self._user
+        )
+        if set_history_result.return_code != 0:
+            self._logger.debug(
+                "Failed to increase tmux history-limit: %s",
+                (set_history_result.stderr or "").strip(),
+            )
+
+        if self._remote_asciinema_recording_path:
+            self._logger.debug("Starting recording.")
+            await self.send_keys(
+                keys=[
+                    f"asciinema rec --stdin {self._remote_asciinema_recording_path}",
+                    "Enter",
+                ],
+                min_timeout_sec=1.0,
+            )
+            await self.send_keys(
+                keys=[
+                    "clear",
+                    "Enter",
+                ],
+            )
+
+        if self._remote_asciinema_recording_path:
+            await self.environment.upload_file(
+                source_path=self._GET_ASCIINEMA_TIMESTAMP_SCRIPT_HOST_PATH,
+                target_path=str(self.GET_ASCIINEMA_TIMESTAMP_SCRIPT_CONTAINER_PATH),
+            )
+
+    async def stop(self) -> None:
+        if self._remote_asciinema_recording_path:
+            self._logger.debug("Stopping recording.")
+            await self.send_keys(
+                keys=["C-d"],
+                min_timeout_sec=0.1,
+            )
+
+            # Wait a moment for the recording to finish writing
+            import asyncio
+
+            await asyncio.sleep(0.5)
+
+            if self._local_asciinema_recording_path:
+                self._local_asciinema_recording_path.parent.mkdir(
+                    parents=True, exist_ok=True
+                )
+                # Ensure recording exists locally before merging markers
+                await self.environment.download_file(
+                    source_path=str(self._remote_asciinema_recording_path),
+                    target_path=self._local_asciinema_recording_path,
+                )
+
+            # Merge markers into the recording
+            if self._markers and self._local_asciinema_recording_path:
+                self._logger.debug(
+                    f"Merging {len(self._markers)} markers into recording"
+                )
+                handler = AsciinemaHandler(
+                    self._markers, self._local_asciinema_recording_path
+                )
+                handler.merge_markers()
+                self._logger.debug(
+                    f"Successfully merged markers into {self._local_asciinema_recording_path}"
+                )
+            else:
+                self._logger.debug("No markers to merge")
+        ...
+
+    def _is_enter_key(self, key: str) -> bool:
+        return key in self._ENTER_KEYS
+
+    def _ends_with_newline(self, key: str) -> bool:
+        result = re.search(self._ENDS_WITH_NEWLINE_PATTERN, key)
+        return result is not None
+
+    async def is_session_alive(self) -> bool:
+        """Check if the tmux session is still alive."""
+        result = await self.environment.exec(
+            command="tmux has-session -t {}".format(self._session_name),
+            user=self._user,
+        )
+        return result.return_code == 0
+
+    def _is_executing_command(self, key: str) -> bool:
+        return self._is_enter_key(key) or self._ends_with_newline(key)
+
+    def _prevent_execution(self, keys: list[str]) -> list[str]:
+        keys = keys.copy()
+        while keys and self._is_executing_command(keys[-1]):
+            if self._is_enter_key(keys[-1]):
+    async def _send_non_blocking_keys(
+        self,
+        keys: list[str],
+        min_timeout_sec: float,
+    ):
+        start_time_sec = time.time()
+
+        await self._send_keys_to_session(keys, action="non-blocking")
+
+        elapsed_time_sec = time.time() - start_time_sec
+
+        if elapsed_time_sec < min_timeout_sec:
+            await asyncio.sleep(min_timeout_sec - elapsed_time_sec)
+
+    async def send_keys(
+        self,
+        keys: str | list[str],
+        block: bool = False,
+        min_timeout_sec: float = 0.0,
+        max_timeout_sec: float = 180.0,
+    ):
+        """
+        Execute a command in the tmux session.
+
+        Args:
+            keys (str): The keys to send to the tmux session.
+            block (bool): Whether to wait for the command to complete.
+            min_timeout_sec (float): Minimum time in seconds to wait after executing.
+                Defaults to 0.
+            max_timeout_sec (float): Maximum time in seconds to wait for blocking
+                commands. Defaults to 3 minutes.
+        """
+        if block and min_timeout_sec > 0.0:
+            self._logger.debug("min_timeout_sec will be ignored because block is True.")
+
+        prepared_keys, is_blocking = self._prepare_keys(
+            keys=keys,
+            block=block,
+        )
+
+        self._logger.debug(
+            f"Sending keys: {prepared_keys}"
+            f" min_timeout_sec: {min_timeout_sec}"
+            f" max_timeout_sec: {max_timeout_sec}"
+        )
+
+        if is_blocking:
+            await self._send_blocking_keys(
+                keys=prepared_keys,
+                max_timeout_sec=max_timeout_sec,
+            )
+        else:
+            await self._send_non_blocking_keys(
+                keys=prepared_keys,
+                min_timeout_sec=min_timeout_sec,
+            )
+
+    async def capture_pane(self, capture_entire: bool = False) -> str:
+        result = await self.environment.exec(
+            self._tmux_capture_pane(capture_entire=capture_entire), user=self._user
+        )
+        return result.stdout or ""
+
+    async def _get_visible_screen(self) -> str:
+        return await self.capture_pane(capture_entire=False)
+
+    async def _find_new_content(self, current_buffer: str) -> str | None:
+        pb = "" if self._previous_buffer is None else self._previous_buffer.strip()
+        if pb in current_buffer:
+            idx = current_buffer.index(pb)
+            # Find the end of the previous buffer content
+            if "\n" in pb:
+                idx = pb.rfind("\n")
+            return current_buffer[idx:]
+        return None
+
+    async def get_incremental_output(self) -> str:
+        """
+        Get either new terminal output since last call, or current screen if
+        unable to determine.
+
+        This method tracks the previous buffer state and attempts to find new content
+        by comparing against the current full buffer. This provides better handling for
+        commands with large output that would overflow the visible screen.
+
+        Returns:
+            str: Formatted output with either "New Terminal Output:" or
+                 "Current Terminal Screen:"
+        """
+        current_buffer = await self.capture_pane(capture_entire=True)
+
+        # First capture - no previous state
+        if self._previous_buffer is None:
+            self._previous_buffer = current_buffer
+            visible_screen = await self._get_visible_screen()
+            return f"Current Terminal Screen:\n{visible_screen}"
+
+        # Try to find new content
+        new_content = await self._find_new_content(current_buffer)
+
+        # Update state
+        self._previous_buffer = current_buffer
+
+        if new_content is not None:
+            if new_content.strip():
+                return f"New Terminal Output:\n{new_content}"
+            else:
+                # No new content, show current screen
+                return f"Current Terminal Screen:\n{await self._get_visible_screen()}"
+        else:
+            # Couldn't reliably determine new content, fall back to current screen
+            return f"Current Terminal Screen:\n{await self._get_visible_screen()}"

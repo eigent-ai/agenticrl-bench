@@ -1,0 +1,32 @@
+diff -ruN '--exclude=__pycache__' base/verl/trainer/ppo/core_algos.py M04/verl/trainer/ppo/core_algos.py
+--- base/verl/trainer/ppo/core_algos.py	2026-10-12 11:39:31.000000000 +0000
++++ M04/verl/trainer/ppo/core_algos.py	2026-10-12 12:10:24.933066821 +0000
+@@ -1178,7 +1178,7 @@
+         # rank's local token sum by dp_size makes the reduced gradient equal to
+         # the sum over all valid tokens in the global batch.
+         loss = verl_F.masked_sum(loss_mat, loss_mask) * dp_size
+-    elif loss_agg_mode in ["seq-mean-token-sum", "seq-mean-token-sum-norm"]:
++    elif loss_agg_mode == "seq-mean-token-sum":
+         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)  # token-sum
+         seq_mask = (torch.sum(loss_mask, dim=-1) > 0).float()  # exclude fully masked sequences
+         if global_batch_size is None:
+@@ -1186,11 +1186,14 @@
+                 raise ValueError("global_batch_size is required when dp_size > 1")
+             global_batch_size = seq_mask.sum()
+         loss = verl_F.masked_sum(seq_losses, seq_mask) / global_batch_size * dp_size  # seq-mean
+-        if loss_agg_mode == "seq-mean-token-sum-norm":
+-            if loss_scale_factor is None:
+-                horizon = loss_mask.shape[-1]
+-                loss_scale_factor = horizon
+-            loss /= loss_scale_factor
++    elif loss_agg_mode == "seq-mean-token-sum-norm":
++        if loss_scale_factor is None:
++            raise ValueError(
++                f"{loss_agg_mode=} but {loss_scale_factor=}. "
++                'If not intented for custom scaling factor, try setting loss_agg_mode="seq-mean-token-sum".'
++            )
++        seq_losses = torch.sum(loss_mat * loss_mask, dim=-1)
++        loss = torch.sum(seq_losses) / loss_scale_factor * dp_size
+     elif loss_agg_mode == "seq-mean-token-mean":
+         seq_mask = torch.sum(loss_mask, dim=-1)  # per-sequence token count
+         seq_losses = torch.sum(loss_mat * loss_mask, dim=-1) / (seq_mask + 1e-8)  # token-mean

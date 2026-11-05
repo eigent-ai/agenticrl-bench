@@ -1,0 +1,21 @@
+root        26     1  0 22:56 ?        00:00:00 bash -c trap ":" QUIT TERM HUP; "$@"; echo "[engine] exited rc=$? at $(date -u +%FT%TZ)" engine /opt/live/venv/bin/python -I -m sglang.launch_server --config /var/lib/agentrl-live/engine.yaml
+root        31    26  0 22:56 ?        00:00:30 /opt/live/venv/bin/python -I -m sglang.launch_server --config /var/lib/agentrl-live/engine.yaml
+agent     6998  6994  0 23:51 ?        00:00:00 /usr/local/bin/python3 -I -c  import socket, sys, time for attempt in range(60):  # the service starts with the box     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)     try:         s.connect("/run/agentrl-live/run.sock")         break     except OSError as e:         s.close()         err = e         time.sleep(2) else:     sys.exit(f"[live] the live job service is not reachable ({err}); it starts with the box, try again in a minute") s.sendall(b"run\n") rc = 1 for line in s.makefile("rb"):     if line.startswith(b"\x00rc="):         rc = int(line[4:].strip() or b"1")         break     sys.stdout.buffer.write(line)     sys.stdout.flush() sys.exit(rc) 
+root      7018  6999  5 23:51 ?        00:00:06 /usr/local/bin/python3 -I -B /opt/live/srv/job.py --run-dir /var/lib/agentrl-live/runs/20261024-235124
+root      7376  7018  0 23:51 ?        00:00:00 runuser -u agent -- env HOME=/home/agent /usr/local/bin/python3 -m terminal_rl.proxy --engine-url http://127.0.0.1:16031 --host 127.0.0.1 --port 41715 --model-path /models/Qwen3-4B-Instruct-2507 --reasoning-parser none --context-length 32768
+agent     7377  7376  7 23:51 ?        00:00:08 /usr/local/bin/python3 -m terminal_rl.proxy --engine-url http://127.0.0.1:16031 --host 127.0.0.1 --port 41715 --model-path /models/Qwen3-4B-Instruct-2507 --reasoning-parser none --context-length 32768
+--- log files ---
+-rw-r--r-- 1 agent agent    214 Oct 24 23:51 /tmp/live_run.log
+-rw-r--r-- 1 agent agent    269 Oct 24 23:51 /tmp/live_probe_proxy.log
+-rw-r--r-- 1 agent agent 365384 Oct 24 23:50 /tmp/glm_proxy.log
+-rw-r--r-- 1 agent agent 166305 Oct 24 23:50 /tmp/qwen_proxy.log
+-rw-r--r-- 1 agent agent   7838 Oct 24 23:50 /tmp/slow_proxy.log
+-rw-r--r-- 1 agent agent     75 Oct 24 23:50 /tmp/qwen_fake.log
+-rw-r--r-- 1 agent agent     75 Oct 24 23:50 /tmp/glm_fake.log
+-rw-r--r-- 1 agent agent     92 Oct 24 23:48 /tmp/slow_engine.log
+-rw-r--r-- 1 agent agent     61 Oct 24 23:44 /tmp/replay_glm.log
+-rw-r--r-- 1 agent agent     61 Oct 24 23:44 /tmp/replay_qwen.log
+/tmp/glm_proxy.log
+/tmp/qwen_proxy.log
+/tmp/slow_proxy.log
+/tmp/live_probe_proxy.log

@@ -1,0 +1,2 @@
+- [Harbor upgrade is a pure migration](harbor-upgrade-pure-migration.md) — row-identical; suspected bugs go to /app/NOTES.md, not fixed
+- [Harbor upgrade evidence](harbor-upgrade-evidence.md) — old stack absent; what the replay/run tables show and what was inferred

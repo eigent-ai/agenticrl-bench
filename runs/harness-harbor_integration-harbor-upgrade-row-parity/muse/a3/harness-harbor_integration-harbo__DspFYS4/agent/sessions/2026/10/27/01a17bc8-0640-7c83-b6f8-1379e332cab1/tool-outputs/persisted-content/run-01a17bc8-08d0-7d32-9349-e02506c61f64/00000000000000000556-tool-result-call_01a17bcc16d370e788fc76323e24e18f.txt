@@ -1,0 +1,204 @@
+Read text file `/opt/miles/miles/rollout/generate_hub/agentic_tool_call.py`.
+1|"""
+2|Generic agentic generate function for agent-environment RL training.
+3|
+4|The agent logic is fully encapsulated in a user-provided async function
+5|(--custom-agent-function-path). This generate function only handles:
+6|  1. TITO session tracing (OpenAIEndpointTracer)
+7|  2. Collecting the worker-assembled training samples (the session server
+8|     converts records to samples, truncates and merges in the owning worker)
+9|  3. Driver-side metadata application (agent_metadata, session_metadata)
+10|
+11|Agent function contract:
+12|  async def my_agent(
+13|      base_url: str,
+14|      prompt: ...,
+15|      request_kwargs: dict,
+16|      metadata: dict,       # sample.metadata — env-specific fields
+17|      **kwargs,
+18|  ) -> dict | None:
+19|      ...
+20|
+21|  Returning None means no extra metadata to attach.
+22|  Returning a dict merges it into every sample's metadata, so downstream
+23|  reward models (--custom-rm-path) can read whatever the agent left there.
+24|"""
+25|
+26|import argparse
+27|import logging
+28|import time
+29|from collections.abc import Callable
+30|from copy import deepcopy
+31|from typing import Any
+32|
+33|import httpx
+34|from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+35|
+36|from miles.rollout.base_types import GenerateFnInput, GenerateFnOutput
+37|from miles.rollout.generate_utils.openai_endpoint_utils import OpenAIEndpointTracer
+38|from miles.rollout.session.v2.metrics import SESSION_ROLLOUT_METRICS_KEY
+39|from miles.utils.function_registry import load_function
+40|from miles.utils.types import Sample
+41|
+42|logger = logging.getLogger(__name__)
+43|
+44|
+45|async def generate(input: GenerateFnInput) -> GenerateFnOutput:
+46|    assert not input.args.partial_rollout, "Partial rollout is not supported"
+47|    assert getattr(input.args, "session_server_instances", None), (
+48|        "agentic_tool_call.generate requires session_server_instances. "
+49|        "Pass --use-session-server to start the session server."
+50|    )
+51|    use_v2 = getattr(input.args, "use_session_server", None) == "v2"
+52|    collect_spec_metrics = use_v2 and input.args.sglang_speculative_algorithm is not None
+53|    tracer = await OpenAIEndpointTracer.create(
+54|        input.args, evaluation=input.evaluation, sampling_params=input.sampling_params
+55|    )
+56|
+57|    custom_agent_function: Callable = load_function(input.args.custom_agent_function_path)
+58|    assert (
+59|        custom_agent_function is not None
+60|    ), f"Custom agent function {input.args.custom_agent_function_path} not found"
+61|
+62|    max_seq_len = getattr(input.args, "max_seq_len", None)
+63|
+64|    metadata = input.sample.metadata
+65|    if max_seq_len is not None:
+66|        metadata = {**metadata, "max_seq_len": max_seq_len}
+67|    if tracer.session_server_instance_id:
+68|        metadata = {**metadata, "session_server_instance_id": tracer.session_server_instance_id}
+69|
+70|    log_prefix = f"[session={tracer.session_id}]"
+71|
+72|    # From the tracer, not args: with multiple instances the owning ip:port is per-session.
+73|    metadata = {**metadata, "session_server_id": tracer.session_server_id}
+74|
+75|    agent_metadata = None
+76|    collect_failed = False
+77|    t_start = time.monotonic()
+78|    try:
+79|        logger.debug(f"{log_prefix} Starting agent function call")
+80|        agent_metadata = await custom_agent_function(
+81|            base_url=tracer.agent_base_url,
+82|            prompt=input.sample.prompt,
+83|            request_kwargs=build_chat_request_kwargs(input.sampling_params),
+84|            metadata=metadata,
+85|        )
+86|        logger.debug(f"{log_prefix} Agent function returned in {time.monotonic()-t_start:.1f}s")
+87|    except Exception as e:
+88|        logger.warning(f"{log_prefix} Agent function failed: {e}", exc_info=True)
+89|
+90|    finally:
+91|        # Collect even if the agent failed.
+92|        logger.debug(f"{log_prefix} Calling collect_samples...")
+93|        collect_kwargs = {"max_seq_len": max_seq_len}
+94|        if use_v2:
+95|            collect_kwargs["agent_metadata"] = agent_metadata
+96|        try:
+97|            result = await tracer.collect_samples(input.sample, **collect_kwargs)
+98|        # Costs this sample, not the run; a non-2xx still raises RuntimeError.
+99|        except (TimeoutError, httpx.TransportError) as e:
+100|            collect_failed = True
+101|            logger.warning(f"{log_prefix} Failed collecting samples: {e!r}", exc_info=True)
+102|        else:
+103|            logger.debug(
+104|                f"{log_prefix} collect_samples done: {len(result.samples)} samples, "
+105|                f"total_time={time.monotonic()-t_start:.1f}s"
+106|            )
+107|
+108|    if collect_failed:
+109|        sample = deepcopy(input.sample)
+110|        sample.status = Sample.Status.ABORTED
+111|        if collect_spec_metrics:
+112|            sample.metadata.pop(SESSION_ROLLOUT_METRICS_KEY, None)
+113|        return GenerateFnOutput(samples=[sample] if use_v2 else sample)
+114|
+115|    if not result.samples:
+116|        if result.empty_reason == "all_truncated":
+117|            logger.warning("All samples truncated (prompt already exceeds max_seq_len)")
+118|        else:
+119|            logger.warning("No model calls recorded for sample")
+120|        sample = deepcopy(input.sample)
+121|        sample.status = Sample.Status.ABORTED
+122|        if collect_spec_metrics:
+123|            sample.metadata.pop(SESSION_ROLLOUT_METRICS_KEY, None)
+124|        return GenerateFnOutput(samples=[sample] if use_v2 else sample)
+125|
+126|    session_rollout_metrics = None
+127|    if collect_spec_metrics:
+128|        session_rollout_metrics = result.session_metadata[SESSION_ROLLOUT_METRICS_KEY]
+129|        if session_rollout_metrics["session_id"] != tracer.session_id:
+130|            raise ValueError(
+131|                "session_rollout_metrics.session_id does not match the collected session: "
+132|                f"{session_rollout_metrics['session_id']!r} != {tracer.session_id!r}"
+133|            )
+134|        if session_rollout_metrics["metrics"] is None:
+135|            raise ValueError("a successful session collect must carry metrics")
+136|
+137|    samples = result.samples
+138|    if collect_spec_metrics:
+139|        for sample in samples:
+140|            sample.metadata.pop(SESSION_ROLLOUT_METRICS_KEY, None)
+141|            sample.metadata[SESSION_ROLLOUT_METRICS_KEY] = session_rollout_metrics
+142|    if use_v2 and len(samples) > 1:
+143|        # FIXME: handle sample index issues.
+144|        rollout_id = input.sample.rollout_id if input.sample.rollout_id is not None else input.sample.index
+145|        assert rollout_id is not None, "v2 agentic samples require input Sample.rollout_id or Sample.index"
+146|        for sample in samples:
+147|            sample.rollout_id = rollout_id
+148|    if not use_v2:
+149|        # v1: the agent's metadata is applied driver-side. Under v2 it traveled
+150|        # through collect_samples and came back applied by the server-side
+151|        # merge (per-sample metadata/reward on the wire) — no overlay here.
+152|        for s in samples:
+153|            s.metadata.update(agent_metadata or {})
+154|
+155|    # If the agent function reports wall-clock time spent outside policy generation
+156|    # (env/tool steps), surface it on Sample.non_generation_time so throughput
+157|    # accounting subtracts it.
+158|    ngt = ((agent_metadata or {}).get("agent_metrics") or {}).get("total_tool_time")
+159|    if ngt is not None:
+160|        for s in samples:
+161|            s.non_generation_time = ngt
+162|
+163|    if use_v2:
+164|        return GenerateFnOutput(samples=samples)
+165|
+166|    (sample,) = samples
+167|    sample.metadata.update(result.session_metadata)
+168|    return GenerateFnOutput(samples=sample)
+169|
+170|
+171|def _add_arguments(parser: argparse.ArgumentParser):
+172|    parser.add_argument("--custom-agent-function-path", type=str)
+173|    parser.add_argument(
+174|        "--max-seq-len",
+175|        type=int,
+176|        default=None,
+177|        dest="max_seq_len",
+178|        help="Max sequence length in tokens (prompt + completion, including env responses) "
+179|        "per session. Truncation happens inside the session server during sample assembly; "
+180|        "also forwarded to the Harbor agent server (as max_seq_len) to abort the trial early.",
+181|    )
+182|
+183|
+184|generate.add_arguments = _add_arguments
+185|
+186|
+187|# Process keys to match ChatCompletionRequest input
+188|def build_chat_request_kwargs(sampling_params: dict[str, Any]) -> dict[str, Any]:
+189|    request_kwargs = dict(sampling_params)
+190|    key_map = {
+191|        "max_new_tokens": "max_tokens",
+192|        "min_new_tokens": "min_tokens",
+193|        "sampling_seed": "seed",
+194|    }
+195|    for src, dst in key_map.items():
+196|        if src in request_kwargs:
+197|            if dst not in request_kwargs:
+198|                request_kwargs[dst] = request_kwargs[src]
+199|            request_kwargs.pop(src, None)
+200|
+201|    reserved_keys = {"model", "messages"}
+202|    allowed_keys = set(ChatCompletionRequest.model_fields) - reserved_keys
+203|    return {key: value for key, value in request_kwargs.items() if key in allowed_keys and value is not None}

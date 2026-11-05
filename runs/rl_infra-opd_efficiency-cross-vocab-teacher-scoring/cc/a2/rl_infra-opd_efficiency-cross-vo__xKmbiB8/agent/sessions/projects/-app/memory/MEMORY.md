@@ -1,0 +1,1 @@
+- [OPD hooks: testing on this box](opd-box-testing.md) — no pytest, fake teacher usage, shared Falcon scorer at :30000, run.sh keeps latest run

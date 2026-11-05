@@ -1,0 +1,26 @@
+1385:    def init_req_max_new_tokens(self, req):
+1386-        req.sampling_params.max_new_tokens = min(
+1387-            (
+1388-                req.sampling_params.max_new_tokens
+1389-                if req.sampling_params.max_new_tokens is not None
+1390-                else 1 << 30
+1391-            ),
+1392-            self.max_req_len - len(req.origin_input_ids) - 1,
+1393-        )
+1394-
+1395-    def _process_and_broadcast_mm_inputs(
+1396-        self,
+1397-        raw_mm_inputs: Optional[dict],
+1398-    ):
+1399-        """Materialize MultimodalInputs once on the entry rank and broadcast to others.
+1400-
+1401-        Entry rank:
+1402-        - constructs MultimodalInputs.from_dict(raw_mm_inputs) once
+1403-        - broadcasts to other ranks in self.cpu_group (if world_size > 1)
+1404-
+1405-        Non-entry ranks:
+1406-        - receive the object via broadcast (if world_size > 1)
+1407-        - otherwise (single-rank / no group) fall back to local from_dict
+1408-
+1409-        Returns:
+1410-            MultimodalInputs | None

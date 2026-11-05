@@ -1,0 +1,45 @@
+diff -ruN '--exclude=__pycache__' base/verl/workers/utils/losses.py L09/verl/workers/utils/losses.py
+--- base/verl/workers/utils/losses.py	2026-10-12 11:39:31.000000000 +0000
++++ L09/verl/workers/utils/losses.py	2026-10-12 12:39:11.690493777 +0000
+@@ -116,7 +116,7 @@
+     pg_metrics = Metric.from_dict(pg_metrics, aggregation=AggregationType.MEAN)
+ 
+     metrics.update(pg_metrics)
+-    metrics["actor/pg_loss"] = Metric(value=pg_loss, aggregation=metric_aggregation)
++    metrics["actor/pg_loss"] = Metric(value=pg_loss.detach(), aggregation=metric_aggregation)
+     policy_loss = pg_loss
+ 
+     # add entropy loss
+@@ -126,7 +126,7 @@
+         )
+         entropy_coeff = config.entropy_coeff
+         policy_loss -= entropy_coeff * entropy_loss
+-        metrics["actor/entropy_loss"] = Metric(value=entropy_loss, aggregation=metric_aggregation)
++        metrics["actor/entropy"] = Metric(value=entropy_loss.detach(), aggregation=metric_aggregation)
+ 
+     # add kl loss
+     if config.use_kl_loss:
+@@ -138,8 +138,8 @@
+         )
+ 
+         policy_loss += kl_loss * config.kl_loss_coef
+-        metrics["kl_loss"] = Metric(value=kl_loss, aggregation=metric_aggregation)
+-        metrics["kl_coef"] = config.kl_loss_coef
++        metrics["actor/kl_loss"] = Metric(value=kl_loss.detach(), aggregation=metric_aggregation)
++        metrics["actor/kl_coef"] = config.kl_loss_coef
+ 
+     return policy_loss, metrics
+ 
+@@ -197,9 +197,9 @@
+     )
+ 
+     metrics = {
+-        "critic/vf_loss": Metric(value=vf_loss, aggregation=metric_aggregation),
+-        "critic/vf_clipfrac": vf_clipfrac.detach().item(),
+-        "critic/vpred_mean": masked_mean(vpreds, response_mask).detach().item(),
++        "critic/vf_loss": Metric(value=vf_loss.detach(), aggregation=metric_aggregation),
++        "critic/vf_clipfrac": Metric(value=vf_clipfrac.detach(), aggregation=AggregationType.MEAN),
++        "critic/vpred_mean": Metric(value=masked_mean(vpreds, response_mask).detach(), aggregation=AggregationType.MEAN),
+     }
+ 
+     return vf_loss, metrics

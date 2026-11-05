@@ -1,0 +1,502 @@
+Read text file `/app/reference/harbor-0.23.0/harbor/agents/terminus_2/tmux_session.py`.
+1|import asyncio
+2|import base64
+3|import re
+4|import shlex
+5|import time
+6|import uuid
+7|from pathlib import Path, PurePosixPath
+8|from typing import Any
+9|
+10|from harbor.agents.terminus_2.asciinema_handler import AsciinemaHandler
+11|from harbor.environments.base import BaseEnvironment, ExecResult
+12|from harbor.utils.logger import logger
+13|
+14|
+15|class TmuxSession:
+16|    _ENTER_KEYS = {"Enter", "C-m", "KPEnter", "C-j", "^M", "^J"}
+17|    _ENDS_WITH_NEWLINE_PATTERN = r"[\r\n]$"
+18|    _NEWLINE_CHARS = "\r\n"
+19|    _TMUX_COMPLETION_COMMAND = "; tmux wait -S done"
+20|    # tmux rejects commands exceeding its internal message buffer (~16 KB
+21|    # since tmux 1.9, see https://github.com/tmux/tmux/issues/254) with
+22|    # "command too long". Keep a conservative margin below that hard
+23|    # ceiling; keys that cannot fit are delivered via a paste buffer
+24|    # instead (see _paste_key).
+25|    _TMUX_SEND_KEYS_MAX_COMMAND_LENGTH = 16_000
+26|    # stderr marker tmux prints when a client command exceeds the build's
+27|    # message size limit. Older tmux builds enforce far smaller limits than
+28|    # the ~16 KB above, so this is also handled at runtime as a fallback.
+29|    _TMUX_COMMAND_TOO_LONG_MARKER = "command too long"
+30|    # Base64 characters staged per `environment.exec` call when writing a
+31|    # paste-buffer file. exec does not go through tmux, so the bound is the
+32|    # shell's ARG_MAX; stay far below it while keeping round-trips few.
+33|    _PASTE_BASE64_CHUNK_LEN = 65_536
+34|    # Per-command ceiling for tool-install execs (apt/pip/source build). A
+35|    # command whose outbound connection is silently dropped (e.g. asciinema via
+36|    # pip on a closed-internet task) produces no output and would otherwise
+37|    # block until the agent-setup timeout; bounding each one lets the install
+38|    # fall through to the next fallback or degrade to a logged failure.
+39|    _TOOL_INSTALL_TIMEOUT_SEC = 120
+40|    # Ceiling for the whole tool-install step, kept well under harbor's 360s
+41|    # agent-setup timeout so even a pathological chain of hung commands cannot
+42|    # consume the setup budget. On expiry recording tools are skipped.
+43|    _TOOL_INSTALL_BUDGET_SEC = 240
+44|    GET_ASCIINEMA_TIMESTAMP_SCRIPT_CONTAINER_PATH = Path(
+45|        "/tmp/get-asciinema-timestamp.sh"
+46|    )
+47|    _GET_ASCIINEMA_TIMESTAMP_SCRIPT_HOST_PATH = Path(__file__).parent / (
+48|        "get-asciinema-timestamp.sh"
+49|    )
+50|
+51|    def __init__(
+52|        self,
+53|        session_name: str,
+54|        environment: BaseEnvironment,
+55|        logging_path: Path | PurePosixPath,
+56|        local_asciinema_recording_path: Path | None,
+57|        remote_asciinema_recording_path: Path | PurePosixPath | None,
+58|        pane_width: int = 160,
+59|        pane_height: int = 40,
+60|        extra_env: dict[str, str] | None = None,
+61|        user: str | int | None = None,
+62|    ):
+63|        try:
+64|            self._pane_width = int(pane_width)
+65|            self._pane_height = int(pane_height)
+66|        except (ValueError, TypeError):
+67|            raise ValueError("pane_width and pane_height must be valid integers.")
+68|        if self._pane_width <= 0 or self._pane_height <= 0:
+69|            raise ValueError("pane_width and pane_height must be positive integers.")
+70|        self._logging_path = logging_path
+71|        self._local_asciinema_recording_path = local_asciinema_recording_path
+72|        self._remote_asciinema_recording_path = remote_asciinema_recording_path
+73|        self._session_name = session_name
+74|        self._logger = logger
+75|        self._previous_buffer: str | None = None
+76|        self._disable_recording = False
+77|        self.environment = environment
+78|        self._markers: list[tuple[float, str]] = []
+79|        self._extra_env: dict[str, str] = extra_env or {}
+80|        self._user = user
+81|
+82|    # TODO: Add asciinema logging
+83|    # @property
+84|    # def logging_path(self) -> Path:
+85|    #     return (
+86|    #         Path(DockerComposeManager.CONTAINER_SESSION_LOGS_PATH)
+87|    #         / f"{self._session_name}.log"
+88|    #     )
+89|
+90|    # @property
+91|    # def _recording_path(self) -> Path | None:
+92|    #     if self._disable_recording:
+93|    #         return None
+94|    #     return (
+95|    #         Path(DockerComposeManager.CONTAINER_SESSION_LOGS_PATH)
+96|    #         / f"{self._session_name}.cast"
+97|    #     )
+98|
+99|    async def _attempt_tmux_installation(self) -> None:
+100|        """Install tmux and asciinema, bounded so a hung install cannot consume
+101|        the agent-setup budget.
+102|
+103|        Recording tools are best-effort. On a closed-internet task apt/PyPI may
+104|        be unreachable, so an install command can block producing no output;
+105|        without a bound the only ceiling is harbor's agent-setup timeout, which
+106|        fails the whole trial. Cap the entire step at ``_TOOL_INSTALL_BUDGET_SEC``
+107|        and, on expiry, proceed without recording rather than dying.
+108|        """
+109|        try:
+110|            await asyncio.wait_for(
+111|                self._install_recording_tools(),
+112|                timeout=self._TOOL_INSTALL_BUDGET_SEC,
+113|            )
+114|        except asyncio.TimeoutError:
+115|            self._logger.warning(
+116|                "Tool installation exceeded its %ss budget; proceeding without "
+117|                "guaranteed tmux/asciinema (session recording may be "
+118|                "unavailable).",
+119|                self._TOOL_INSTALL_BUDGET_SEC,
+120|            )
+121|
+122|    async def _install_recording_tools(self) -> None:
+123|        """
+124|        Install both tmux and asciinema in a single operation for efficiency.
+125|        """
+126|        # Check what's already installed
+127|        tmux_result = await self.environment.exec(command="tmux -V", user="root")
+128|        tmux_installed = tmux_result.return_code == 0
+129|
+130|        needs_asciinema = self._remote_asciinema_recording_path is not None
+131|        if needs_asciinema:
+132|            asciinema_result = await self.environment.exec(
+133|                command="asciinema --version", user="root"
+134|            )
+135|            asciinema_installed = asciinema_result.return_code == 0
+136|        else:
+137|            asciinema_installed = True
+138|
+139|        if tmux_installed and asciinema_installed:
+140|            self._logger.debug("Both tmux and asciinema are already installed")
+141|            return
+142|
+143|        tools_needed = []
+144|        if not tmux_installed:
+145|            tools_needed.append("tmux")
+146|        if needs_asciinema and not asciinema_installed:
+147|            tools_needed.append("asciinema")
+148|
+149|        self._logger.debug(f"Installing: {', '.join(tools_needed)}")
+150|
+151|        # Detect system and package manager
+152|        system_info = await self._detect_system_info()
+153|
+154|        if system_info["package_manager"]:
+155|            install_command = self._get_combined_install_command(
+156|                system_info, tools_needed
+157|            )
+158|            if install_command:
+159|                self._logger.debug(
+160|                    f"Installing tools using {system_info['package_manager']}: {install_command}"
+161|                )
+162|                result = await self.environment.exec(
+163|                    command=install_command,
+164|                    user="root",
+165|                    timeout_sec=self._TOOL_INSTALL_TIMEOUT_SEC,
+166|                )
+167|
+168|                if result.return_code == 0:
+169|                    # Verify installations
+170|                    if not tmux_installed:
+171|                        verify_tmux = await self.environment.exec(
+172|                            command="tmux -V", user="root"
+173|                        )
+174|                        if verify_tmux.return_code != 0:
+175|                            self._logger.warning(
+176|                                "tmux installation verification failed"
+177|                            )
+178|                            await self._build_tmux_from_source()
+179|
+180|                    if needs_asciinema and not asciinema_installed:
+181|                        verify_asciinema = await self.environment.exec(
+182|                            command="asciinema --version", user="root"
+183|                        )
+184|                        if verify_asciinema.return_code != 0:
+185|                            self._logger.warning(
+186|                                "asciinema installation verification failed"
+187|                            )
+188|                            await self._install_asciinema_with_pip()
+189|
+190|                    return
+191|
+192|        # Fallback to individual installations
+193|        if not tmux_installed:
+194|            self._logger.debug("Installing tmux from source...")
+195|            await self._build_tmux_from_source()
+196|
+197|        if needs_asciinema and not asciinema_installed:
+198|            self._logger.debug("Installing asciinema via pip...")
+199|            await self._install_asciinema_with_pip()
+200|
+201|    async def _detect_system_info(self) -> dict[str, str | None]:
+202|        """
+203|        Detect the operating system and available package managers.
+204|        """
+205|        system_info: dict[str, str | None] = {
+206|            "os": None,
+207|            "package_manager": None,
+208|            "update_command": None,
+209|        }
+210|
+211|        # Check for OS release files
+212|        os_release_result = await self.environment.exec(
+213|            command="cat /etc/os-release 2>/dev/null || echo 'not found'",
+214|            user="root",
+215|        )
+216|
+217|        # Check uname for system type
+218|        uname_result = await self.environment.exec(command="uname -s", user="root")
+219|
+220|        # Detect package managers by checking if they exist
+221|        package_managers = [
+222|            "apt-get",
+223|            "dnf",
+224|            "yum",
+225|            "apk",
+226|            "pacman",
+227|            "brew",
+228|            "pkg",
+229|            "zypper",
+230|        ]
+231|
+232|        for pm_name in package_managers:
+233|            check_result = await self.environment.exec(
+234|                command=f"which {pm_name} >/dev/null 2>&1", user="root"
+235|            )
+236|            if check_result.return_code == 0:
+237|                system_info["package_manager"] = pm_name
+238|                break
+239|
+240|        # Try to determine OS from available info
+241|        if (
+242|            os_release_result.return_code == 0
+243|            and os_release_result.stdout
+244|            and "not found" not in os_release_result.stdout
+245|        ):
+246|            stdout_lower = os_release_result.stdout.lower()
+247|            if "ubuntu" in stdout_lower or "debian" in stdout_lower:
+248|                system_info["os"] = "debian-based"
+249|            elif "fedora" in stdout_lower or "rhel" in stdout_lower:
+250|                system_info["os"] = "rhel-based"
+251|            elif "alpine" in stdout_lower:
+252|                system_info["os"] = "alpine"
+253|            elif "arch" in stdout_lower:
+254|                system_info["os"] = "arch"
+255|        elif uname_result.return_code == 0 and uname_result.stdout:
+256|            stdout_lower = uname_result.stdout.lower()
+257|            if "darwin" in stdout_lower:
+258|                system_info["os"] = "macos"
+259|            elif "freebsd" in stdout_lower:
+260|                system_info["os"] = "freebsd"
+261|
+262|        self._logger.debug(f"Detected system: {system_info}")
+263|        return system_info
+264|
+265|    def _get_combined_install_command(
+266|        self, system_info: dict[str, Any], tools: list[str]
+267|    ) -> str:
+268|        """
+269|        Get the appropriate installation command for multiple tools based on system info.
+270|        """
+271|        package_manager = system_info.get("package_manager")
+272|
+273|        if not package_manager or not isinstance(package_manager, str):
+274|            return ""
+275|
+276|        # Build the package list
+277|        packages = " ".join(tools)
+278|
+279|        # Package manager commands with non-interactive flags
+280|        install_commands = {
+281|            "apt-get": f"DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y {packages}",
+282|            "dnf": f"dnf install -y {packages}",
+283|            "yum": f"yum install -y {packages}",
+284|            "apk": f"apk add --no-cache {packages}",
+285|            "pacman": f"pacman -S --noconfirm {packages}",
+286|            "brew": f"brew install {packages}",
+287|            "pkg": f"ASSUME_ALWAYS_YES=yes pkg install -y {packages}",
+288|            "zypper": f"zypper install -y -n {packages}",
+289|        }
+290|
+291|        return install_commands.get(package_manager, "")
+292|
+293|    async def _build_tmux_from_source(self) -> None:
+294|        """
+295|        Build tmux from source as a fallback option.
+296|        """
+297|        try:
+298|            # Install build dependencies based on detected system - with non-interactive flags
+299|            dep_commands = [
+300|                "DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential libevent-dev libncurses5-dev curl",
+301|                "yum groupinstall -y 'Development Tools' && yum install -y libevent-devel ncurses-devel curl",
+302|                "dnf groupinstall -y 'Development Tools' && dnf install -y libevent-devel ncurses-devel curl",
+303|                "apk add --no-cache build-base libevent-dev ncurses-dev curl",
+304|            ]
+305|
+306|            # Try to install build dependencies
+307|            for cmd in dep_commands:
+308|                result = await self.environment.exec(
+309|                    command=cmd,
+310|                    user="root",
+311|                    timeout_sec=self._TOOL_INSTALL_TIMEOUT_SEC,
+312|                )
+313|                if result.return_code == 0:
+314|                    break
+315|
+316|            # Download and build tmux
+317|            build_cmd = (
+318|                "cd /tmp && "
+319|                "curl -L https://github.com/tmux/tmux/releases/download/3.4/tmux-3.4.tar.gz -o tmux.tar.gz && "
+320|                "tar -xzf tmux.tar.gz && "
+321|                "cd tmux-3.4 && "
+322|                "./configure --prefix=/usr/local && "
+323|                "make && "
+324|                "make install"
+325|            )
+326|
+327|            result = await self.environment.exec(
+328|                command=build_cmd,
+329|                user="root",
+330|                timeout_sec=self._TOOL_INSTALL_TIMEOUT_SEC,
+331|            )
+332|
+333|            # Verify installation
+334|            verify_result = await self.environment.exec(
+335|                command="tmux -V || /usr/local/bin/tmux -V", user="root"
+336|            )
+337|            if verify_result.return_code == 0:
+338|                self._logger.debug("tmux successfully built and installed from source")
+339|            else:
+340|                self._logger.error("Failed to install tmux from source")
+341|
+342|        except Exception as e:
+343|            self._logger.error(f"Failed to build tmux from source: {e}")
+344|
+345|    async def _install_asciinema_with_pip(self) -> None:
+346|        """
+347|        Install asciinema using pip as a fallback.
+348|        """
+349|        try:
+350|            # Try to install python3-pip first - with non-interactive flags
+351|            pip_install_commands = [
+352|                "DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y python3-pip",
+353|                "yum install -y python3-pip",
+354|                "dnf install -y python3-pip",
+355|                "apk add --no-cache python3 py3-pip",
+356|            ]
+357|
+358|            # Try to install pip
+359|            for cmd in pip_install_commands:
+360|                result = await self.environment.exec(
+361|                    command=cmd,
+362|                    user="root",
+363|                    timeout_sec=self._TOOL_INSTALL_TIMEOUT_SEC,
+364|                )
+365|                if result.return_code == 0:
+366|                    break
+367|
+368|            # Install asciinema using pip
+369|            pip_commands = ["pip3 install asciinema", "pip install asciinema"]
+370|
+371|            for cmd in pip_commands:
+372|                result = await self.environment.exec(
+373|                    command=cmd,
+374|                    user="root",
+375|                    timeout_sec=self._TOOL_INSTALL_TIMEOUT_SEC,
+376|                )
+377|                if result.return_code == 0:
+378|                    # Verify installation
+379|                    verify_result = await self.environment.exec(
+380|                        command="asciinema --version", user="root"
+381|                    )
+382|                    if verify_result.return_code == 0:
+383|                        self._logger.debug("asciinema successfully installed using pip")
+384|                        return
+385|
+386|            self._logger.error("Failed to install asciinema using pip")
+387|
+388|        except Exception as e:
+389|            self._logger.error(f"Failed to install asciinema with pip: {e}")
+390|
+391|    @property
+392|    def _tmux_start_session(self) -> str:
+393|        # Build environment variable options for tmux new-session -e KEY=value
+394|        env_options = "".join(
+395|            f"-e {shlex.quote(f'{key}={value}')} "
+396|            for key, value in self._extra_env.items()
+397|        )
+398|
+399|        return (
+400|            f"export TERM=xterm-256color && "
+401|            f"export SHELL=/bin/bash && "
+402|            f"tmux new-session {env_options}-x {self._pane_width} -y {self._pane_height} -d -s {self._session_name} 'bash --login' \\; "
+403|            f"pipe-pane -t {self._session_name} "
+404|            f"'cat > {self._logging_path}'"
+405|        )
+406|
+407|    @staticmethod
+408|    def _utf8_len(s: str) -> int:
+409|        """Return the UTF-8 byte length of *s*.
+410|
+411|        tmux measures command/message sizes in bytes, not Unicode code
+412|        points, so all size checks must use byte length.
+413|        """
+414|        return len(s.encode("utf-8"))
+415|
+416|    @property
+417|    def _send_keys_prefix(self) -> str:
+418|        # use `--` to explicitly mark end of options so everything after is
+419|        # treated as keys
+420|        return "tmux send-keys -t " + shlex.quote(self._session_name) + " --"
+421|
+422|    @property
+423|    def _max_escaped_key_length(self) -> int:
+424|        """Largest quoted key that still fits in a single send-keys command."""
+425|        return (
+426|            self._TMUX_SEND_KEYS_MAX_COMMAND_LENGTH
+427|            - self._utf8_len(self._send_keys_prefix)
+428|            - 1
+429|        )
+430|
+431|    def _send_keys_command(self, keys: list[str]) -> str:
+432|        return self._send_keys_prefix + " " + " ".join(shlex.quote(key) for key in keys)
+433|
+434|    def _key_requires_paste(self, key: str) -> bool:
+435|        return self._utf8_len(shlex.quote(key)) > self._max_escaped_key_length
+436|
+437|    def _batch_keys_for_send(self, keys: list[str]) -> list[list[str]]:
+438|        """Group *keys* into batches whose send-keys command fits the limit.
+439|
+440|        Every key must individually fit in a single command; oversized keys
+441|        (see ``_key_requires_paste``) are delivered via ``_paste_key``.
+442|        """
+443|        max_len = self._TMUX_SEND_KEYS_MAX_COMMAND_LENGTH
+444|        prefix_len = self._utf8_len(self._send_keys_prefix)
+445|
+446|        batches: list[list[str]] = []
+447|        batch: list[str] = []
+448|        batch_len = prefix_len
+449|
+450|        for key in keys:
+451|            escaped_len = self._utf8_len(shlex.quote(key))
+452|            if escaped_len > self._max_escaped_key_length:
+453|                raise ValueError(
+454|                    "key exceeds the tmux send-keys command-length limit; "
+455|                    "it must be sent via a paste buffer instead"
+456|                )
+457|            addition = 1 + escaped_len  # space + quoted key
+458|            if batch and batch_len + addition > max_len:
+459|                batches.append(batch)
+460|                batch = []
+461|                batch_len = prefix_len
+462|            batch.append(key)
+463|            batch_len += addition
+464|
+465|        if batch:
+466|            batches.append(batch)
+467|        return batches
+468|
+469|    def _tmux_send_keys(self, keys: list[str]) -> list[str]:
+470|        """Build one or more ``tmux send-keys`` commands for *keys*.
+471|
+472|        If the shell-escaped command would exceed the tmux command-length
+473|        limit, the keys are spread across multiple commands so that each
+474|        individual command stays within the limit.
+475|        """
+476|        return [
+477|            self._send_keys_command(batch) for batch in self._batch_keys_for_send(keys)
+478|        ]
+479|
+480|    def _tmux_capture_pane(self, capture_entire: bool = False) -> str:
+481|        if capture_entire:
+482|            extra_args = ["-S", "-"]
+483|        else:
+484|            extra_args = []
+485|
+486|        return " ".join(
+487|            [
+488|                "tmux",
+489|                "capture-pane",
+490|                "-p",
+491|                *extra_args,
+492|                "-t",
+493|                self._session_name,
+494|            ]
+495|        )
+496|
+497|    async def start(self) -> None:
+498|        await self._attempt_tmux_installation()
+499|        start_session_result = await self.environment.exec(
+500|            command=self._tmux_start_session, user=self._user
+(more lines below)

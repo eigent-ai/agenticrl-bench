@@ -1,0 +1,5 @@
+DEVICE=eth0
+BOOTPROTO=none
+ONBOOT=no
+HWADDR=
+TYPE=Ethernet

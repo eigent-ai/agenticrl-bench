@@ -1,0 +1,62 @@
+
+        # Get hf config
+        self._maybe_pull_model_tokenizer_from_remote()
+        self.model_override_args = json.loads(model_override_args)
+        kwargs = {}
+        if override_config_file and override_config_file.strip():
+            kwargs["_configuration_file"] = override_config_file.strip()
+        self.hf_config = get_config(
+            self.model_path,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            model_override_args=self.model_override_args,
+            **kwargs,
+        )
+        self.hf_text_config = get_hf_text_config(self.hf_config)
+        self.hf_generation_config = get_generation_config(
+            self.model_path,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            **kwargs,
+        )
+
+        # Set enable_multimodal
+        if enable_multimodal is None:
+            mm_disabled_models = [
+                "Gemma3ForConditionalGeneration",
+                "Llama4ForConditionalGeneration",
+                "Step3VLForConditionalGeneration",
+            ]
+            if self.hf_config.architectures[0] in mm_disabled_models:
+                enable_multimodal = False
+/usr/local/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py:406:def get_generation_config(
+/usr/local/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py-407-    model: str,
+/usr/local/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py-408-    trust_remote_code: bool,
+/usr/local/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py-409-    revision: Optional[str] = None,
+/usr/local/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py-410-    **kwargs,
+/usr/local/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py-411-):
+/usr/local/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py-412-    try:
+/usr/local/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py-413-        return GenerationConfig.from_pretrained(
+/usr/local/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py-414-            model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+/usr/local/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py-415-        )
+/usr/local/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py-416-    except OSError as e:
+/usr/local/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py-417-        return None
+/usr/local/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py-418-
+/usr/local/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py-419-
+/usr/local/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py-420-# Qwen-1M related
+/usr/local/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py-421-def get_sparse_attention_config(
+/usr/local/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py-422-    model: str,
+/usr/local/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py-423-    sparse_attention_config_filename: str = "sparse_attention_config.json",
+/usr/local/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py-424-) -> Dict[str, Any]:
+/usr/local/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py-425-    is_local = os.path.isdir(model)
+/usr/local/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py-426-    if not is_local:
+/usr/local/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py-427-        # Download the config files.
+/usr/local/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py-428-        model = download_from_hf(model, allow_patterns=["*.json"])
+/usr/local/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py-429-
+/usr/local/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py-430-    config_file = os.path.join(model, sparse_attention_config_filename)
+/usr/local/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py-431-    if not os.path.exists(config_file):
+/usr/local/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py-432-        return {}
+/usr/local/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py-433-
+/usr/local/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py-434-    # Load the sparse attention config.
+/usr/local/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py-435-    with open(config_file) as f:
+/usr/local/lib/python3.12/site-packages/sglang/srt/utils/hf_transformers_utils.py-436-        config = json.load(f)

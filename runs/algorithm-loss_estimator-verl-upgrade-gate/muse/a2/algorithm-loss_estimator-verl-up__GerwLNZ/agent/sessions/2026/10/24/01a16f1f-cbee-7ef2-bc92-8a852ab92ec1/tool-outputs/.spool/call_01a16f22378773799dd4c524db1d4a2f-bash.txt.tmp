@@ -1,0 +1,49 @@
+65:from verl.trainer.ppo.ray_trainer import apply_kl_penalty, compute_spec_decode_metrics
+66:from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+76:from verl.trainer.ppo.v1.utils import MetricsAggregator, compute_advantage_for_multi_trajectories
+140:        if self.config.algorithm.use_kl_in_reward:
+178:        # their filtering semantics and can consume algorithm.filter_groups through their own config.
+180:            filter_groups_metric = self._resolve_filter_groups_metric()
+183:                filter_groups_metric=filter_groups_metric,
+187:                filter_groups = self.config.algorithm.get("filter_groups", None)
+189:                if filter_groups_metric is not None:
+190:                    max_inflight_gen_batches = filter_groups.get("max_inflight_gen_batches", 1)
+195:                    if filter_groups_metric is not None or sync_refill_failed_groups
+201:    def _resolve_filter_groups_metric(self) -> str | None:
+203:        filter_groups = self.config.algorithm.get("filter_groups", None)
+204:        filter_enabled = bool(filter_groups is not None and filter_groups.get("enable", False))
+208:        filter_metric = filter_groups.get("metric", None)
+210:            raise ValueError("algorithm.filter_groups.metric must be set when group filtering is enabled")
+215:            "algorithm.filter_groups requires the reward metric at sampling time: use rule-based reward or "
+219:        max_num_gen_batches = filter_groups.get("max_num_gen_batches", 0)
+222:                "algorithm.filter_groups.max_num_gen_batches=%s is ignored by the built-in V1 ReplayBuffer; "
+742:        filter_groups = self.config.algorithm.get("filter_groups", None)
+743:        dapo_enabled = bool(filter_groups is not None and filter_groups.get("enable", False))
+1559:        response_mask = self._lengths_to_mask(response_lengths, responses.size(1))
+1560:        attention_mask = torch.cat([prompt_mask, response_mask], dim=1)
+1656:        bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+1676:        fields = ["entropy", "log_probs", "response_mask"]
+1682:        data["old_log_probs"] = response_from_nested(data.pop("log_probs"), data["response_mask"])
+1683:        data["entropy"] = response_from_nested(data.pop("entropy"), data["response_mask"])
+1694:            loss_mask=data.batch["response_mask"],
+1729:            keys=batch.keys, partition_id=batch.partition_id, select_fields=["log_probs", "response_mask"]
+1731:        data["ref_log_prob"] = response_from_nested(data.pop("log_probs"), data["response_mask"])
+1751:            keys=batch.keys, partition_id=batch.partition_id, select_fields=["values", "response_mask"]
+1753:        data["values"] = response_from_nested(data.pop("values"), data["response_mask"])
+1760:        fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
+1763:        response_mask = data["response_mask"]
+1769:        if self.config.algorithm.use_kl_in_reward:
+1770:            data, kl_metrics = apply_kl_penalty(
+1775:            data.batch["token_level_rewards"] = data.batch["token_level_scores"]
+1781:        bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+1786:            data, is_metrics = compute_rollout_correction_and_add_to_batch(data, rollout_corr_config)
+1790:        data = compute_advantage_for_multi_trajectories(
+1792:            batch_keys=batch.keys,
+1803:        if self.config.algorithm.use_kl_in_reward:
+1804:            fields.append("token_level_rewards")
+1806:            fields.append("response_mask")
+1812:            output[field] = response_to_nested(data.batch[field], response_mask)
+1889:            "response_mask",
+1894:            "token_level_rewards",
+1936:        if "token_level_rewards" not in data:
+1937:            data["token_level_rewards"] = data["rm_scores"]

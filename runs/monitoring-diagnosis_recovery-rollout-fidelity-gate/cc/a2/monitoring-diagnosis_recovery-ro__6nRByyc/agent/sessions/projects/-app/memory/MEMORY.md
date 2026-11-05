@@ -1,0 +1,2 @@
+- [Screening box workflow](screening-box-workflow.md) — run_screen.sh service, own runs only when idle + ray stop, 2 h task limit
+- [Fidelity check design](fidelity-check-design.md) — why the panel fails, which tests work, queue verdicts

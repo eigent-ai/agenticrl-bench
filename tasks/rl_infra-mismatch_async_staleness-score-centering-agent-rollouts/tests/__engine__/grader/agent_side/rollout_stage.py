@@ -1,0 +1,105 @@
+import argparse
+import asyncio
+import json
+import os
+import pickle
+import sys
+import time
+import traceback
+from unittest.mock import patch
+import httpx
+ap = argparse.ArgumentParser()
+ap.add_argument("--cases", required=True)
+ap.add_argument("--out", required=True)
+ap.add_argument("--router", default="127.0.0.1:30777")
+ap.add_argument("--only", default=None)
+a = ap.parse_args()
+import replay
+from argv import build_argv
+CASES = json.load(open(a.cases))
+TIMEOUT_ROLLOUT = 120
+def select(uid):
+    httpx.post(f"http://{a.router}/_replay/select", json={"uid": uid}, timeout=30).raise_for_status()
+async def run_case(case, out_dir):
+    from miles.rollout.inference_rollout.inference_rollout_common import GenerateState, generate_and_rm
+    from miles.utils import http_utils
+    from miles.utils.arguments import parse_args
+    from miles.utils.http_utils import init_http_client
+    from miles.utils.types import Sample
+    argv = build_argv(case, router=a.router)
+    with patch("sys.argv", ["train.py"] + argv):
+        args = parse_args()
+    http_utils._http_client = None
+    init_http_client(args)
+    server = None
+    if case["recipe"] == "session":
+        from miles.rollout.session.config import compute_session_server_config
+        from miles.rollout.session.server import SessionServer
+        from miles.rollout.session.types import SessionServerInstance
+        from miles.utils.test_utils.uvicorn_thread_server import UvicornThreadServer
+        port = int(case.get("session_port", 31780))
+        instance_id = f"{args.run_uuid}-0"
+        args.session_server_instances = [SessionServerInstance(addr=f"127.0.0.1:{port}", instance_id=instance_id)]
+        cfg = compute_session_server_config(args, host="127.0.0.1", port=port, instance_id=instance_id,
+                                            backend_url=f"http://{a.router}")
+        server = UvicornThreadServer(SessionServer(cfg).app, host="127.0.0.1", port=port)
+        server.start()
+    try:
+        state = GenerateState(args)
+        replay.CURRENT["rewards"] = case["rewards"]
+        samples = []
+        index = 0
+        for gi, group in enumerate(case["groups"]):
+            for uid in group:
+                rec = replay.data()[uid]
+                select(uid)
+                replay.CURRENT.update(uid=uid, tool_i=0)
+                md = {"replay_uid": uid}
+                if rec.get("first_turn_top_p") is not None:
+                    md["first_turn_top_p"] = rec["first_turn_top_p"]
+                prompt = rec["prompt_messages"] if case["recipe"] == "session" else rec["prompt_text"]
+                s = Sample(prompt=prompt, label="{}", metadata=md, index=index, group_index=gi)
+                s.rollout_id = index
+                index += 1
+                out = await asyncio.wait_for(
+                    generate_and_rm(state, s, dict(state.sampling_params)), timeout=TIMEOUT_ROLLOUT
+                )
+                outs = out if isinstance(out, list) else [out]
+                for o in outs:
+                    if o.status == Sample.Status.ABORTED:
+                        raise RuntimeError(f"rollout {uid} aborted")
+                samples.extend(outs)
+        select(None)
+        from miles.ray.rollout.train_data_conversion import convert_samples_to_train_data
+        train_data = convert_samples_to_train_data(args, samples, {}, None, None)
+        with open(os.path.join(out_dir, "train_data.pkl"), "wb") as f:
+            pickle.dump(train_data, f)
+        summary = [{"tokens": list(map(int, s.tokens)), "response_length": int(s.response_length),
+                    "loss_mask": list(map(int, s.loss_mask or [])), "status": str(s.status),
+                    "uid": (s.metadata or {}).get("replay_uid")} for s in samples]
+        with open(os.path.join(out_dir, "samples.json"), "w") as f:
+            json.dump(summary, f)
+    finally:
+        if server is not None:
+            server.stop()
+def main():
+    status = {}
+    for case in CASES:
+        if a.only and case["id"] != a.only:
+            continue
+        out_dir = os.path.join(a.out, case["id"])
+        os.makedirs(out_dir, exist_ok=True)
+        t0 = time.time()
+        try:
+            asyncio.run(run_case(case, out_dir))
+            status[case["id"]] = {"ok": True, "s": round(time.time() - t0, 1)}
+        except BaseException as e:
+            status[case["id"]] = {"ok": False, "s": round(time.time() - t0, 1),
+                                  "error": f"{type(e).__name__}: {e}"[:2000], "tb": traceback.format_exc()[-6000:]}
+        print(json.dumps({case["id"]: {k: v for k, v in status[case["id"]].items() if k != "tb"}}), flush=True)
+        if "tb" in status[case["id"]]:
+            print(status[case["id"]]["tb"], file=sys.stderr, flush=True)
+        with open(os.path.join(a.out, "rollout_status.json"), "w") as f:
+            json.dump(status, f)
+main()
+sys.exit(0)

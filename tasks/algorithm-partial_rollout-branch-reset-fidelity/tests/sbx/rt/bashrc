@@ -1,0 +1,15 @@
+if [ -r /run/sbx/rt/clock.env ] && [ -z "${LD_PRELOAD:-}" ]; then
+  set -a; . /run/sbx/rt/clock.env; set +a
+  exec bash --rcfile /run/sbx/rt/bashrc -i
+fi
+[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc
+[ -f ~/.bashrc ] && . ~/.bashrc
+export PYTHONSTARTUP=/run/sbx/rt/pystartup.py
+HISTCONTROL=ignorespace
+__sbx_state() {
+  __sbx_rc=$?
+  { builtin echo "pwd $PWD"; builtin umask; builtin set +o; builtin shopt -p; builtin declare -p;
+    builtin alias -p; builtin declare -f; builtin jobs; builtin dirs -l -p; builtin trap -p; } 2>/dev/null >| /run/sbx/state/shell
+  return $__sbx_rc
+}
+PROMPT_COMMAND=__sbx_state

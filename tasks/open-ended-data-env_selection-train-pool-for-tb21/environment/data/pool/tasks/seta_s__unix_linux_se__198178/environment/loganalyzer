@@ -1,0 +1,97 @@
+#!/bin/bash
+
+if [ $# -ne 1 ]; then
+    echo "Usage: loganalyzer <logfile>"
+    exit 1
+fi
+
+LOGFILE="$1"
+
+if [ ! -f "$LOGFILE" ]; then
+    echo "Error: File '$LOGFILE' not found"
+    exit 1
+fi
+
+declare -A sev_names
+sev_names[0]="debug"
+sev_names[1]="info"
+sev_names[2]="notice"
+sev_names[3]="warning"
+sev_names[4]="err"
+sev_names[5]="crit"
+sev_names[6]="alert"
+sev_names[7]="emerg"
+
+declare -A fac_names
+fac_names[0]="kern"
+fac_names[1]="user"
+fac_names[2]="mail"
+fac_names[3]="daemon"
+fac_names[4]="auth"
+fac_names[5]="syslog"
+fac_names[6]="lpr"
+fac_names[7]="news"
+fac_names[8]="uucp"
+fac_names[9]="cron"
+fac_names[10]="authpriv"
+fac_names[11]="ftp"
+fac_names[16]="local0"
+fac_names[17]="local1"
+fac_names[18]="local2"
+fac_names[19]="local3"
+fac_names[20]="local4"
+fac_names[21]="local5"
+fac_names[22]="local6"
+fac_names[23]="local7"
+
+declare -A sev_count
+declare -A fac_count
+critical_msgs=()
+total=0
+
+while IFS= read -r line; do
+    if [[ "$line" =~ ^\<([0-9]+)\> ]]; then
+        pri="${BASH_REMATCH[1]}"
+
+        fac_num=$(( pri & 7 ))
+        sev_num=$(( pri >> 3 ))
+
+        sev_label="${sev_names[$sev_num]:-unknown}"
+        fac_label="${fac_names[$fac_num]:-facility$fac_num}"
+
+        sev_count[$sev_label]=$(( ${sev_count[$sev_label]:-0} + 1 ))
+        fac_count[$fac_label]=$(( ${fac_count[$fac_label]:-0} + 1 ))
+
+        if [ "$sev_num" -ge 5 ]; then
+            msg="${line#*: }"
+            critical_msgs+=("$fac_label.$sev_label: $msg")
+        fi
+
+        total=$(( total + 1 ))
+    fi
+done < "$LOGFILE"
+
+echo "=== Severity Breakdown ==="
+for sev in emerg alert crit err warning notice info debug; do
+    if [ "${sev_count[$sev]:-0}" -gt 0 ]; then
+        echo "  $sev: ${sev_count[$sev]}"
+    fi
+done
+
+echo ""
+echo "=== Facility Breakdown ==="
+for fac in kern user mail daemon auth syslog lpr news uucp cron authpriv ftp local0 local1 local2 local3 local4 local5 local6 local7; do
+    if [ "${fac_count[$fac]:-0}" -gt 0 ]; then
+        echo "  $fac: ${fac_count[$fac]}"
+    fi
+done
+
+echo ""
+echo "=== Critical and Above ==="
+if [ ${#critical_msgs[@]} -eq 0 ]; then
+    echo "  (none)"
+else
+    for msg in "${critical_msgs[@]}"; do
+        echo "  $msg"
+    done
+fi

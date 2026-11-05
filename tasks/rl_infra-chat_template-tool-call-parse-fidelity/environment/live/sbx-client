@@ -1,0 +1,22 @@
+#!/usr/local/bin/python3 -I
+"""Shell of the live data agent (DATA_AGENT_SANDBOX_CMD of the live batch): runs its arguments as user nobody through
+the live service, in the current directory under /work/ws, with limits and a 40 s cap."""
+import json
+import os
+import socket
+import sys
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect("/run/agentrl-live/sbx/sock")
+s.sendall(json.dumps({"argv": sys.argv[1:], "cwd": os.getcwd()}).encode() + b"\n")
+buf = b""
+while True:
+    chunk = s.recv(1 << 16)
+    if not chunk:
+        break
+    buf += chunk
+r = json.loads(buf)
+sys.stdout.write(r["stdout"])
+sys.stderr.write(r["stderr"])
+rc = r["rc"]
+sys.exit(rc if 0 <= rc < 256 else 128 + min(-rc, 127) if rc < 0 else 1)

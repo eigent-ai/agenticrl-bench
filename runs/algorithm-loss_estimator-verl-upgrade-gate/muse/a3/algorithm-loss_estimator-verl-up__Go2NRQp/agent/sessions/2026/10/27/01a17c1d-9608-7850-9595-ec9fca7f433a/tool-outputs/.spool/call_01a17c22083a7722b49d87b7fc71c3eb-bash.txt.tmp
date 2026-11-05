@@ -1,0 +1,107 @@
+    # Store global batch info for loss aggregation:
+    # dp_size: data parallel size
+    # batch_num_tokens: number of valid tokens in global batch
+    # global_batch_size: global batch size
+    global_batch_info: dict = field(default_factory=dict)
+
+    # Store distillation loss settings for computing the specified loss_mode
+    # Not set by user, populated at runtime
+    loss_settings: Optional[dict] = None
+
+    def __post_init__(self):
+        self._mutable_fields.add("loss_settings")
+        from verl.trainer.distillation.losses import DistillationLossSettings, get_distillation_loss_settings
+
+        self.loss_settings: DistillationLossSettings = get_distillation_loss_settings(self.loss_mode)
+
+        if self.policy_loss_mode != "vanilla":
+            raise NotImplementedError(
+                f"Only vanilla policy loss is currently supported when use_policy_gradient is True, "
+                f"but got {self.policy_loss_mode}."
+            )
+
+        if self.use_policy_gradient and self.loss_mode == "forward_kl_topk":
+            print(
+                "WARNING: forward_kl_topk is most effective as a supervised distillation loss "
+                "(use_policy_gradient=False). With policy gradient, the update uses only the sampled"
+                " token's logprob ∇logπ(a), so the top-k distributional signal (how non-sampled logits "
+                "should move) is largely unused."
+            )
+
+        if not self.use_policy_gradient and self.loss_mode == "k1":
+            raise ValueError(
+                "Directly backpropagating k1 loss is incorrect since gradient of k1 loss"
+                " wrt model weights does not depend on teacher log probabilities."
+            )
+
+
+@dataclass
+class DistillationTeacherModelConfig(BaseConfig):
+    """Configuration for on-policy distillation teacher.
+
+    loss_scale_factor: Optional[int] = None
+    entropy_coeff: float = 0
+    tau_pos: float = 1.0
+    tau_neg: float = 1.05
+    calculate_entropy: bool = False
+    calculate_sum_pi_squared: bool = False
+    use_kl_loss: bool = False
+    # Whether to enable PrefixGrouper-based shared-prefix forward
+    use_prefix_grouper: bool = False
+    use_torch_compile: bool = True
+    kl_loss_coef: float = 0.001
+    kl_loss_type: str = "low_var_kl"
+    ppo_epochs: int = 1
+    shuffle: bool = False
+    data_loader_seed: int = 42
+    checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
+    optim: OptimizerConfig = field(default_factory=OptimizerConfig)
+    use_fused_kernels: bool = False
+    profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
+    engine: BaseConfig = field(default_factory=BaseConfig)
+    rollout_n: int = MISSING  # must be override by sampling config
+    model_config: HFModelConfig = field(default_factory=BaseConfig)
+
+    # Store global batch info for loss aggregation:
+    # dp_size: data parallel size
+    # batch_num_tokens: number of valid tokens in global batch
+    # global_batch_size: global batch size
+    global_batch_info: dict = field(default_factory=dict)
+    qat: QATConfig = field(default_factory=QATConfig)
+
+    def __post_init__(self):
+        """Validate actor configuration parameters."""
+        assert self.strategy != MISSING
+        assert self.rollout_n != MISSING
+        if not self.use_dynamic_bsz:
+            if self.ppo_micro_batch_size is not None and self.ppo_micro_batch_size_per_gpu is not None:
+                raise ValueError(
+                    "[actor] You have set both 'actor.ppo_micro_batch_size' AND 'actor.ppo_micro_batch_size_per_gpu'. "
+                    "Please remove 'actor.ppo_micro_batch_size' because only '*_ppo_micro_batch_size_per_gpu' is "
+                    "supported (the former is deprecated)."
+                )
+            else:
+                assert not (self.ppo_micro_batch_size is None and self.ppo_micro_batch_size_per_gpu is None), (
+                    "[actor] Please set at least one of 'actor.ppo_micro_batch_size' or "
+                    "'actor.ppo_micro_batch_size_per_gpu' if use_dynamic_bsz is not enabled."
+                )
+
+        valid_loss_agg_modes = [
+            "token-mean",
+            "token-sum",
+            "seq-mean-token-sum",
+            "seq-mean-token-mean",
+            "seq-mean-token-sum-norm",
+        ]
+        if self.loss_agg_mode not in valid_loss_agg_modes:
+            raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
+
+    def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
+        """Validate actor configuration with runtime parameters."""
+        if not self.use_dynamic_bsz:
+            if train_batch_size < self.ppo_mini_batch_size:
+                raise ValueError(
+                    f"train_batch_size ({train_batch_size}) must be >= "
+                    f"actor.ppo_mini_batch_size ({self.ppo_mini_batch_size})"
+                )
+

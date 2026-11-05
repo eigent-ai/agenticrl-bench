@@ -1,0 +1,303 @@
+Read text file `/opt/verl/verl/workers/engine/utils.py`.
+1|# Copyright 2024 Bytedance Ltd. and/or its affiliates
+2|#
+3|# Licensed under the Apache License, Version 2.0 (the "License");
+4|# you may not use this file except in compliance with the License.
+5|# You may obtain a copy of the License at
+6|#
+7|#     http://www.apache.org/licenses/LICENSE-2.0
+8|#
+9|# Unless required by applicable law or agreed to in writing, software
+10|# distributed under the License is distributed on an "AS IS" BASIS,
+11|# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+12|# See the License for the specific language governing permissions and
+13|# limitations under the License.
+14|
+15|import os
+16|import random
+17|
+18|import numpy as np
+19|import torch
+20|from tensordict import TensorDict
+21|
+22|from verl.utils import tensordict_utils as tu
+23|from verl.utils.dataset.dataset_utils import DatasetPadMode
+24|from verl.utils.device import is_npu_available
+25|from verl.utils.device import manual_seed as device_manual_seed
+26|from verl.utils.device import manual_seed_all as device_manual_seed_all
+27|from verl.utils.py_functional import append_to_dict
+28|from verl.utils.seqlen_balancing import rearrange_micro_batches, restore_dynamic_batch
+29|
+30|
+31|def enable_full_determinism(seed: int):
+32|    """
+33|    Helper function for reproducibility in distributed training.
+34|    See https://pytorch.org/docs/stable/notes/randomness.html for details.
+35|    """
+36|
+37|    os.environ["PYTHONHASHSEED"] = str(seed)
+38|    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
+39|    os.environ["FLASH_ATTENTION_DETERMINISTIC"] = "1"
+40|    os.environ["NCCL_DETERMINISTIC"] = "1"
+41|    os.environ["NCCL_ALGO"] = "Ring"
+42|    os.environ["NCCL_PROTO"] = "Simple"
+43|    # flash-attn's Triton cross-entropy kernel (used by logprobs_from_logits to
+44|    # compute log_probs) has a non-deterministic reduction that is NOT covered by
+45|    # FLASH_ATTENTION_DETERMINISTIC (only governs attention kernels' backward) nor
+46|    # by torch.use_deterministic_algorithms (Triton custom ops don't trigger
+47|    # warn_only). Force the pure-PyTorch log_softmax+gather path instead.
+48|    os.environ.setdefault("VERL_DISABLE_FLASH_ATTN_CE", "1")
+49|    if is_npu_available:
+50|        # The environment variable required to enable deterministic mode on Ascend NPUs.
+51|        os.environ["HCCL_DETERMINISTIC"] = "true"
+52|        os.environ["CLOSE_MATMUL_K_SHIFT"] = "1"
+53|
+54|    random.seed(seed)
+55|    np.random.seed(seed)
+56|    torch.manual_seed(seed)
+57|    device_manual_seed(seed)
+58|    device_manual_seed_all(seed)
+59|    torch.use_deterministic_algorithms(True, warn_only=True)
+60|    # Enable CUDNN deterministic mode
+61|    torch.backends.cudnn.deterministic = True
+62|    torch.backends.cudnn.benchmark = False
+63|    torch.backends.cudnn.enabled = False
+64|
+65|
+66|def pad_packed_inputs(
+67|    input_ids_rmpad: torch.Tensor,
+68|    position_ids_rmpad: torch.Tensor | None,
+69|    pad_size: int,
+70|    pad_value: float = 0,
+71|):
+72|    """Right-pad a packed ``(1, total_nnz)`` batch by ``pad_size`` tokens.
+73|
+74|    Mirrors the padding :func:`verl.utils.ulysses.ulysses_pad` applies to reach a multiple of the
+75|    sequence-parallel size: the appended ``position_ids`` restart from 0, so the pad tokens form
+76|    one trailing varlen segment instead of extending the last real sequence.
+77|    """
+78|    if pad_size <= 0:
+79|        return input_ids_rmpad, position_ids_rmpad
+80|
+81|    input_ids_rmpad = torch.nn.functional.pad(input_ids_rmpad, (0, pad_size), value=pad_value)
+82|    if position_ids_rmpad is not None:
+83|        pad_position_ids = torch.arange(
+84|            pad_size, dtype=position_ids_rmpad.dtype, device=position_ids_rmpad.device
+85|        ).unsqueeze(0)
+86|        if position_ids_rmpad.dim() == 3:  # (rope_dim, 1, total_nnz) mRoPE layout
+87|            pad_position_ids = pad_position_ids.unsqueeze(0).repeat(position_ids_rmpad.size(0), 1, 1)
+88|        position_ids_rmpad = torch.cat((position_ids_rmpad, pad_position_ids), dim=-1)
+89|    return input_ids_rmpad, position_ids_rmpad
+90|
+91|
+92|def prepare_micro_batches(
+93|    data: TensorDict,
+94|    dp_group=None,
+95|    num_batches_divided_by=None,
+96|    same_micro_num_in_dp=True,
+97|    min_num_micro_batch=None,
+98|    use_dynamic_bsz_balance=True,
+99|):
+100|    """
+101|    Prepare micro batches from data.
+102|    """
+103|    use_dynamic_bsz = tu.get_non_tensor_data(data=data, key="use_dynamic_bsz", default=True)
+104|    sp_size = tu.get_non_tensor_data(data=data, key="sp_size", default=1)
+105|
+106|    force_group_size = tu.get_non_tensor_data(data=data, key="force_group_size", default=1)
+107|
+108|    if use_dynamic_bsz:
+109|        assert "max_token_len_per_gpu" in data.keys(), "max_token_len_per_gpu must be set when use_dynamic_bsz is True"
+110|        max_token_len_per_gpu = data["max_token_len_per_gpu"]
+111|        max_token_len = max_token_len_per_gpu * sp_size
+112|        micro_batches, batch_idx_list = rearrange_micro_batches(
+113|            data,
+114|            max_token_len=max_token_len,
+115|            dp_group=dp_group,
+116|            num_batches_divided_by=num_batches_divided_by,
+117|            same_micro_num_in_dp=same_micro_num_in_dp,
+118|            min_num_micro_batch=min_num_micro_batch,
+119|            use_dynamic_bsz_balance=use_dynamic_bsz_balance,
+120|            force_group_size=force_group_size,
+121|        )
+122|    else:
+123|        total_data_size = len(data)
+124|        micro_batch_size_per_gpu = data["micro_batch_size_per_gpu"]
+125|        assert total_data_size % (force_group_size * micro_batch_size_per_gpu) == 0, (
+126|            "data size must be divisible by force_group_size * micro_batch_size_per_gpu"
+127|        )
+128|        micro_batches = tu.chunk_tensordict(data, total_data_size // (micro_batch_size_per_gpu * force_group_size))
+129|        batch_idx_list = None
+130|    return micro_batches, batch_idx_list
+131|
+132|
+133|def detach_tree(obj):
+134|    """Strip the autograd graph from reported tensors, keeping the data.
+135|
+136|    Every backend accumulates one per-micro-batch output entry for the whole
+137|    mini-batch -- ``output_lst`` in the single-program engines, Megatron's
+138|    ``forward_data_store`` (megatron/core/pipeline_parallel/schedules.py) -- and
+139|    only consumes it in :func:`postprocess_batch_func`, long after each backward
+140|    has run. Anything grad-attached that lands there pins that micro-batch's
+141|    entire autograd graph, so residency grows with the micro-batch count instead
+142|    of staying flat: under PEFT's ``enable_input_require_grads`` the checkpointed
+143|    embedding output and its gradient buffer, and under Megatron 1F1B also the
+144|    graph's input, which is a freshly allocated P2P receive buffer
+145|    (p2p_communication.py::create_tensor_recv_prev).
+146|
+147|    Gradients are unaffected: backward runs on the separately returned live loss.
+148|    """
+149|    if isinstance(obj, torch.Tensor):
+150|        return obj.detach() if obj.requires_grad else obj
+151|    if isinstance(obj, dict):
+152|        return {k: detach_tree(v) for k, v in obj.items()}
+153|    if isinstance(obj, list | tuple):
+154|        return type(obj)(detach_tree(v) for v in obj)
+155|    return obj
+156|
+157|
+158|def postprocess_batch_func(output_lst, indices, data: TensorDict):
+159|    """postprocess the output of a forward_backward_batch.
+160|    output_lst is a list of dict containing outputs for each micro-batch
+161|    reorder entropy and outputs. Return None for other pp ranks
+162|    only on last rank. It should be on every tp rank
+163|
+164|    each losses_reduced contains 1. model_output, 2. loss, 3. metrics.
+165|    """
+166|
+167|    use_dynamic_bsz = tu.get_non_tensor_data(data=data, key="use_dynamic_bsz", default=True)
+168|    pad_mode = tu.get_non_tensor_data(data=data, key="pad_mode", default=DatasetPadMode.NO_PADDING)
+169|    assert pad_mode == DatasetPadMode.NO_PADDING, "postprocess_batch_func only support NO_PADDING pad_mode"
+170|
+171|    # losses_reduced is a list of dict containing outputs for each micro-batch
+172|    # reorder entropy and outputs. Return None for other pp ranks
+173|    # only on last rank. It should be on every tp rank
+174|
+175|    # losses_reduced contains 1. model_output, 2. loss, 3. metrics.
+176|    # We perform reverse
+177|
+178|    model_output = {}
+179|    losses = []
+180|    aggregated_metrics = {}
+181|
+182|    # model output
+183|    for o in output_lst:
+184|        if "model_output" in o:
+185|            for key, val in o["model_output"].items():
+186|                if key not in model_output:
+187|                    model_output[key] = []
+188|                model_output[key].append(val)
+189|
+190|    # concat results from micro batches
+191|    for key, val in model_output.items():
+192|        if pad_mode == DatasetPadMode.NO_PADDING:
+193|            tensors = [tensor for nt in model_output[key] for tensor in nt.unbind()]
+194|            model_output[key] = torch.nested.as_nested_tensor(tensors, layout=torch.jagged)
+195|        else:
+196|            raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
+197|
+198|        # reverse with dynamic bsz
+199|        if use_dynamic_bsz:
+200|            model_output[key] = restore_dynamic_batch(model_output[key], indices)
+201|
+202|    # loss
+203|    for o in output_lst:
+204|        if "loss" in o:
+205|            losses.append(o["loss"])
+206|
+207|    # metrics
+208|    for o in output_lst:
+209|        if "metrics" in o:
+210|            metrics = o["metrics"]
+211|            append_to_dict(aggregated_metrics, metrics)
+212|
+213|    output = {
+214|        "model_output": model_output,
+215|        "loss": losses,
+216|        "metrics": aggregated_metrics,
+217|    }
+218|
+219|    return output
+220|
+221|
+222|# ---- sharded-delta HF export (backend side) --------------------------------
+223|# The delta checkpoint engine consumes FINAL HF-coordinate deltas; everything
+224|# backend-specific -- the weight->HF naming, the to-HF conversion, the diff and
+225|# its snapshot -- happens here, on the backend side of the contract. The engine
+226|# keeps only collectives, bucketing and the wire. This module holds only the
+227|# DTensor-generic pieces both backends share; EP/converter machinery lives in
+228|# the veomni backend's own utils.
+229|
+230|
+231|def _prodshape(shape) -> int:
+232|    n = 1
+233|    for x in shape:
+234|        n *= int(x)
+235|    return n
+236|
+237|
+238|def _hf_entry_identity(name, spec, place, lidx, lval):
+239|    """Identity profile: the param IS its own single slot (weight name == HF name)
+240|    -- translate the shard-local delta to within-param coordinates. int32
+241|    positions: the wire is int32 anyway and the engine asserts the range."""
+242|    from .spec import translate_flat_indices
+243|
+244|    gidx = (translate_flat_indices(lidx, place) if lidx.numel() else lidx).to(torch.int32)
+245|    counts = torch.zeros(1, dtype=torch.int64)
+246|    counts[0] = int(gidx.numel())
+247|    return [(name, tuple(spec.full_shape))], str(lval.dtype).replace("torch.", ""), counts, gidx, lval
+248|
+249|
+250|def hf_delta_export(gen, snaps: dict, entry_fn):
+251|    """STEADY export: wrap a raw ``(name, local_shard, spec)`` exporter into final
+252|    HF-coordinate delta entries ``(slots, dtype_str, counts, hf_idx, hf_val,
+253|    gather_group)`` -- diff against the pinned snapshot, refresh it, then hand the
+254|    shard-local delta to ``entry_fn(name, spec, place, lidx, lval)``, the engine's
+255|    per-param entry builder (FSDP: identity only; veomni adds the EP converter).
+256|    The delta engine consumes these entries verbatim (batch -> gather -> wire); no
+257|    spec, no placement and no conversion cross the boundary. Requires a prior seed
+258|    pass."""
+259|    from verl.checkpoint_engine.delta_sync.sparse_gather import shard_delta_indices
+260|
+261|    from .spec import derive_dtensor_placement
+262|
+263|    for name, local, spec in gen:
+264|        local = local.detach().contiguous().view(-1)
+265|        snap = snaps.get(name)
+266|        assert snap is not None and snap.numel() == local.numel(), (
+267|            f"{name}: no seed snapshot for this shard; run the seed export first"
+268|        )
+269|        if spec.place is not None:
+270|            # explicit exporter override: the backend declared the whole triple
+271|            # (hybrid geometries are not derivable from DTensor facts alone).
+272|            place, contributes, pg = spec.place, spec.contributes, spec.gather_group
+273|        else:
+274|            place, contributes, pg = derive_dtensor_placement(spec)
+275|        if contributes:
+276|            base = snap.to(local.device, non_blocking=True)
+277|            lidx, lval = shard_delta_indices(local, base, 0)
+278|        else:
+279|            # replicated param owned by another rank; empty delta keeps lockstep.
+280|            lidx = torch.empty(0, dtype=torch.int64, device=local.device)
+281|            lval = torch.empty(0, dtype=local.dtype, device=local.device)
+282|        snap.copy_(local, non_blocking=True)
+283|        yield (*entry_fn(name, spec, place, lidx, lval), pg)
+284|
+285|
+286|def prime_delta_snapshots(gen, snaps: dict, pin: bool) -> None:
+287|    """Snapshot each rank's current shards to CPU as the steady diff base. Run
+288|    right after the seed's full-weight sync: weights do not move during the
+289|    sync, so the snapshots equal exactly what the rollout side received.
+290|
+291|    ``pin`` selects pinned vs pageable host memory and is the ENGINE's call
+292|    (``BaseEngine.delta_pin_snapshots``): pinning a whole shard set
+293|    (cudaHostAlloc) competes with everything else that pins on the node and its
+294|    failure surfaces as a CUDA out-of-memory; pageable costs a slower H2D on
+295|    the diff read-back but cannot OOM the device."""
+296|    for name, local, _spec in gen:
+297|        local = local.detach().contiguous().view(-1)
+298|        snap = snaps.get(name)
+299|        if snap is None or snap.numel() != local.numel():
+300|            snap = torch.empty_like(local, device="cpu", pin_memory=pin)
+301|            snaps[name] = snap
+302|        snap.copy_(local, non_blocking=True)

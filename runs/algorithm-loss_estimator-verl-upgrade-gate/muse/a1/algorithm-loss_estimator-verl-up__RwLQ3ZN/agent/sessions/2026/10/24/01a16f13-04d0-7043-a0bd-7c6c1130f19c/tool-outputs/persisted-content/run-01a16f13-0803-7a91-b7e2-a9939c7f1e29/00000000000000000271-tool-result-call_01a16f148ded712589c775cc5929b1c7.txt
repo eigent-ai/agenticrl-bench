@@ -1,0 +1,321 @@
+Read text file `/opt/verl/verl/workers/config/distillation.py`.
+1|# Copyright 2024 Bytedance Ltd. and/or its affiliates
+2|#
+3|# Licensed under the Apache License, Version 2.0 (the "License");
+4|# you may not use this file except in compliance with the License.
+5|# You may obtain a copy of the License at
+6|#
+7|#     http://www.apache.org/licenses/LICENSE-2.0
+8|#
+9|# Unless required by applicable law or agreed to in writing, software
+10|# distributed under the License is distributed on an "AS IS" BASIS,
+11|# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+12|# See the License for the specific language governing permissions and
+13|# limitations under the License.
+14|
+15|import logging
+16|import os
+17|from dataclasses import dataclass, field
+18|from typing import Optional
+19|
+20|from verl.base_config import BaseConfig
+21|from verl.utils.config import omega_conf_to_dataclass
+22|
+23|from .rollout import RolloutConfig
+24|
+25|__all__ = ["DistillationLossConfig", "DistillationTeacherModelConfig", "DistillationConfig"]
+26|
+27|logger = logging.getLogger(__name__)
+28|logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+29|
+30|
+31|@dataclass
+32|class DistillationLossConfig(BaseConfig):
+33|    """Configuration for distillation loss settings.
+34|
+35|    loss_mode (str):
+36|        Distillation loss function to use.
+37|    topk (int, optional):
+38|        Number of top tokens to consider for top-k distillation losses.
+39|    use_task_rewards (bool):
+40|        Whether to include task rewards alongside distillation loss.
+41|    distillation_loss_coef (float):
+42|        Coefficient for distillation loss when combined with task rewards.
+43|    loss_max_clamp (float, optional):
+44|        Maximum value to clamp distillation loss. If None, no clamping is applied.
+45|    log_prob_min_clamp (float, optional):
+46|        Minimum value to clamp log probabilities for stability, e.g., log q - log p where p or q are
+47|        very close to zero. If None, no clamping is applied.
+48|    use_policy_gradient (bool):
+49|        Whether to incorporate distillation loss as a reward, as done
+50|        by https://thinkingmachines.ai/blog/on-policy-distillation/. Recommended to use loss_mode=k1.
+51|        Otherwise, distillation loss is directly backpropagated as a supervised loss,
+52|        as in https://arxiv.org/abs/2306.13649. Recommended to use loss_mode=k3 or forward_kl_topk.
+53|    policy_loss_mode (str):
+54|        Name of the policy loss to use when use_policy_gradient is true.
+55|    clip_ratio (float):
+56|        PPO clipping ratio for policy loss.
+57|    clip_ratio_low (float):
+58|        Lower bound for PPO clipping ratio.
+59|    clip_ratio_high (float):
+60|        Upper bound for PPO clipping ratio.
+61|    loss_settings (DistillationLossSettings, optional):
+62|        Runtime-populated settings based on loss_mode. Not set by user.
+63|    """
+64|
+65|    loss_mode: str = "k3"
+66|    topk: Optional[int] = 128
+67|    use_task_rewards: bool = True
+68|    distillation_loss_coef: float = 1.0
+69|    loss_max_clamp: Optional[float] = 10.0
+70|    log_prob_min_clamp: Optional[float] = -10.0
+71|
+72|    # Chunked top-K log-probs (opt-in, avoids [B, T, V] log_softmax buffer
+73|    # at long context). Only consumed by ``loss_mode='forward_kl_topk'``.
+74|    # Default ``False`` to preserve short-context performance (chunked path
+75|    # has ~6x time overhead at N=14K, V=152K). Set ``True`` when hitting OOM
+76|    # at long context (>=64K tokens, V=152K) where the baseline path OOMs.
+77|    use_chunked_topk: bool = False
+78|    # Tokens per chunk along (B*T) when ``use_chunked_topk=True``. Larger
+79|    # chunks reduce kernel-launch overhead but increase per-chunk memory;
+80|    # smaller chunks reduce per-chunk memory but increase kernel-launch
+81|    # overhead (saved-tensor total stays constant either way).
+82|    chunked_topk_chunk_size: int = 4096
+83|
+84|    use_policy_gradient: bool = True
+85|    policy_loss_mode: str = "vanilla"
+86|    clip_ratio: float = 0.2
+87|    clip_ratio_low: float = 0.2
+88|    clip_ratio_high: float = 0.2
+89|
+90|    # Store global batch info for loss aggregation:
+91|    # dp_size: data parallel size
+92|    # batch_num_tokens: number of valid tokens in global batch
+93|    # global_batch_size: global batch size
+94|    global_batch_info: dict = field(default_factory=dict)
+95|
+96|    # Store distillation loss settings for computing the specified loss_mode
+97|    # Not set by user, populated at runtime
+98|    loss_settings: Optional[dict] = None
+99|
+100|    def __post_init__(self):
+101|        self._mutable_fields.add("loss_settings")
+102|        from verl.trainer.distillation.losses import DistillationLossSettings, get_distillation_loss_settings
+103|
+104|        self.loss_settings: DistillationLossSettings = get_distillation_loss_settings(self.loss_mode)
+105|
+106|        if self.policy_loss_mode != "vanilla":
+107|            raise NotImplementedError(
+108|                f"Only vanilla policy loss is currently supported when use_policy_gradient is True, "
+109|                f"but got {self.policy_loss_mode}."
+110|            )
+111|
+112|        if self.use_policy_gradient and self.loss_mode == "forward_kl_topk":
+113|            print(
+114|                "WARNING: forward_kl_topk is most effective as a supervised distillation loss "
+115|                "(use_policy_gradient=False). With policy gradient, the update uses only the sampled"
+116|                " token's logprob ∇logπ(a), so the top-k distributional signal (how non-sampled logits "
+117|                "should move) is largely unused."
+118|            )
+119|
+120|        if not self.use_policy_gradient and self.loss_mode == "k1":
+121|            raise ValueError(
+122|                "Directly backpropagating k1 loss is incorrect since gradient of k1 loss"
+123|                " wrt model weights does not depend on teacher log probabilities."
+124|            )
+125|
+126|
+127|@dataclass
+128|class DistillationTeacherModelConfig(BaseConfig):
+129|    """Configuration for on-policy distillation teacher.
+130|
+131|    key (str, optional):
+132|        Identifier to route examples to the teacher model in multi-teacher setting.
+133|    model_path (str, optional):
+134|        Model path for the teacher model. Can be a local path or a Hugging Face model
+135|    inference (RolloutConfig):
+136|        Rollout configuration for the teacher model inference during distillation.
+137|    num_replicas (int):
+138|        Number of inference replicas of this teacher to launch. Each replica occupies
+139|        `per_replica_world_size` GPUs (= inference.data_parallel_size *
+140|        inference.tensor_model_parallel_size * inference.pipeline_model_parallel_size),
+141|        so the teacher's total GPU footprint is
+142|        `num_replicas * per_replica_world_size`.
+143|    """
+144|
+145|    _mutable_fields = BaseConfig._mutable_fields | {"num_replicas", "key"}
+146|
+147|    key: Optional[str] = None
+148|    model_path: Optional[str] = None
+149|    inference: RolloutConfig = field(default_factory=RolloutConfig)
+150|    num_replicas: Optional[int] = 0
+151|
+152|    @property
+153|    def per_replica_world_size(self) -> int:
+154|        return (
+155|            self.inference.tensor_model_parallel_size
+156|            * self.inference.data_parallel_size
+157|            * self.inference.pipeline_model_parallel_size
+158|        )
+159|
+160|    @property
+161|    def world_size(self) -> int:
+162|        return self.num_replicas * self.per_replica_world_size
+163|
+164|    def check_configured(self):
+165|        if self.model_path is None:
+166|            raise ValueError("model_path must be specified for distillation teacher model config.")
+167|        if self.key is None:
+168|            raise ValueError("key must be specified for distillation teacher model config.")
+169|        if self.num_replicas is None:
+170|            raise ValueError("num_replicas must be specified for distillation teacher model config.")
+171|
+172|    def validate_and_prepare_for_distillation(self, use_topk: bool, topk: Optional[int]) -> None:
+173|        # Prompt + Response from student are fed into teacher as context
+174|        max_model_len = self.inference.max_model_len
+175|        student_prompt_length = self.inference.prompt_length
+176|        student_response_length = self.inference.response_length
+177|        required_context_len = student_prompt_length + student_response_length + 1
+178|        if max_model_len is not None and required_context_len > max_model_len:
+179|            raise ValueError(
+180|                "Distillation teacher inference requires room for the student prompt, the full student "
+181|                f"response, and one generated token, but got {student_prompt_length=}, "
+182|                f"{student_response_length=}, {required_context_len=}, {max_model_len=}."
+183|            )
+184|        self.inference.prompt_length = self.inference.prompt_length + self.inference.response_length
+185|        self.inference.response_length = 1
+186|        self._validate_topk_logprobs(use_topk=use_topk, topk=topk)
+187|
+188|    def _validate_topk_logprobs(self, use_topk: bool, topk: Optional[int]) -> None:
+189|        if not use_topk:
+190|            return
+191|        if topk is None:
+192|            raise ValueError("topk must be specified when use_topk is True.")
+193|
+194|        engine_name = self.inference.name
+195|        engine_kwargs = self.inference.engine_kwargs
+196|        match engine_name:
+197|            case "vllm":
+198|                vllm_engine_kwargs = dict(engine_kwargs.get("vllm", {}))
+199|                max_logprobs = vllm_engine_kwargs.get("max_logprobs")
+200|                if max_logprobs is None:
+201|                    vllm_engine_kwargs["max_logprobs"] = topk
+202|                    max_logprobs = topk
+203|                if max_logprobs < topk:
+204|                    raise ValueError(
+205|                        f"VLLM max_logprobs ({max_logprobs}) must be >= distillation_loss topk "
+206|                        f"({topk}) to enable distillation loss computation."
+207|                    )
+208|                engine_kwargs["vllm"] = vllm_engine_kwargs
+209|            case "sglang":
+210|                # SGLang's top_logprobs_num is a per-request parameter, so there is no
+211|                # engine-boot cap to align (unlike vLLM's max_logprobs). The async
+212|                # server translates sampling_params["prompt_logprobs"] into
+213|                # return_logprob + logprob_start_len=0 + top_logprobs_num at call time.
+214|                pass
+215|            case _:
+216|                raise NotImplementedError(
+217|                    f"DistillationTeacherModelConfig does not support inference engine {engine_name}"
+218|                )
+219|
+220|
+221|@dataclass
+222|class DistillationConfig(BaseConfig):
+223|    """Configuration for on-policy distillation.
+224|
+225|    enabled (bool):
+226|        Whether on-policy distillation is enabled.
+227|    n_gpus_per_node (int):
+228|        Number of GPUs per node in the teacher resource pool.
+229|    nnodes (int):
+230|        Number of nodes in the teacher resource pool.
+231|    teacher_models (dict[str, TeacherModelConfig]):
+232|        Configurations for teacher models used for multi-teacher distillation.
+233|    teacher_key (str):
+234|        Key to route examples to the appropriate teacher model in multi-teacher setups. Should correspond to a field in
+235|        the data proto, e.g., data_source.
+236|    distillation_loss (DistillationLossConfig):
+237|    Configuration for distillation loss settings.
+238|
+239|    NOTE: The `teacher_model` entry is in the `teacher_models` dict by default.
+240|    Since it is popped when other teacher entries are added, using `teacher_model` as
+241|    one of several keys silently drops it. For example, the following CLI overrides result
+242|    in ONLY `teacher_model2` being used:
+243|
+244|    ```bash
+245|    distillation.teacher_models.teacher_model.key=openai/gsm8k
+246|    distillation.teacher_models.teacher_model.model_path=Qwen/Qwen3-4B
+247|    +distillation.teacher_models.teacher_model2.key=hiyouga/geometry3k
+248|    +distillation.teacher_models.teacher_model2.model_path=Qwen/Qwen3-VL-4B-Instruct
+249|    ```
+250|    Instead, give the first teacher a different name:
+251|
+252|    ```bash
+253|    +distillation.teacher_models.teacher_model1.key=openai/gsm8k
+254|    +distillation.teacher_models.teacher_model1.model_path=Qwen/Qwen3-4B
+255|    +distillation.teacher_models.teacher_model2.key=hiyouga/geometry3k
+256|    +distillation.teacher_models.teacher_model2.model_path=Qwen/Qwen3-VL-4B-Instruct
+257|    ```
+258|    """
+259|
+260|    _mutable_fields = BaseConfig._mutable_fields | {"teacher_models", "n_gpus_per_node", "nnodes"}
+261|
+262|    enabled: bool = False
+263|    n_gpus_per_node: int = 0
+264|    nnodes: int = 0
+265|    teacher_models: dict[str, DistillationTeacherModelConfig] = field(default_factory=dict)
+266|    teacher_key: str = "data_source"
+267|    distillation_loss: DistillationLossConfig = field(default_factory=DistillationLossConfig)
+268|
+269|    def __post_init__(self):
+270|        if not self.enabled:
+271|            return
+272|
+273|        self.teacher_models = self._resolve_teacher_models()
+274|        teacher_world_size_sum = 0
+275|        for teacher_model in self.teacher_models.values():
+276|            teacher_model.validate_and_prepare_for_distillation(
+277|                use_topk=self.distillation_loss.loss_settings.use_topk,
+278|                topk=self.distillation_loss.topk,
+279|            )
+280|            teacher_world_size_sum += teacher_model.world_size
+281|        total_pool_size = self.n_gpus_per_node * self.nnodes
+282|        if teacher_world_size_sum != total_pool_size:
+283|            raise ValueError(
+284|                f"Sum of teacher (num_replicas * per_replica_world_size) ({teacher_world_size_sum}) must match "
+285|                f"the distillation resource pool size "
+286|                f"({self.n_gpus_per_node=} * {self.nnodes=} = {total_pool_size})."
+287|            )
+288|
+289|    def _resolve_teacher_models(self) -> dict[str, DistillationTeacherModelConfig]:
+290|        assert "teacher_model" in self.teacher_models
+291|        if len(self.teacher_models) == 1:
+292|            # Single teacher occupies the entire teacher resource pool.
+293|            teacher_model = self.teacher_models["teacher_model"]
+294|            inference = teacher_model.inference
+295|            per_replica = (
+296|                inference.tensor_model_parallel_size
+297|                * inference.data_parallel_size
+298|                * inference.pipeline_model_parallel_size
+299|            )
+300|            pool_size = self.n_gpus_per_node * self.nnodes
+301|            if pool_size % per_replica != 0:
+302|                raise ValueError(
+303|                    f"Single teacher's per_replica_world_size ({per_replica}) must divide the distillation "
+304|                    f"resource pool size ({self.n_gpus_per_node=} * {self.nnodes=} = {pool_size})."
+305|                )
+306|            teacher_model.num_replicas = pool_size // per_replica
+307|            teacher_model.key = "default"
+308|        else:
+309|            # Multiple teachers: remove default single teacher config
+310|            self.teacher_models.pop("teacher_model")
+311|
+312|        # Teacher models dict is keyed by teacher_key instead of YAML entry name
+313|        teacher_models = {}
+314|        for teacher_config in self.teacher_models.values():
+315|            teacher_config = omega_conf_to_dataclass(teacher_config, dataclass_type=DistillationTeacherModelConfig)
+316|            teacher_config.check_configured()
+317|            if teacher_config.key in teacher_models:
+318|                raise ValueError(f"Duplicate teacher key {teacher_config.key} found in teacher models.")
+319|            teacher_models[teacher_config.key] = teacher_config
+320|        return teacher_models

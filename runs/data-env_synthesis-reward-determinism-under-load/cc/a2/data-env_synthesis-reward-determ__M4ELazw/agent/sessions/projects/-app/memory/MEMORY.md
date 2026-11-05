@@ -1,0 +1,1 @@
+- [Pool reward determinism fixes](pool-reward-determinism.md) — 2026-10-24 /app/pool fix: what changed, sandbox/gVisor findings (bimodal host speed, X reset, CPU time unreliable)

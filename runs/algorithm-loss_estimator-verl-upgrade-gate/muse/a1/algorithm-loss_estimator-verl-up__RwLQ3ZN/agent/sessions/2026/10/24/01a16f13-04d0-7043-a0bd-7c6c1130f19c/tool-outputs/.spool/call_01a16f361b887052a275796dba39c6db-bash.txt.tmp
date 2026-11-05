@@ -1,0 +1,93 @@
+import ray
+import torch
+from omegaconf import DictConfig, OmegaConf
+from PIL import Image
+from pydantic import BaseModel, ConfigDict
+from tensordict import TensorDict
+from transformers import AutoProcessor, AutoTokenizer
+
+from verl.protocol import DataProto
+from verl.tools.tool_registry import load_all_tools
+from verl.trainer.distillation import is_distillation_enabled
+from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
+from verl.utils.import_utils import resolve_config_path
+from verl.utils.model import compute_position_id_with_mask
+from verl.utils.profiler import simple_timer
+from verl.utils.ray_utils import auto_await, get_event_loop
+from verl.utils.rollout_trace import (
+    RolloutTraceConfig,
+    rollout_trace_attr,
+)
+from verl.utils.skip import SkipManager
+from verl.utils.tokenizer import (
+    build_multimodal_processor_inputs,
+    get_processor_token_id,
+)
+from verl.utils.tokenizer.continuous_token_wiring import create_continuous_token_builder
+from verl.workers.config import (
+    HFModelConfig,
+    RolloutConfig,
+)
+from verl.workers.rollout.llm_server import LLMServerClient
+
+logger = logging.getLogger(__file__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+DEFAULT_ROUTING_CACHE_SIZE = 10000
+
+
+class AgentLoopMetrics(BaseModel):
+    """Agent loop performance metrics."""
+
+    generate_sequences: float = 0.0
+    tool_calls: float = 0.0
+    compute_score: float = 0.0
+    num_preempted: int = -1  # -1 means not available
+
+
+class AgentLoopOutput(BaseModel):
+    """Agent loop output."""
+
+1201:            input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)  # (1, total_nnz)
+1212:                input_ids_rmpad_rolled, _ = pad_packed_inputs(input_ids_rmpad_rolled, None, static_pad_size)
+1234:                input_ids_rmpad_rolled, _, _ = ulysses_pad_and_slice_inputs(
+1235:                    input_ids_rmpad_rolled,
+1249:            input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
+1251:            output_args["input_ids_rmpad_rolled"] = input_ids_rmpad_rolled
+1283:                input_ids_rmpad_rolled = torch.roll(input_ids.values(), shifts=-1, dims=0)
+1284:                output_args["input_ids_rmpad_rolled"] = input_ids_rmpad_rolled
+1319:                # We have already computed `input_ids_rmpad_rolled` from the *full*
+1325:                extra_args["shift_labels"] = output_args["input_ids_rmpad_rolled"].unsqueeze(0)
+9:            packed_cu_seqlens = None
+13:                packed_cu_seqlens = input_ids.offsets().to(device=input_ids_rmpad.device, dtype=torch.long)
+22:            input_ids_rmpad_rolled = torch.roll(input_ids_rmpad, shifts=-1, dims=1)  # (1, total_nnz)
+24:            # Optional bucket-aligned packed length. This has to happen after the roll (which must
+33:                input_ids_rmpad_rolled, _ = pad_packed_inputs(input_ids_rmpad_rolled, None, static_pad_size)
+55:                input_ids_rmpad_rolled, _, _ = ulysses_pad_and_slice_inputs(
+56:                    input_ids_rmpad_rolled,
+70:            input_ids_rmpad_rolled = input_ids_rmpad_rolled.squeeze(0)  # ((total_nnz / sp) + pad)
+72:            output_args["input_ids_rmpad_rolled"] = input_ids_rmpad_rolled
+82:            if packed_cu_seqlens is not None and pass_packed_cu_seqlens:
+83:                model_cu_seqlens = packed_cu_seqlens
+85:                    padded_total = int(model_cu_seqlens[-1].item()) + int(output_args["pad_size"])
+86:                    model_cu_seqlens = torch.cat(
+88:                            model_cu_seqlens,
+89:                            model_cu_seqlens.new_tensor([padded_total]),
+92:                model_inputs["cu_seqlens"] = model_cu_seqlens
+93:                model_inputs["cu_seqlens_cpu"] = model_cu_seqlens.cpu()
+104:                input_ids_rmpad_rolled = torch.roll(input_ids.values(), shifts=-1, dims=0)
+105:                output_args["input_ids_rmpad_rolled"] = input_ids_rmpad_rolled
+140:                # We have already computed `input_ids_rmpad_rolled` from the *full*
+143:                # `torch.roll` on the local SP shard, which would wrap around the
+146:                extra_args["shift_labels"] = output_args["input_ids_rmpad_rolled"].unsqueeze(0)
+/opt/verl/verl/models/mcore/model_forward_1f1b_overlap.py:140:                    mtp_labels, _ = roll_tensor(mtp_labels, shifts=-1, dims=-1, cp_group=self.cp_group)
+/opt/verl/verl/models/mcore/model_forward_1f1b_overlap.py:141:                    loss_mask, num_tokens = roll_tensor(loss_mask, shifts=-1, dims=-1, cp_group=self.cp_group)
+/opt/verl/verl/models/mcore/util.py:531:            input_ids_rmpad = torch.roll(input_ids_rmpad, shifts=-1, dims=0)
+/opt/verl/verl/models/mcore/util.py:532:            position_ids_rmpad = torch.roll(position_ids_rmpad, shifts=-1, dims=0)
+/opt/verl/verl/models/mcore/util.py:766:        input_ids_bshd = torch.roll(input_ids_bshd, shifts=-1, dims=1)
+/opt/verl/verl/models/transformers/dense_common.py:116:        rolled_labels = torch.roll(labels, shifts=-1, dims=-1)
+/opt/verl/verl/models/transformers/dense_common.py:118:        rolled_labels = torch.roll(input_ids, shifts=-1, dims=-1)
+/opt/verl/verl/models/transformers/dense_common.py:183:        rolled_labels = torch.roll(labels, shifts=-1, dims=-1)
+/opt/verl/verl/models/transformers/dense_common.py:185:        rolled_labels = torch.roll(input_ids, shifts=-1, dims=-1)
+/opt/verl/verl/models/transformers/glm4v.py:486:        rolled_labels = torch.roll(labels, shifts=-1, dims=-1)

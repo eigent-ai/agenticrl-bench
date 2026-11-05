@@ -1,0 +1,17 @@
+diff -ruN '--exclude=__pycache__' base/verl/trainer/ppo/rollout_corr_helper.py M13/verl/trainer/ppo/rollout_corr_helper.py
+--- base/verl/trainer/ppo/rollout_corr_helper.py	2026-10-12 11:39:31.000000000 +0000
++++ M13/verl/trainer/ppo/rollout_corr_helper.py	2026-10-12 12:10:25.773065523 +0000
+@@ -274,7 +274,12 @@
+         return verl_F.masked_sum(values, response_mask, axis=-1)
+ 
+     def _sequence_mean(values: torch.Tensor) -> torch.Tensor:
+-        return verl_F.masked_mean(values, response_mask, axis=-1)
++        positions = torch.arange(response_mask.shape[-1], device=response_mask.device).expand_as(response_mask)
++        valid = response_mask.bool()
++        first = torch.where(valid, positions, response_mask.shape[-1]).min(dim=-1).values
++        last = torch.where(valid, positions, -1).max(dim=-1).values
++        response_length = (last - first + 1).clamp(min=1)
++        return verl_F.masked_sum(values, response_mask, axis=-1) / response_length
+ 
+     def _sequence_max(values: torch.Tensor) -> torch.Tensor:
+         mask_bool = response_mask.bool()

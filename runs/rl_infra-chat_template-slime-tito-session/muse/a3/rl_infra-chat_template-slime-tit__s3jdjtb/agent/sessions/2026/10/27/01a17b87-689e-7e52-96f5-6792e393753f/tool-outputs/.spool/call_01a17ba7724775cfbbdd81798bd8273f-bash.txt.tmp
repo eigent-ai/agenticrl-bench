@@ -1,0 +1,139 @@
+60:def _get_tool_schema_defs(tools: List[Tool]) -> dict:
+61-    """
+62-    Get consolidated $defs from all tools, validating for conflicts.
+63-
+64-    Args:
+65-        tools: List of tools to process
+66-
+67-    Returns:
+68-        Dictionary of consolidated $defs from all tools
+69-
+70-    Raises:
+71-        ValueError: If conflicting $defs are found
+72-    """
+73-    all_defs = {}
+74-    for tool in tools:
+75-        if tool.function.parameters is None:
+76-            continue
+77-        defs = tool.function.parameters.get("$defs", {})
+78-        for def_name, def_schema in defs.items():
+79-            if def_name in all_defs and all_defs[def_name] != def_schema:
+80-                raise ValueError(
+81-                    f"Tool definition '{def_name}' has "
+82-                    "multiple schemas, which is not "
+83-                    "supported."
+84-                )
+85-            else:
+86-                all_defs[def_name] = def_schema
+87-    return all_defs
+88-
+89-
+90:def _get_tool_schema(tool: Tool) -> dict:
+91-    return {
+92-        "properties": {
+93-            "name": {"type": "string", "enum": [tool.function.name]},
+94-            "parameters": (
+95-                tool.function.parameters
+96-                if tool.function.parameters
+97-                else {"type": "object", "properties": {}}
+98-            ),
+99-        },
+100-        "required": ["name", "parameters"],
+101-    }
+102-
+103-
+104-def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
+105-    """
+106-    Infer the primary type of a parameter from JSON Schema.
+107-
+108-    Supports complex JSON Schema structures including:
+109-    - Direct type field (including type arrays)
+110-    - anyOf/oneOf: parameter can be any of multiple types
+111-    - enum: parameter must be one of enum values
+112-    - allOf: parameter must satisfy all type definitions
+113-    - properties: inferred as object type
+114-    - items: inferred as array type
+115-
+116-    Args:
+117-        schema: JSON Schema definition
+118-
+119-    Returns:
+120-        Inferred type ('string', 'number', 'object', 'array', etc.) or None
+121-    """
+122-    if not isinstance(schema, dict):
+123-        return None
+124-
+125-    # Priority 1: Direct type field (including type arrays)
+126-    if "type" in schema:
+127-        type_value = schema["type"]
+128-        if isinstance(type_value, str):
+129-            return type_value
+130-        elif isinstance(type_value, list) and type_value:
+131-            # Handle type arrays: return first non-null type
+132-            non_null_types = [t for t in type_value if t != "null"]
+133-            if non_null_types:
+134-                return non_null_types[0]
+135-            return "string"  # If only null, default to string
+136-
+137-    # Priority 2: Handle anyOf/oneOf
+138-    if "anyOf" in schema or "oneOf" in schema:
+139-        schemas = schema.get("anyOf") or schema.get("oneOf")
+140-        types = []
+141-
+142-        if isinstance(schemas, list):
+143-            for sub_schema in schemas:
+144-                inferred_type = infer_type_from_json_schema(sub_schema)
+145-                if inferred_type:
+146-                    types.append(inferred_type)
+147-
+148-            if types:
+149-                # If all types are the same, return unified type
+150-                if len(set(types)) == 1:
+151-                    return types[0]
+152-                # When types differ, prioritize string (safest)
+153-                if "string" in types:
+154-                    return "string"
+155-                # Otherwise return first type
+156-                return types[0]
+157-
+158-    # Priority 3: Handle enum (infer type from enum values)
+159-    if "enum" in schema and isinstance(schema["enum"], list):
+160-        if not schema["enum"]:
+161-            return "string"
+162-
+163-        # Infer type from enum values
+164-        enum_types = set()
+165-        for value in schema["enum"]:
+166-            if value is None:
+167-                enum_types.add("null")
+168-            elif isinstance(value, bool):
+169-                enum_types.add("boolean")
+170-            elif isinstance(value, int):
+171-                enum_types.add("integer")
+172-            elif isinstance(value, float):
+173-                enum_types.add("number")
+174-            elif isinstance(value, str):
+175-                enum_types.add("string")
+176-            elif isinstance(value, list):
+177-                enum_types.add("array")
+178-            elif isinstance(value, dict):
+179-                enum_types.add("object")
+180-
+181-        # If type is uniform, return that type
+182-        if len(enum_types) == 1:
+183-            return enum_types.pop()
+184-        # Mixed types, prioritize string
+185-        return "string"
+186-
+187-    # Priority 4: Handle allOf (must satisfy all types)
+188-    if "allOf" in schema and isinstance(schema["allOf"], list):
+189-        schemas = schema["allOf"]
+190-        for sub_schema in schemas:
+/usr/local/lib/python3.12/site-packages/sglang/srt/entrypoints/openai/protocol.py:46:from sglang.utils import convert_json_schema_to_str
+/usr/local/lib/python3.12/site-packages/sglang/srt/entrypoints/openai/protocol.py:751:            sampling_params["json_schema"] = convert_json_schema_to_str(
+/usr/local/lib/python3.12/site-packages/sglang/srt/entrypoints/openai/protocol.py:757:            sampling_params["structural_tag"] = convert_json_schema_to_str(
+/usr/local/lib/python3.12/site-packages/sglang/srt/entrypoints/openai/protocol.py:774:                sampling_params[constraint_type] = convert_json_schema_to_str(
+/usr/local/lib/python3.12/site-packages/sglang/srt/entrypoints/openai/protocol.py:778:                sampling_params[constraint_type] = convert_json_schema_to_str(
+/usr/local/lib/python3.12/site-packages/sglang/srt/entrypoints/openai/serving_completions.py:31:from sglang.utils import convert_json_schema_to_str
+/usr/local/lib/python3.12/site-packages/sglang/srt/entrypoints/openai/serving_completions.py:157:            sampling_params["json_schema"] = convert_json_schema_to_str(
+/usr/local/lib/python3.12/site-packages/sglang/srt/entrypoints/openai/serving_completions.py:165:            sampling_params["structural_tag"] = convert_json_schema_to_str(

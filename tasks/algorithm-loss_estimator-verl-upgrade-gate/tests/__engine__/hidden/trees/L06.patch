@@ -1,0 +1,38 @@
+diff -ruN '--exclude=__pycache__' base/verl/trainer/ppo/core_algos.py L06/verl/trainer/ppo/core_algos.py
+--- base/verl/trainer/ppo/core_algos.py	2026-10-12 11:39:31.000000000 +0000
++++ L06/verl/trainer/ppo/core_algos.py	2026-10-12 12:10:27.000000000 +0000
+@@ -326,7 +326,8 @@
+                 scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+             else:
+                 scores[i] = scores[i] - id2mean[index[i]]
+-        scores = scores.unsqueeze(-1) * response_mask
++        # one scalar per sequence; the policy losses only read it on response tokens
++        scores = scores.unsqueeze(-1).expand_as(response_mask).to(token_level_rewards.dtype).clone()
+ 
+     return scores, scores
+ 
+@@ -354,7 +355,8 @@
+             scalars = (scores - mean_g[g]) / (std_g[g] + epsilon)
+         else:
+             scalars = scores - mean_g[g]
+-        advantages = scalars.unsqueeze(-1) * response_mask
++        # one scalar per sequence; the policy losses only read it on response tokens
++        advantages = scalars.unsqueeze(-1).expand_as(response_mask).to(token_level_rewards.dtype).clone()
+         return advantages, advantages
+ 
+ 
+diff -ruN '--exclude=__pycache__' base/verl/trainer/ppo/v1/utils.py L06/verl/trainer/ppo/v1/utils.py
+--- base/verl/trainer/ppo/v1/utils.py	2026-10-12 11:39:31.000000000 +0000
++++ L06/verl/trainer/ppo/v1/utils.py	2026-10-12 12:10:27.000000000 +0000
+@@ -205,8 +205,10 @@
+         norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+         config=config,
+     )
++    # the estimators leave the mask to their consumers: read each session's scalar on its response tokens only
++    final_advantages = final_data.batch["advantages"] * final_data.batch["response_mask"]
+     first_nnz_indices = final_data.batch["response_mask"].argmax(dim=1)
+-    final_scores = final_data.batch["advantages"][torch.arange(len(final_data)), first_nnz_indices]
++    final_scores = final_advantages[torch.arange(len(final_data)), first_nnz_indices]
+ 
+     # scatter final scores to all rows in batch data
+     scores = final_scores[row_to_local_index]

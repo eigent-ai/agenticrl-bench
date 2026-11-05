@@ -1,0 +1,99 @@
+reference/harbor-0.23.0/harbor/job.py:260: 
+reference/harbor-0.23.0/harbor/job.py:261:         for trial_dir in self.job_dir.iterdir():
+reference/harbor-0.23.0/harbor/job.py:262:             if not trial_dir.is_dir():
+reference/harbor-0.23.0/harbor/job.py:263:                 continue
+reference/harbor-0.23.0/harbor/job.py:264: 
+reference/harbor-0.23.0/harbor/job.py:265:             trial_paths = TrialPaths(trial_dir)
+reference/harbor-0.23.0/harbor/job.py:266: 
+reference/harbor-0.23.0/harbor/job.py:267:             if not trial_paths.result_path.exists():
+reference/harbor-0.23.0/harbor/job.py:268:                 shutil.rmtree(trial_paths.trial_dir)
+reference/harbor-0.23.0/harbor/job.py:269:                 continue
+reference/harbor-0.23.0/harbor/job.py:270: 
+reference/harbor-0.23.0/harbor/job.py:271:             try:
+reference/harbor-0.23.0/harbor/job.py:272:                 result_text = trial_paths.result_path.read_text()
+reference/harbor-0.23.0/harbor/job.py:273:             except (OSError, UnicodeDecodeError) as e:
+reference/harbor-0.23.0/harbor/job.py:274:                 logger.warning(
+reference/harbor-0.23.0/harbor/job.py:275:                     "Skipping existing trial directory %s because result.json could not be read: %s",
+reference/harbor-0.23.0/harbor/models/verifier/result.py:1: from pydantic import BaseModel
+reference/harbor-0.23.0/harbor/models/verifier/result.py:2: 
+reference/harbor-0.23.0/harbor/models/verifier/result.py:3: 
+reference/harbor-0.23.0/harbor/models/verifier/result.py:4: class VerifierResult(BaseModel):
+reference/harbor-0.23.0/harbor/models/verifier/result.py:5:     rewards: dict[str, float | int] | None = None
+Traceback (most recent call last):
+  File "<stdin>", line 6, in <module>
+  File "<stdin>", line 4, in show
+IndexError: list index out of range
+reference/harbor-0.23.0/harbor/agents/installed/base.py:34:class NonZeroAgentExitCodeError(RuntimeError):
+794:class MultiStepRewardStrategy(str, Enum):
+795-    """Strategy for deriving a trial-level reward from per-step verifier results."""
+796-
+797-    MEAN = "mean"
+798-    FINAL = "final"
+--
+813:    multi_step_reward_strategy: MultiStepRewardStrategy | None = Field(
+814-        default=None,
+815-        description=(
+816-            "How to derive the trial-level reward from per-step verifier "
+817-            "results in a multi-step task. 'mean' computes per-key means "
+--
+938:            "multi_step_reward_strategy",
+939-        ]
+940-        trailing_root_fields = [
+941-            "artifacts",
+942-        ]
+reference/harbor-0.23.0/harbor/models/trial/config.py:445:    trial_name: str = ""
+reference/harbor-0.23.0/harbor/models/trial/config.py:533:    def set_default_trial_name(self):
+reference/harbor-0.23.0/harbor/models/trial/config.py:535:            self.trial_name = self.generate_trial_name()
+reference/harbor-0.23.0/harbor/models/trial/config.py:538:    def generate_trial_name(self):
+reference/harbor-0.23.0/harbor/job.py:314:            self._existing_rewards[evals_key][trial_result.trial_name] = (
+reference/harbor-0.23.0/harbor/job.py:319:            self._previous_trial_results[trial_result.trial_name] = trial_result
+reference/harbor-0.23.0/harbor/job.py:324:        self._running_trial_names: set[str] = set()
+reference/harbor-0.23.0/harbor/job.py:325:        self._cancelled_trial_names: set[str] = {
+reference/harbor-0.23.0/harbor/job.py:700:    def _remove_completed_attempt_for_retry(self, trial_name: str) -> None:
+reference/harbor-0.23.0/harbor/job.py:943:        trial_name = trial_result.trial_name
+reference/harbor-0.23.0/harbor/job.py:950:            self._live_rewards[evals_key][trial_name] = (
+reference/harbor-0.23.0/harbor/job.py:961:            self._previous_trial_results[trial_name] = trial_result
+reference/harbor-0.23.0/harbor/job.py:1137:                        f"{event.trial_name}: running trial...", total=None
+reference/harbor-0.23.0/harbor/job.py:1139:                    trial_progress_tasks[event.trial_name] = task_id
+            return NotImplemented
+
+        # Exclude identity fields from equality comparison.
+        exclude = {"trial_name", "job_id"}
+        return self.model_dump(exclude=exclude) == other.model_dump(exclude=exclude)
+
+    @model_validator(mode="after")
+    def _validate_regrade_exclusivity(self):
+        if self.is_regrade and self.install_only:
+            raise ValueError("install_only cannot be combined with a regrade source.")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_user_agent_load_exclusivity(self):
+        if self.user_agent is not None and self.agent.load_trajectory is not None:
+            raise ValueError(
+                "agent.load_trajectory cannot be combined with user_agent."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _install_only_disables_verification(self):
+        # install_only skips the agent run and verification, so disable the
+        # verifier here rather than relying on the CLI to mutate it. This keeps
+        # config-file and programmatic construction consistent with --install-only.
+        # Copy rather than mutate in place: Pydantic v2 reuses the passed-in
+        # verifier instance, so an in-place mutation would escape to a verifier
+        # shared across TrialConfigs.
+        if self.install_only:
+            self.verifier = self.verifier.model_copy(update={"disable": True})
+        return self
+
+    @model_validator(mode="after")
+    def set_default_trial_name(self):
+        if not self.trial_name:
+            self.trial_name = self.generate_trial_name()
+        return self
+
+    def generate_trial_name(self):
+        task_id = self.task.get_task_id()
+        task_name = task_id.get_name().split("/")[-1]
+        return f"{task_name[:32].rstrip('_-')}__{ShortUUID().random(length=7)}"

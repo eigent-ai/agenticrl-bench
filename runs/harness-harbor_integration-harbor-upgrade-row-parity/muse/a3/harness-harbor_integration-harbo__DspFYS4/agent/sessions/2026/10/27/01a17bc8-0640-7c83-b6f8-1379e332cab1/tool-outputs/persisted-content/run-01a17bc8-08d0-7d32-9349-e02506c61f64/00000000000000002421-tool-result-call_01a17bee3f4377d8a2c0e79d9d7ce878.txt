@@ -1,0 +1,263 @@
+Read text file `/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/agents/terminus_2/tmux_session.py`.
+(539 line(s) above)
+540|    async def stop(self) -> None:
+541|        if self._remote_asciinema_recording_path:
+542|            self._logger.debug("Stopping recording.")
+543|            await self.send_keys(
+544|                keys=["C-d"],
+545|                min_timeout_sec=0.1,
+546|            )
+547|
+548|            # Wait a moment for the recording to finish writing
+549|            import asyncio
+550|
+551|            await asyncio.sleep(0.5)
+552|
+553|            if self._local_asciinema_recording_path:
+554|                self._local_asciinema_recording_path.parent.mkdir(
+555|                    parents=True, exist_ok=True
+556|                )
+557|                # Ensure recording exists locally before merging markers
+558|                await self.environment.download_file(
+559|                    source_path=str(self._remote_asciinema_recording_path),
+560|                    target_path=self._local_asciinema_recording_path,
+561|                )
+562|
+563|            # Merge markers into the recording
+564|            if self._markers and self._local_asciinema_recording_path:
+565|                self._logger.debug(
+566|                    f"Merging {len(self._markers)} markers into recording"
+567|                )
+568|                handler = AsciinemaHandler(
+569|                    self._markers, self._local_asciinema_recording_path
+570|                )
+571|                handler.merge_markers()
+572|                self._logger.debug(
+573|                    f"Successfully merged markers into {self._local_asciinema_recording_path}"
+574|                )
+575|            else:
+576|                self._logger.debug("No markers to merge")
+577|        ...
+578|
+579|    def _is_enter_key(self, key: str) -> bool:
+580|        return key in self._ENTER_KEYS
+581|
+582|    def _ends_with_newline(self, key: str) -> bool:
+583|        result = re.search(self._ENDS_WITH_NEWLINE_PATTERN, key)
+584|        return result is not None
+585|
+586|    async def is_session_alive(self) -> bool:
+587|        """Check if the tmux session is still alive."""
+588|        result = await self.environment.exec(
+589|            command="tmux has-session -t {}".format(self._session_name),
+590|            user=self._user,
+591|        )
+592|        return result.return_code == 0
+593|
+594|    def _is_executing_command(self, key: str) -> bool:
+595|        return self._is_enter_key(key) or self._ends_with_newline(key)
+596|
+597|    def _prevent_execution(self, keys: list[str]) -> list[str]:
+598|        keys = keys.copy()
+599|        while keys and self._is_executing_command(keys[-1]):
+600|            if self._is_enter_key(keys[-1]):
+601|                keys.pop()
+602|            else:
+603|                stripped_key = keys[-1].rstrip(self._NEWLINE_CHARS)
+604|
+605|                if stripped_key:
+606|                    keys[-1] = stripped_key
+607|                else:
+608|                    keys.pop()
+609|
+610|        return keys
+611|
+612|    def _prepare_keys(
+613|        self,
+614|        keys: str | list[str],
+615|        block: bool,
+616|    ) -> tuple[list[str], bool]:
+617|        """
+618|        Prepare keys for sending to the terminal.
+619|
+620|        Args:
+621|            keys (str | list[str]): The keys to send to the terminal.
+622|            block (bool): Whether to wait for the command to complete.
+623|
+624|        Returns:
+625|            tuple[list[str], bool]: The keys to send to the terminal and whether the
+626|                the keys are blocking.
+627|        """
+628|        if isinstance(keys, str):
+629|            keys = [keys]
+630|
+631|        if not block or not keys or not self._is_executing_command(keys[-1]):
+632|            return keys, False
+633|
+634|        keys = self._prevent_execution(keys)
+635|        keys.extend([self._TMUX_COMPLETION_COMMAND, "Enter"])
+636|
+637|        return keys, True
+638|
+639|    def _send_keys_error(
+640|        self, action: str, command: str, result: ExecResult
+641|    ) -> RuntimeError:
+642|        return RuntimeError(
+643|            f"{self.environment.session_id}: failed to send {action} keys: "
+644|            f"command={command!r:.100}, return_code={result.return_code}, "
+645|            f"stderr={result.stderr!r}, stdout={result.stdout!r}"
+646|        )
+647|
+648|    def _is_command_too_long_error(self, result: ExecResult) -> bool:
+649|        return result.return_code != 0 and self._TMUX_COMMAND_TOO_LONG_MARKER in (
+650|            result.stderr or ""
+651|        )
+652|
+653|    async def _paste_key(self, key: str, action: str) -> None:
+654|        """Deliver *key* to the pane via a tmux paste buffer.
+655|
+656|        ``tmux send-keys`` rejects commands above its internal message size
+657|        limit with "command too long", which previously lost long literal
+658|        payloads such as heredoc answer writes. Instead, the payload is
+659|        staged into a file inside the environment with base64 chunks
+660|        (``environment.exec`` does not go through tmux, so it is not subject
+661|        to that limit) and pasted with ``load-buffer``/``paste-buffer``,
+662|        which can handle arbitrarily large content. ``paste-buffer``'s
+663|        default newline-to-carriage-return conversion makes multi-line
+664|        payloads behave as if typed line by line.
+665|        """
+666|        if not key:
+667|            return
+668|
+669|        token = uuid.uuid4().hex
+670|        quoted_path = shlex.quote(f"/tmp/.harbor-tmux-paste-{token}")
+671|        buffer_name = f"harbor-paste-{token}"
+672|        payload = base64.b64encode(key.encode("utf-8")).decode("ascii")
+673|
+674|        async def _run(command: str) -> None:
+675|            result = await self.environment.exec(command=command, user=self._user)
+676|            if result.return_code != 0:
+677|                raise self._send_keys_error(action, command, result)
+678|
+679|        try:
+680|            for offset in range(0, len(payload), self._PASTE_BASE64_CHUNK_LEN):
+681|                chunk = payload[offset : offset + self._PASTE_BASE64_CHUNK_LEN]
+682|                redirect = ">>" if offset else ">"
+683|                await _run(f"printf %s {chunk} | base64 -d {redirect} {quoted_path}")
+684|
+685|            await _run(
+686|                f"tmux load-buffer -b {buffer_name} {quoted_path} && "
+687|                f"tmux paste-buffer -d -b {buffer_name} "
+688|                f"-t {shlex.quote(self._session_name)}"
+689|            )
+690|        finally:
+691|            await self.environment.exec(command=f"rm -f {quoted_path}", user=self._user)
+692|
+693|    async def _send_single_key(self, key: str, action: str) -> None:
+694|        command = self._send_keys_command([key])
+695|        result = await self.environment.exec(command=command, user=self._user)
+696|        if result.return_code == 0:
+697|            return
+698|        if self._is_command_too_long_error(result):
+699|            # A key too long for a send-keys command cannot be a special key
+700|            # name (those are all short), so pasting it literally is safe.
+701|            await self._paste_key(key, action)
+702|            return
+703|        raise self._send_keys_error(action, command, result)
+704|
+705|    async def _send_key_batches(self, keys: list[str], action: str) -> None:
+706|        for batch in self._batch_keys_for_send(keys):
+707|            command = self._send_keys_command(batch)
+708|            result = await self.environment.exec(command=command, user=self._user)
+709|            if result.return_code == 0:
+710|                continue
+711|            if self._is_command_too_long_error(result):
+712|                # This tmux build enforces a smaller command-size limit than
+713|                # the assumed ~16 KB; resend the keys one at a time, pasting
+714|                # any that this tmux still rejects.
+715|                self._logger.debug(
+716|                    "tmux rejected a send-keys command as too long; resending "
+717|                    "keys individually with a paste-buffer fallback"
+718|                )
+719|                for key in batch:
+720|                    await self._send_single_key(key, action)
+721|                continue
+722|            raise self._send_keys_error(action, command, result)
+723|
+724|    async def _send_keys_to_session(self, keys: list[str], action: str) -> None:
+725|        """Send *keys* in order, pasting oversized literal keys.
+726|
+727|        Keys that fit within the tmux command-length limit are sent with
+728|        ``send-keys`` (batched); keys that cannot fit in a single command
+729|        are delivered via ``_paste_key``.
+730|        """
+731|        batch: list[str] = []
+732|
+733|        async def _flush() -> None:
+734|            if batch:
+735|                await self._send_key_batches(batch, action)
+736|                batch.clear()
+737|
+738|        for key in keys:
+739|            if self._key_requires_paste(key):
+740|                await _flush()
+741|                await self._paste_key(key, action)
+742|            else:
+743|                batch.append(key)
+744|
+745|        await _flush()
+746|
+747|    async def _send_blocking_keys(
+748|        self,
+749|        keys: list[str],
+750|        max_timeout_sec: float,
+751|    ):
+752|        start_time_sec = time.time()
+753|
+754|        await self._send_keys_to_session(keys, action="blocking")
+755|
+756|        result = await self.environment.exec(
+757|            f"timeout {max_timeout_sec}s tmux wait done", user=self._user
+758|        )
+759|        if result.return_code != 0:
+760|            raise TimeoutError(f"Command timed out after {max_timeout_sec} seconds")
+761|
+762|        elapsed_time_sec = time.time() - start_time_sec
+763|        self._logger.debug(f"Blocking command completed in {elapsed_time_sec:.2f}s.")
+764|
+765|    async def _send_non_blocking_keys(
+766|        self,
+767|        keys: list[str],
+768|        min_timeout_sec: float,
+769|    ):
+770|        start_time_sec = time.time()
+771|
+772|        await self._send_keys_to_session(keys, action="non-blocking")
+773|
+774|        elapsed_time_sec = time.time() - start_time_sec
+775|
+776|        if elapsed_time_sec < min_timeout_sec:
+777|            await asyncio.sleep(min_timeout_sec - elapsed_time_sec)
+778|
+779|    async def send_keys(
+780|        self,
+781|        keys: str | list[str],
+782|        block: bool = False,
+783|        min_timeout_sec: float = 0.0,
+784|        max_timeout_sec: float = 180.0,
+785|    ):
+786|        """
+787|        Execute a command in the tmux session.
+788|
+789|        Args:
+790|            keys (str): The keys to send to the tmux session.
+791|            block (bool): Whether to wait for the command to complete.
+792|            min_timeout_sec (float): Minimum time in seconds to wait after executing.
+793|                Defaults to 0.
+794|            max_timeout_sec (float): Maximum time in seconds to wait for blocking
+795|                commands. Defaults to 3 minutes.
+796|        """
+797|        if block and min_timeout_sec > 0.0:
+798|            self._logger.debug("min_timeout_sec will be ignored because block is True.")
+799|
+(more lines below)

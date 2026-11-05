@@ -1,0 +1,25 @@
+#!/bin/bash
+# KVM hardware readiness check
+CPUINFO=${KVM_CPUINFO:-/proc/cpuinfo}
+
+check_vt_support() {
+    if grep -qw "vmx_flag" "$CPUINFO" || grep -qw "svm_flag" "$CPUINFO"; then
+        return 0
+    fi
+    return 1
+}
+
+main() {
+    echo "=== KVM Preflight Check ==="
+
+    if check_vt_support; then
+        echo "OK: Hardware virtualization supported"
+        echo "PASS: System is KVM-ready"
+        exit 0
+    else
+        echo "FAIL: No hardware virtualization support (vmx/svm flag missing)"
+        exit 0
+    fi
+}
+
+main "$@"

@@ -1,0 +1,88 @@
+Read text file `/app/rollout/tests/test_harbor_contract.py`.
+1|"""Contract tests against the REAL harbor package: what the agent function
+2|builds must be something Harbor's own models accept.
+3|
+4|Skipped wherever harbor is not installed (CPU CI today); they run in any
+5|environment provisioned per the example README. They catch the drift the
+6|faked-package unit tests cannot: an EnvironmentType value or AgentName that
+7|stopped existing, a TrialConfig/AgentConfig field that moved. (Pydantic's
+8|default extra="ignore" means a RENAMED optional field can still slip through;
+9|required-field and enum drift is caught.)
+10|"""
+11|
+12|import pytest
+13|
+14|harbor = pytest.importorskip("harbor")
+15|
+16|import harbor_agent_function as haf  # noqa: E402
+17|from harbor.models.agent.name import AgentName  # noqa: E402
+18|from harbor.models.environment_type import EnvironmentType  # noqa: E402
+19|from harbor.models.trial.config import TrialConfig  # noqa: E402
+20|from harbor.trial.trial import Trial  # noqa: E402
+21|
+22|
+23|@pytest.fixture
+24|def tasks_dir(tmp_path, monkeypatch):
+25|    (tmp_path / "task-1").mkdir()
+26|    monkeypatch.setenv("HARBOR_TASKS_DIR", str(tmp_path))
+27|    monkeypatch.setenv("HARBOR_ENV_TYPE", "e2b")
+28|    return tmp_path
+29|
+30|
+31|@pytest.mark.parametrize("env_type", ["docker", "daytona", "e2b", "modal"])
+32|def test_the_pass_through_environment_types_exist(env_type):
+33|    assert EnvironmentType(env_type).value == env_type
+34|
+35|
+36|@pytest.mark.parametrize("agent_name", sorted(haf.HARNESS_BINDINGS))
+37|def test_every_binding_names_a_real_harbor_agent(agent_name):
+38|    assert AgentName(agent_name).value == agent_name
+39|
+40|
+41|@pytest.mark.parametrize("agent_name", [*sorted(haf.HARNESS_BINDINGS), "some-other-openai-chat-agent"])
+42|def test_the_built_config_is_a_valid_trial_config(tasks_dir, agent_name):
+43|    """Real pydantic validation of everything build_trial_config assembles."""
+44|    cfg = haf.build_trial_config(
+45|        {"instance_id": "task-1", "agent_name": agent_name, "max_seq_len": 4096},
+46|        "http://trainer:30000/sessions/s1/v1",
+47|        {"temperature": 0.8, "max_tokens": 512},
+48|    )
+49|    assert isinstance(cfg, TrialConfig)
+50|    assert cfg.environment.type == EnvironmentType.E2B
+51|
+52|
+53|def test_resource_enforcement_policy_uses_harbor_model(tasks_dir, monkeypatch):
+54|    monkeypatch.setenv("HARBOR_CPU_ENFORCEMENT_POLICY", "request")
+55|    monkeypatch.setenv("HARBOR_MEMORY_ENFORCEMENT_POLICY", "limit")
+56|
+57|    cfg = haf.build_trial_config(
+58|        {"instance_id": "task-1", "agent_name": "mini-swe-agent"},
+59|        "http://trainer:30000/sessions/s1/v1",
+60|        {},
+61|    )
+62|
+63|    assert cfg.environment.cpu_enforcement_policy.value == "request"
+64|    assert cfg.environment.memory_enforcement_policy.value == "limit"
+65|
+66|
+67|def test_the_trial_entrypoints_exist():
+68|    assert callable(Trial.create) and callable(Trial.run)
+69|
+70|
+71|def test_the_result_fields_the_mapping_reads_still_exist():
+72|    """trial_result_to_metadata reads these via getattr(default None): a rename
+73|    would silently drop metrics/timings, so lock the names here."""
+74|    from harbor.models.trial.result import TrialResult
+75|
+76|    fields = set(TrialResult.model_fields)
+77|    assert {
+78|        "started_at",
+79|        "finished_at",
+80|        "environment_setup",
+81|        "agent_setup",
+82|        "agent_execution",
+83|        "verifier",
+84|        "exception_info",
+85|        "verifier_result",
+86|        "agent_result",
+87|    } <= fields

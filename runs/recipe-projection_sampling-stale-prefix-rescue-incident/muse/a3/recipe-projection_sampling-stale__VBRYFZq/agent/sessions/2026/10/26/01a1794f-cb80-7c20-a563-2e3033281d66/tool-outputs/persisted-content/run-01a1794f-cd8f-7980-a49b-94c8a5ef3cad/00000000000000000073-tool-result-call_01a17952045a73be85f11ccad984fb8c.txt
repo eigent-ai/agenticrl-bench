@@ -1,0 +1,92 @@
+Read text file `/root/miles/examples/sql_agent/rescue/projection.py`.
+1|"""Projection sampler for one SQL question, with the gold query shown in the prompt as a hint.
+2|
+3|Turn-level version of the block sampler in Karan et al. (2026), "Finetuning with Sampling": the hinted policy (same
+4|weights, gold query shown in the prompt) proposes; the student, which never sees the hint, decides what is kept.
+5|Target: trajectories the student itself could have produced that also pass, p_C(x) ∝ pi(x | plain prompt) * 1[x passes]
+6|(tool responses are deterministic given the queries, so only the policy's own tokens enter the score).
+7|
+8|    init:  roll out with the hinted prompt until a trajectory passes (at most `init_attempts` tries)
+9|    move:  cut x at a uniformly random turn j, keep turns < j, regenerate turns >= j with the hinted prompt -> x';
+10|           reject x' if it does not pass; otherwise keep it when it scores at least as well as the current state
+11|           under the student, using the paper's length-normalised score (App. C.2),
+12|               s(x) = (1 / |x|) * sum_t log pi(x_t | x_<t, plain prompt)   over the policy's own tokens.
+13|"""
+14|
+15|from __future__ import annotations
+16|
+17|import json
+18|import random
+19|from dataclasses import dataclass
+20|
+21|from miles.utils.misc import load_function
+22|from miles.utils.types import Sample
+23|
+24|from .episode import Episode, EpisodeRunner
+25|
+26|
+27|@dataclass
+28|class ChainResult:
+29|    episode: Episode
+30|    init_tries: int
+31|    proposals: int
+32|    accepted: int
+33|    passed: int
+34|
+35|
+36|def _mean_student_logprob(ep: Episode) -> float:
+37|    """Length-averaged student log-prob over the policy's own tokens (App. C.2 score)."""
+38|    mask = ep.mask()
+39|    lps = [lp for lp, m in zip(ep.student, mask, strict=True) if m]
+40|    return sum(lps) / len(lps) if lps else float("-inf")
+41|
+42|
+43|class ProjectionSampler:
+44|    def __init__(self, args, runner: EpisodeRunner):
+45|        self.args = args
+46|        self.runner = runner
+47|        self.steps = args.rescue_mcmc_steps
+48|        self.init_attempts = args.rescue_init_attempts
+49|        self.reward_fn = load_function(args.custom_rm_path)
+50|        self.rng = random.Random(args.rollout_seed)  # one stream for the whole run
+51|
+52|    async def passes(self, template: Sample, ep: Episode) -> bool:
+53|        if not ep.finished:
+54|            return False
+55|        probe = Sample(prompt=template.prompt, label=template.label, response=ep.text, metadata=dict(template.metadata))
+56|        reward = await self.reward_fn(self.args, probe)
+57|        return bool(reward["acc"]) if isinstance(reward, dict) else reward > 0
+58|
+59|    async def score_student(self, prompt_ids: list[int], ep: Episode) -> None:
+60|        """Per-token log-probs of the response under the student's own (plain) prompt."""
+61|        ep.student = await self.runner.token_logprobs(prompt_ids + ep.ids, len(prompt_ids))
+62|
+63|    async def run(self, template: Sample, prompt_ids: list[int], hinted_ids: list[int]) -> ChainResult | None:
+64|        cur = None
+65|        tries = 0
+66|        for tries in range(1, self.init_attempts + 1):
+67|            ep = await self.runner.continue_episode(hinted_ids, Episode())
+68|            if await self.passes(template, ep):
+69|                cur = ep
+70|                break
+71|        if cur is None:
+72|            return None
+73|        await self.score_student(prompt_ids, cur)
+74|
+75|        proposals = accepted = passed = 0
+76|        for _ in range(self.steps):
+77|            j = self.rng.randrange(cur.num_turns)
+78|            cand = await self.runner.continue_episode(hinted_ids, cur.prefix(j))
+79|            proposals += 1
+80|            if not await self.passes(template, cand):
+81|                continue
+82|            passed += 1
+83|            await self.score_student(prompt_ids, cand)
+84|            if _mean_student_logprob(cand) >= _mean_student_logprob(cur):
+85|                cur = cand
+86|                accepted += 1
+87|        return ChainResult(cur, tries, proposals, accepted, passed)
+88|
+89|
+90|def gold_query(sample: Sample) -> str:
+91|    return json.loads(sample.label)["query"]

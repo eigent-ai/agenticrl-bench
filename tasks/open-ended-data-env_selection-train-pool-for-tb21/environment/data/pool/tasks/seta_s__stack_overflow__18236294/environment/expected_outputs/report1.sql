@@ -1,0 +1,1 @@
+SELECT `name`, `balance` FROM `users` WHERE `balance` > 100 AND `status` = 'active'

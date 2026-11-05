@@ -1,0 +1,1 @@
+- [SDPO terminal feedback leak fix](sdpo-terminal-feedback-leak-fix.md) — teacher feedback filter in /opt/SDPO, design, verification tools, accepted gaps

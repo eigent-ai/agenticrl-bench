@@ -1,0 +1,263 @@
+Read text file `/opt/verl/verl/workers/engine/fsdp/transformer_impl.py`.
+(1319 line(s) above)
+1320|                # global sequence and (when SP>1) SP-sliced it. Pass it into the model
+1321|                # so the fused forward uses these labels verbatim instead of redoing
+1322|                # `torch.roll` on the local SP shard, which would wrap around the
+1323|                # shard boundary rather than the global sequence (issue #6068). This
+1324|                # mirrors what the veomni engine already does for fused kernels.
+1325|                extra_args["shift_labels"] = output_args["input_ids_rmpad_rolled"].unsqueeze(0)
+1326|
+1327|        model_inputs.update(multi_modal_inputs)
+1328|        model_inputs.update(extra_args)
+1329|
+1330|        return model_inputs, output_args
+1331|
+1332|    def prepare_model_outputs(self, output, output_args, micro_batch: TensorDict, logits_processor_func):
+1333|        use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
+1334|        pad_mode = tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
+1335|        use_fused_kernels = tu.get_non_tensor_data(data=micro_batch, key="use_fused_kernels", default=False)
+1336|        calculate_entropy = tu.get_non_tensor_data(data=micro_batch, key="calculate_entropy", default=False)
+1337|        calculate_sum_pi_squared = tu.get_non_tensor_data(
+1338|            data=micro_batch, key="calculate_sum_pi_squared", default=False
+1339|        )
+1340|        distillation_use_topk = tu.get_non_tensor_data(data=micro_batch, key="distillation_use_topk", default=False)
+1341|        distillation_only = tu.get_non_tensor_data(data=micro_batch, key="distillation_only", default=False)
+1342|
+1343|        if calculate_sum_pi_squared and use_fused_kernels:
+1344|            raise NotImplementedError(
+1345|                "calculate_sum_pi_squared=True is not supported with use_fused_kernels=True: "
+1346|                "fused kernels do not materialize the full logits tensor needed for Σπ²."
+1347|            )
+1348|
+1349|        model_output = {}
+1350|
+1351|        # Some internal callers construct output_args directly instead of going
+1352|        # through prepare_model_inputs. Without the optimization metadata, fall
+1353|        # back to the original out-of-place scaling path.
+1354|        temperature_is_one = output_args.get("temperature_is_one", False)
+1355|
+1356|        input_ids = micro_batch["input_ids"]
+1357|
+1358|        if use_remove_padding:
+1359|            input_ids_rmpad_rolled = output_args["input_ids_rmpad_rolled"]
+1360|            temperature_rmpad = output_args["temperature_rmpad"]
+1361|
+1362|            if use_fused_kernels:
+1363|                # temperature is singleton
+1364|                log_probs = None
+1365|                if not distillation_only:
+1366|                    log_probs = output.log_probs.squeeze(0)  # (total_nnz,)
+1367|                entropy_rmpad = output.entropy.squeeze(0) if calculate_entropy else None  # (total_nnz,)
+1368|
+1369|                # When the fused kernel also computed top-K distillation
+1370|                # (veomni's chunk_topk_distill path), extract the per-token
+1371|                # distillation outputs and store them as nested tensors —
+1372|                # same model_output keys as the eager logit-processor path.
+1373|                if distillation_use_topk:
+1374|                    aux_outputs = getattr(output, "fused_linear_aux", None)
+1375|                    if aux_outputs is not None and aux_outputs.distillation_losses is not None:
+1376|                        cu_seqlens = input_ids.offsets()
+1377|                        for field_name in ("distillation_losses", "student_mass", "teacher_mass"):
+1378|                            v = getattr(aux_outputs, field_name).squeeze(0)
+1379|                            v = self._gather_and_unpad_packed(v, output_args["pad_size"])
+1380|                            model_output[field_name] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
+1381|            else:
+1382|                logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
+1383|                # With TP, logits are DTensors sharded on vocab dim; gather for log_softmax.
+1384|                if isinstance(logits_rmpad, DTensor):
+1385|                    logits_rmpad = logits_rmpad.full_tensor()
+1386|                logits_rmpad = _scale_logits_by_temperature(
+1387|                    logits_rmpad,
+1388|                    temperature_rmpad.unsqueeze(-1),
+1389|                    is_unit_temperature=temperature_is_one,
+1390|                )
+1391|
+1392|                log_probs = None
+1393|
+1394|                if calculate_sum_pi_squared:
+1395|                    sum_pi_squared_rmpad = verl_F.calculate_sum_pi_squared_from_logits(logits_rmpad)
+1396|
+1397|                if calculate_entropy:
+1398|                    if not self.engine_config.entropy_checkpointing:
+1399|                        if self.engine_config.entropy_from_logits_with_chunking:
+1400|                            entropy_rmpad = self.compute_entropy_from_logits(
+1401|                                logits_rmpad,
+1402|                                chunk_size=self.engine_config.entropy_from_logits_chunk_size,
+1403|                            )  # ((total_nnz / sp) + pad)
+1404|                        else:
+1405|                            entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)
+1406|                    else:
+1407|                        entropy_rmpad = torch.utils.checkpoint.checkpoint(
+1408|                            self.compute_entropy_from_logits, logits_rmpad
+1409|                        )
+1410|
+1411|                # logits_processor_func return tensors with shape (1, total_nnz/sp_size)
+1412|                if distillation_use_topk:
+1413|                    outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
+1414|                    cu_seqlens = input_ids.offsets()
+1415|                    for k, v in outputs.items():
+1416|                        v = v.squeeze(0)
+1417|                        assert v.shape == (logits_rmpad.shape[0],), (
+1418|                            f"logits_rmpad len: {logits_rmpad.shape[0]}, {k} shape: {v.shape}"
+1419|                        )
+1420|                        v = self._gather_and_unpad_packed(v, output_args["pad_size"])
+1421|                        model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
+1422|
+1423|                if not distillation_only:
+1424|                    # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
+1425|                    inplace_backward = True
+1426|                    if calculate_entropy:
+1427|                        inplace_backward = False
+1428|                    log_probs = logprobs_from_logits(
+1429|                        logits=logits_rmpad,
+1430|                        labels=input_ids_rmpad_rolled,
+1431|                        inplace_backward=inplace_backward,
+1432|                    )
+1433|
+1434|            # gather across the ulysses sp group and drop the packed-sequence padding
+1435|            pad_size = output_args["pad_size"]
+1436|            if not distillation_only:
+1437|                log_probs = self._gather_and_unpad_packed(log_probs, pad_size)
+1438|            if calculate_entropy:
+1439|                entropy_rmpad = self._gather_and_unpad_packed(entropy_rmpad, pad_size)
+1440|            if calculate_sum_pi_squared:
+1441|                sum_pi_squared_rmpad = self._gather_and_unpad_packed(sum_pi_squared_rmpad, pad_size)
+1442|
+1443|            if pad_mode == DatasetPadMode.NO_PADDING:
+1444|                cu_seqlens = input_ids.offsets()
+1445|                # (bsz, j1), for each sample, is the length of each sample: [real_prompt length + real_response length]
+1446|                if not distillation_only:
+1447|                    log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)
+1448|                if calculate_entropy:
+1449|                    entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
+1450|                if calculate_sum_pi_squared:
+1451|                    sum_pi_squared = torch.nested.nested_tensor_from_jagged(sum_pi_squared_rmpad, cu_seqlens)
+1452|            else:
+1453|                raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
+1454|
+1455|        else:  # not using rmpad and no ulysses sp
+1456|            if use_fused_kernels:
+1457|                if pad_mode == DatasetPadMode.NO_PADDING:
+1458|                    # Re-wrap dense fused (bsz, seqlen) outputs as nested/jagged: mask out the
+1459|                    # padding columns per sequence and pack the valid tokens to (total_nnz,).
+1460|                    cu_seqlens = input_ids.offsets()
+1461|                    seq_lengths = cu_seqlens.diff()
+1462|                    arange = torch.arange(output.log_probs.shape[1], device=output.log_probs.device)
+1463|                    mask = arange < seq_lengths.unsqueeze(1)
+1464|
+1465|                    log_probs = None
+1466|                    if not distillation_only:
+1467|                        log_probs = output.log_probs[mask]
+1468|                        log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)
+1469|
+1470|                    if calculate_entropy:
+1471|                        entropy = output.entropy[mask]
+1472|                        entropy = torch.nested.nested_tensor_from_jagged(entropy, cu_seqlens)
+1473|                else:
+1474|                    raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
+1475|
+1476|            else:
+1477|                logits = output.logits  # (bsz, response_length, vocab_size)
+1478|                temperature = output_args["temperature"]  # (bsz,)
+1479|                temperature = temperature.unsqueeze(-1).unsqueeze(-1)
+1480|                # With TP, logits are DTensors sharded on vocab dim; gather for log_softmax.
+1481|                if isinstance(logits, DTensor):
+1482|                    logits = logits.full_tensor()
+1483|                logits = _scale_logits_by_temperature(
+1484|                    logits,
+1485|                    temperature,
+1486|                    is_unit_temperature=temperature_is_one,
+1487|                )
+1488|
+1489|                if calculate_entropy:
+1490|                    if not self.engine_config.entropy_checkpointing:
+1491|                        entropy = verl_F.entropy_from_logits(logits)
+1492|                    else:
+1493|                        entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
+1494|
+1495|                if calculate_sum_pi_squared:
+1496|                    sum_pi_squared = verl_F.calculate_sum_pi_squared_from_logits(logits)
+1497|
+1498|                if pad_mode == DatasetPadMode.NO_PADDING:
+1499|                    cu_seqlens = input_ids.offsets()
+1500|                    seq_lengths = cu_seqlens.diff()
+1501|                    starts = torch.zeros_like(seq_lengths, dtype=torch.int64)
+1502|                    logits = torch.nested.narrow(logits, 1, starts, seq_lengths, layout=torch.jagged)
+1503|                    logits_rmpad = torch.cat([t for t in logits.unbind()])
+1504|                    input_ids_rmpad_rolled = output_args["input_ids_rmpad_rolled"]
+1505|
+1506|                    # Mirror the use_remove_padding=True branch (see verl#6293).
+1507|                    # No Ulysses SP gather here: this branch is the no-SP path
+1508|                    # (log_probs is also not gathered) and pad_size is only
+1509|                    # populated in output_args along the use_remove_padding=True
+1510|                    # path of prepare_model_inputs.
+1511|                    if distillation_use_topk:
+1512|                        outputs = logits_processor_func(student_logits=logits_rmpad.unsqueeze(0), data=micro_batch)
+1513|                        for k, v in outputs.items():
+1514|                            v = v.squeeze(0)
+1515|                            assert v.shape == (logits_rmpad.shape[0],), (
+1516|                                f"logits_rmpad len: {logits_rmpad.shape[0]}, {k} shape: {v.shape}"
+1517|                            )
+1518|                            model_output[k] = torch.nested.nested_tensor_from_jagged(v, cu_seqlens)
+1519|
+1520|                    log_probs = None
+1521|                    if not distillation_only:
+1522|                        log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
+1523|
+1524|                    # (bsz, j1), for each sample, length of each sample: [real_prompt_length + real_response_length]
+1525|                    if not distillation_only:
+1526|                        log_probs = torch.nested.nested_tensor_from_jagged(log_probs, cu_seqlens)
+1527|                    if calculate_entropy:
+1528|                        entropy = torch.nested.narrow(entropy, 1, starts, seq_lengths, layout=torch.jagged)
+1529|                        entropy_rmpad = torch.cat([t for t in entropy.unbind()])
+1530|                        entropy = torch.nested.nested_tensor_from_jagged(entropy_rmpad, cu_seqlens)
+1531|                    if calculate_sum_pi_squared:
+1532|                        sum_pi_squared = torch.nested.narrow(
+1533|                            sum_pi_squared, 1, starts, seq_lengths, layout=torch.jagged
+1534|                        )
+1535|                        sum_pi_squared_rmpad = torch.cat([t for t in sum_pi_squared.unbind()])
+1536|                        sum_pi_squared = torch.nested.nested_tensor_from_jagged(sum_pi_squared_rmpad, cu_seqlens)
+1537|                else:
+1538|                    raise NotImplementedError(f"pad_mode {pad_mode} not implemented")
+1539|
+1540|        if not distillation_only:
+1541|            model_output["log_probs"] = log_probs
+1542|        if calculate_entropy:
+1543|            model_output["entropy"] = entropy
+1544|        if calculate_sum_pi_squared:
+1545|            model_output["sum_pi_squared"] = sum_pi_squared
+1546|
+1547|        return model_output
+1548|
+1549|    def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
+1550|        device_name = get_device_name()
+1551|        # actually, we should avoid assigning like this...
+1552|        micro_batch = micro_batch.to(get_device_id())
+1553|        model_inputs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
+1554|
+1555|        # Honor mixed_precision.param_dtype resolved during FSDP setup. When dtype is fp32,
+1556|        # autocast is a no-op at best and a footgun at worst, so skip it entirely.
+1557|        # getattr fallback: some subclasses (e.g. VeOmniEngine) bypass FSDPEngine.__init__
+1558|        # and _build_fsdp_module, so self._autocast_dtype may not be set.
+1559|        autocast_dtype = getattr(self, "_autocast_dtype", torch.bfloat16)
+1560|        autocast_ctx: ContextManager = (
+1561|            nullcontext()
+1562|            if autocast_dtype == torch.float32
+1563|            else torch.autocast(device_type=device_name, dtype=autocast_dtype)
+1564|        )
+1565|        with autocast_ctx:
+1566|            raw_output = self.module(
+1567|                **model_inputs,
+1568|                use_cache=False,
+1569|            )  # prevent model thinks we are generating
+1570|
+1571|            model_output = self.prepare_model_outputs(
+1572|                output=raw_output, output_args=output_args, micro_batch=micro_batch, logits_processor_func=loss_function
+1573|            )
+1574|
+1575|            if loss_function is not None:
+1576|                loss, metrics = loss_function(
+1577|                    model_output=model_output, data=micro_batch, dp_group=self.get_data_parallel_group()
+1578|                )
+1579|            else:
+(more lines below)

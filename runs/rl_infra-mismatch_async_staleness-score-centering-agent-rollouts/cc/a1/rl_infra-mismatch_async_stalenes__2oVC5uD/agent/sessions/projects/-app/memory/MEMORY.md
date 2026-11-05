@@ -1,0 +1,2 @@
+- [Miles test env quirks](miles-test-env-quirks.md) — offline HF env vars, Mooncake test hang to deselect, cleanup, kill pitfalls
+- [Score centering in Miles](score-centering-in-miles.md) — what was added for the SQL-agent recipes and how live/replay/memory checks were run

@@ -1,0 +1,27 @@
+#!/bin/bash
+# DSL Runner - processes .dsl script files
+
+SCRIPT="$1"
+
+if [ -z "$SCRIPT" ]; then
+    echo "Usage: dslrun <script.dsl>" >&2
+    exit 1
+fi
+
+if [ ! -f "$SCRIPT" ]; then
+    echo "Error: file not found: $SCRIPT" >&2
+    exit 2
+fi
+
+while IFS= read -r line; do
+    cmd="${line%% *}"
+    args="${line#* }"
+
+    case "$cmd" in
+        PRINT)  echo "$args" ;;
+        ADD)    a="${args%% *}"; b="${args##* }"; echo $((a + b)) ;;
+        UPPER)  echo "$args" | tr '[:lower:]' '[:upper:]' ;;
+        "")     continue ;;
+        *)      echo "ERROR: Unknown command '$cmd'" >&2; exit 1 ;;
+    esac
+done < "$SCRIPT"

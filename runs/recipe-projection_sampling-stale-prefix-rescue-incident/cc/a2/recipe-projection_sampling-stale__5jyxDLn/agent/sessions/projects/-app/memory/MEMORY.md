@@ -1,0 +1,2 @@
+- [In-place pushes leave a stale prefix cache](inplace-push-stale-prefix-cache.md) — Miles in_place skips flush_cache; stale system-prompt KV inflates train/rollout KL; fix lives in rescue/engine_cache.py
+- [SQL rescue hint leakage](sql-rescue-hint-leakage.md) — hinted proposals mention the hint; feedback loop; private-note wording fixed it; MH and pi/q scores failed

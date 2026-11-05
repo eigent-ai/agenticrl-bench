@@ -1,0 +1,71 @@
+559:def make_iterator(tensordict: TensorDict, mini_batch_size, epochs, seed=None, dataloader_kwargs=None):
+560-    """Create an iterator that yields mini-batches from a TensorDict.
+561-
+562-    Wraps a TensorDict in a DataLoader-style iterator that yields mini-batches
+563-    for the specified number of epochs. Useful for training loops.
+564-
+565-    Args:
+566-        tensordict: The TensorDict to iterate over.
+567-        mini_batch_size: Size of each mini-batch. Must evenly divide the
+568-            TensorDict's batch size.
+569-        epochs: Number of times to iterate through the entire dataset.
+570-        seed: Optional random seed for reproducible shuffling.
+571-        dataloader_kwargs: Optional dict of additional kwargs to pass to
+572-            the underlying DataLoader (e.g., shuffle=True, num_workers=4).
+573-
+574-    Returns:
+575-        An iterator that yields TensorDict mini-batches.
+576-
+577-    Raises:
+578-        AssertionError: If batch size is not divisible by mini_batch_size.
+579-
+580-    Example:
+581-        >>> td = TensorDict({"obs": torch.randn(100, 4)}, batch_size=[100])
+582-        >>> for batch in make_iterator(td, mini_batch_size=10, epochs=2):
+583-        ...     # batch is a TensorDict with batch_size=[10]
+584-        ...     pass
+585-    """
+586-    from torch.utils.data import DataLoader
+587-
+588-    assert tensordict.batch_size[0] % mini_batch_size == 0, f"{tensordict.batch_size[0]} % {mini_batch_size} != 0"
+589-    # we can directly create a dataloader from TensorDict
+590-    if dataloader_kwargs is None:
+591-        dataloader_kwargs = {}
+592-
+593-    if seed is not None:
+594-        generator = torch.Generator()
+595-        generator.manual_seed(seed)
+596-    else:
+597-        generator = None
+598-
+599-    assert isinstance(dataloader_kwargs, dict)
+600-
+601-    idx_lst = torch.arange(tensordict.shape[0])
+602-
+603-    train_dataloader = DataLoader(
+604-        dataset=idx_lst, batch_size=mini_batch_size, collate_fn=lambda x: x, generator=generator, **dataloader_kwargs
+605-    )
+606-
+607-    def get_data():
+608-        for _ in range(epochs):
+609-            for idx in train_dataloader:
+610-                yield index_select_tensor_dict(tensordict, idx)
+611-
+612-    return iter(get_data())
+613-
+614-
+615-def assert_tensordict_eq(tensordict1: TensorDict, tensordict2: TensorDict):
+616-    """Assert that two TensorDicts are equal.
+617-
+618-    Performs a deep equality check between two TensorDicts, verifying that
+619-    they have the same keys with identical values. Handles nested tensors
+348:def rearrange_micro_batches(
+349-    batch,
+350-    max_token_len,
+351-    dp_group=None,
+352-    num_batches_divided_by=None,
+353-    same_micro_num_in_dp=True,
+--
+564:def restore_dynamic_batch(data: torch.Tensor, batch_idx_list: list[list[int]]) -> torch.Tensor:
+565-    """
+566-    Restore a batch from dynamic batching.

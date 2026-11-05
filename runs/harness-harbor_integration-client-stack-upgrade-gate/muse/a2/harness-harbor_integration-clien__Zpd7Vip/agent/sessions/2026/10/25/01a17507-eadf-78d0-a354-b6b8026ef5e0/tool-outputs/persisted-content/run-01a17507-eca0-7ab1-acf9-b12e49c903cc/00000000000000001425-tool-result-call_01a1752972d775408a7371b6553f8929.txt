@@ -1,0 +1,122 @@
+edited
+changed lines: lines 830-833
+--- original
++++ updated
+@@
+-    return {"exception": exc, "sent": sess.sent if sess else None,
+-            "session_kwargs": sess.kwargs if sess else None,
+-            "rollout_details": context.rollout_details, "metadata": meta,
+-            "trajectories": trajs, "overrun": server.overrun()}
++    sk = None
++    if sess:
++        sk = {k: sess.kwargs.get(k) for k in ("session_name", "pane_width", "pane_height")
++              if k in sess.kwargs}
++    return {"exception": exc, "sent": sess.sent if sess else None,
++            "session_kwargs": sk,
++            "rollout_details": context.rollout_details, "metadata": meta,
++            "trajectories": trajs, "overrun": server.overrun()}
++
++
++def _run_parser(scen):
++    if scen["parser"] == "json":
++        from harbor.agents.terminus_2.terminus_json_plain_parser import TerminusJSONPlainParser as P
++    else:
++        from harbor.agents.terminus_2.terminus_xml_plain_parser import TerminusXMLPlainParser as P
++    parser = P()
++    results = []
++    for text in scen["inputs"]:
++        try:
++            r = parser.parse_response(text)
++            results.append({"commands": [[c.keystrokes, c.duration] for c in r.commands],
++                            "complete": r.is_task_complete, "error": r.error,
++                            "warning": r.warning, "analysis": r.analysis, "plan": r.plan})
++        except BaseException as e:  # noqa: BLE001
++            results.append({"exception": type(e).__name__})
++    salvage = []
++    if hasattr(parser, "salvage_truncated_response"):
++        for text in scen["inputs"] + PARSER_SALVAGE:
++            try:
++                s, multi = parser.salvage_truncated_response(text)
++                salvage.append([s, multi])
++            except BaseException as e:  # noqa: BLE001
++                salvage.append({"exception": type(e).__name__})
++    return {"results": results, "salvage": salvage}
++
++
++PARSER_SALVAGE = [
++    '<response><analysis>a</analysis><plan>p</plan><commands><keystrokes duration="0.1">ls\n</keystrokes></commands></response>junk junk',
++    '<response><analysis>a</analysis><plan>p</plan><commands><keystrokes duration="0.1">ls\n</keystrokes></commands>',
++    '<response><analysis>a</analysis><plan>p</plan><commands><keystrokes duration="0.1">a\n</keystrokes></commands></response><response><analysis>b</analysis><plan>p</plan><commands><keystrokes duration="0.1">b\n</keystrokes></commands></response>',
++]
++
++
++async def _run_verifier(scen, work):
++    import logging
++    from types import SimpleNamespace
++    from harbor.verifier.verifier import Verifier
++    from harbor.models.task.config import TaskOS
++    results = {}
++    work = Path(work)
++    for case in scen["cases"]:
++        cdir = work / case["name"]
++        (cdir / "verifier").mkdir(parents=True, exist_ok=True)
++        (cdir / "tests").mkdir(parents=True, exist_ok=True)
++        (cdir / "tests" / "test.sh").write_text("#!/bin/bash\ntrue\n")
++        for fname, content in (case["files"] or {}).items():
++            (cdir / "verifier" / fname).write_text(content)
++        exec_calls = []
++
++        async def _exec(command=None, env=None, user=None, **kw):
++            exec_calls.append(command)
++            return SimpleNamespace(return_code=0, stdout="", stderr="")
++
++        async def _upload_dir(**kw):
++            return None
++
++        env = SimpleNamespace(os=TaskOS.LINUX, capabilities=SimpleNamespace(mounted=True),
++                              exec=_exec, upload_dir=_upload_dir, session_id="gate-env")
++        task_paths = SimpleNamespace(
++            tests_dir=cdir / "tests",
++            test_path_for=lambda os_: cdir / "tests" / "test.sh",
++            discovered_test_path_for=lambda os_: cdir / "tests" / "test.sh",
++            validate_input_tree=lambda p: None)
++        task = SimpleNamespace(paths=task_paths,
++                               config=SimpleNamespace(verifier=SimpleNamespace(env={})))
++        trial_paths = SimpleNamespace(
++            verifier_dir=cdir / "verifier",
++            reward_text_path=cdir / "verifier" / "reward.txt",
++            reward_json_path=cdir / "verifier" / "reward.json",
++            test_stdout_path=cdir / "verifier" / "test-stdout.txt")
++        v = Verifier.__new__(Verifier)
++        v.task = task
++        v.trial_paths = trial_paths
++        v.environment = env
++        v.override_env = {}
++        v.logger = logging.getLogger("gate-verifier")
++        v.verifier_env = None
++        v.step_name = None
++        v.include_logs = None
++        v.exclude_logs = None
++        v._skip_tests_upload = False
++        try:
++            res = await v.verify()
++            results[case["name"]] = {"rewards": res.rewards, "exec": exec_calls}
++        except BaseException as e:  # noqa: BLE001
++            results[case["name"]] = {"exception": type(e).__name__, "exec": exec_calls}
++    return {"cases": results}
++
++
++async def _run_llm_errors(doc, scen, server, work):
++    results = {}
++    for case in scen["cases"]:
++        agent = _make_agent(doc, scen["launch"], work, server.base)
++        before = len(server.requests)
++        server.arm(scen["id"] + "/" + case["name"], [case["action"]] * 12)
++        try:
++            r = await agent._llm.call(prompt="gate error probe", message_history=[],
++                                      **agent._llm_call_kwargs)
++            results[case["name"]] = {"result": _resp_dict(r), "calls": len(server.requests) - before}
++        except BaseException as e:  # noqa: BLE001
++            results[case["name"]] = {"exception": type(e).__name__,
++                                     "calls": len(server.requests) - before}
++    return {"cases": results}

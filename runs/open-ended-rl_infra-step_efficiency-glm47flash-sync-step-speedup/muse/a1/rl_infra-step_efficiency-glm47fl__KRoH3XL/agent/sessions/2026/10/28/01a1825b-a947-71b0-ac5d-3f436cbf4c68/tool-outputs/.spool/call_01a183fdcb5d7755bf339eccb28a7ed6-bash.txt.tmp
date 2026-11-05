@@ -1,0 +1,70 @@
+
+self = <tests.fast.backends.training_utils.loss.test_loss_snapshot.TestLossSnapshot object at 0x2b79f9e94d40>
+config = ('grpo_b3', {'advantage_estimator': 'grpo', 'loss_type': 'policy_loss'}, 3, [20, 64, 40], [10, 48, 32])
+mode = 'compare'
+
+    def test_loss_snapshot(self, config, mode):
+        args, parallel_state, inputs = self._build(config)
+    
+        if mode == "snapshot":
+            path = self._snapshot_path(config)
+            outputs = run_all(args, parallel_state, inputs)
+            save_snapshot(path, inputs, outputs)
+    
+        elif mode == "compare":
+>           snapshot_dir = ensure_snapshot_dir(SNAPSHOT_DIR)
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/fast/backends/training_utils/loss/test_loss_snapshot.py:286: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+snapshot_dir = PosixPath('/root/miles/tests/fast/backends/training_utils/loss/loss_snapshots')
+
+    def ensure_snapshot_dir(snapshot_dir: Path) -> Path:
+        """Return a directory containing .pt snapshots.
+    
+        If *snapshot_dir* already has .pt files, return it as-is.
+        Otherwise, shallow-clone yueming-yuan/miles-artifacts into a cache
+        directory and return the path to loss_snapshots/ inside the clone.
+        """
+        if snapshot_dir.exists() and any(snapshot_dir.glob("*.pt")):
+            return snapshot_dir
+        repo_dir = ARTIFACTS_CACHE / "repo"
+        result_dir = repo_dir / "loss_snapshots"
+        if result_dir.exists() and any(result_dir.glob("*.pt")):
+            return result_dir
+        ARTIFACTS_CACHE.mkdir(parents=True, exist_ok=True)
+>       subprocess.run(
+            ["git", "clone", "--depth=1", ARTIFACTS_REPO, str(repo_dir)],
+            check=True,
+        )
+
+tests/fast/backends/training_utils/loss/loss_test_utils.py:322: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+input = None, capture_output = False, timeout = None, check = True
+popenargs = (['git', 'clone', '--depth=1', 'https://github.com/yueming-yuan/miles-artifacts.git', '/root/.cache/miles-test-artifacts/repo'],)
+--
+        stderr. By default, stdout and stderr are not captured, and those attributes
+        will be None. Pass stdout=PIPE and/or stderr=PIPE in order to capture them,
+        or pass capture_output=True to capture both.
+    
+        If check is True and the exit code was non-zero, it raises a
+        CalledProcessError. The CalledProcessError object will have the return code
+        in the returncode attribute, and output & stderr attributes if those streams
+        were captured.
+    
+        If timeout is given, and the process takes too long, a TimeoutExpired
+        exception will be raised.
+    
+        There is an optional argument "input", allowing you to
+        pass bytes or a string to the subprocess's stdin.  If you use this argument
+        you may not also use the Popen constructor's "stdin" argument, as
+        it will be used internally.
+    
+        By default, all communication is in bytes, and therefore any "input" should
+        be bytes, and the stdout and stderr will be bytes. If in text mode, any
+        "input" should be a string, and stdout and stderr will be strings decoded
+        according to locale encoding, or by "encoding" if set. Text mode is
+        triggered by setting any of text, encoding, errors or universal_newlines.
+    

@@ -1,0 +1,47 @@
+diff -ruN '--exclude=__pycache__' base/verl/trainer/ppo/core_algos.py M06/verl/trainer/ppo/core_algos.py
+--- base/verl/trainer/ppo/core_algos.py	2026-10-12 11:39:31.000000000 +0000
++++ M06/verl/trainer/ppo/core_algos.py	2026-10-12 12:10:25.113066543 +0000
+@@ -2493,19 +2493,16 @@
+ 
+     # Compute IS weights and rejection mask
+     # Note: For PPO-clip, we still compute IS weights for metrics, but don't apply them
+-    with torch.no_grad():
+-        rollout_is_weights_proto, modified_response_mask, rollout_metrics = (
+-            compute_rollout_correction_and_rejection_mask(
+-                old_log_prob=log_prob,  # Current policy (for IS ratio: π_current / π_rollout)
+-                rollout_log_prob=rollout_log_prob,  # Rollout policy
+-                response_mask=response_mask,
+-                rollout_is=rollout_is,
+-                rollout_is_threshold=rollout_is_threshold,
+-                rollout_is_batch_normalize=rollout_is_batch_normalize,
+-                rollout_rs=rollout_rs,
+-                rollout_rs_threshold=rollout_rs_threshold,
+-            )
+-        )
++    rollout_is_weights_proto, modified_response_mask, rollout_metrics = compute_rollout_correction_and_rejection_mask(
++        old_log_prob=log_prob,  # Current policy (for IS ratio: π_current / π_rollout)
++        rollout_log_prob=rollout_log_prob,  # Rollout policy
++        response_mask=response_mask,
++        rollout_is=rollout_is,
++        rollout_is_threshold=rollout_is_threshold,
++        rollout_is_batch_normalize=rollout_is_batch_normalize,
++        rollout_rs=rollout_rs,
++        rollout_rs_threshold=rollout_rs_threshold,
++    )
+ 
+     # Extract IS weights tensor (or None if disabled)
+     computed_is_weights = rollout_is_weights_proto.batch["rollout_is_weights"] if rollout_is_weights_proto else None
+diff -ruN '--exclude=__pycache__' base/verl/trainer/ppo/rollout_corr_helper.py M06/verl/trainer/ppo/rollout_corr_helper.py
+--- base/verl/trainer/ppo/rollout_corr_helper.py	2026-10-12 11:39:31.000000000 +0000
++++ M06/verl/trainer/ppo/rollout_corr_helper.py	2026-10-12 12:10:25.113066543 +0000
+@@ -620,10 +620,6 @@
+         )
+         metrics["rollout_is_oob_ratio"] = verl_F.masked_mean(oob_mask.float(), response_mask).item()
+ 
+-    # Detach weights to prevent gradient flow (mathematically required by IS theory)
+-    # IS weights change the measure, not the objective. See §3.2.2 in docs/algo/rollout_corr_math.md
+-    rollout_is_weights = rollout_is_weights.detach()
+-
+     # Apply batch normalization if requested
+     if rollout_is_batch_normalize:
+         # Compute mean based on aggregation level

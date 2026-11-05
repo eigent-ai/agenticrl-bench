@@ -1,0 +1,121 @@
+                    # If there are no commands, we still need to add an observation result
+                    if not commands:
+                        observation_results.append(
+                            ObservationResult(
+                                content=observation,
+                            )
+                        )
+                elif not commands:
+                    # No commands and no task completion, just the observation
+                    observation_results.append(
+                        ObservationResult(
+                            content=observation,
+                        )
+                    )
+
+                tool_calls = tool_calls_list or None
+            else:
+                # In raw_content mode, just add observation without tool_calls
+                observation_results.append(
+                    ObservationResult(
+                        content=observation,
+                    )
+                )
+
+            # Build the step object using Pydantic models
+            if llm_response.model_name:
+                self._last_response_model_name = llm_response.model_name
+            self._trajectory_steps.append(
+                Step(
+                    step_id=len(self._trajectory_steps) + 1,
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    source="agent",
+                    model_name=llm_response.model_name or self._model_name,
+                    message=message_content,
+                    reasoning_content=llm_response.reasoning_content,
+                    tool_calls=tool_calls,
+                    observation=Observation(results=observation_results),
+                    metrics=Metrics(
+                        prompt_tokens=chat.total_input_tokens - tokens_before_input,
+                        completion_tokens=chat.total_output_tokens
+                        - tokens_before_output,
+                        cached_tokens=cache_tokens_used
+                        if cache_tokens_used > 0
+                        else None,
+                        cost_usd=step_cost if step_cost > 0 else None,
+                        prompt_token_ids=llm_response.prompt_token_ids,
+                        completion_token_ids=llm_response.completion_token_ids,
+                        logprobs=llm_response.logprobs,
+                    ),
+                )
+            )
+
+            # Dump trajectory after every episode to ensure we persist even if program terminates
+            self._dump_trajectory()
+
+            if is_task_complete:
+                if was_pending_completion:
+                    # Task is confirmed complete (this is the second time task_complete was True), return
+                    return
+                else:
+                    # First completion attempt - ask for confirmation and continue
+                    prompt = observation
+                    continue
+
+            prompt = observation
+
+    def _reset_per_run_state(self) -> None:
+        """Reset all per-run state. The same Terminus2 instance is reused
+        across multiple `run()` invocations in multi-step trials, so any
+        accumulator that should be scoped to a single step must be reset here.
+        """
+        self._trajectory_steps = []
+        self._api_request_times = []
+        self._n_episodes = 0
+        self._summarization_count = 0
+        self._subagent_metrics = SubagentMetrics()
+        self._subagent_rollout_details = []
+        self._pending_completion = False
+        self._pending_subagent_refs = None
+        self._pending_handoff_prompt = None
+        self._session_id = (
+            self.options.session_id or self.session_id or str(uuid.uuid4())
+        )
+        session_id_headers = {
+            name: self._session_id for name in self._session_id_headers or []
+        }
+        if session_id_headers:
+            extra_headers = self._llm_call_kwargs.setdefault("extra_headers", {})
+            if not isinstance(extra_headers, dict):
+                raise ValueError("llm_call_kwargs.extra_headers must be a mapping")
+            extra_headers.update(session_id_headers)
+
+    @override
+    async def run(
+        self,
+        instruction: str,
+        environment: BaseEnvironment,
+        context: AgentContext,
+    ) -> None:
+        self._reset_per_run_state()
+        self._chat = Chat(
+            self._llm, interleaved_thinking=self.options.interleaved_thinking
+        )
+        self._context = context
+
+        if self._session is None:
+            raise RuntimeError("Session is not set")
+
+        # Get the terminal state for the initial prompt
+        terminal_state = self._limit_output_length(
+            await self._session.get_incremental_output()
+        )
+
+        augmented_instruction = instruction
+        if self.mcp_servers:
+            mcp_info = "\n\nMCP Servers:\nThe following MCP servers are available for this task.\n"
+            for s in self.mcp_servers:
+                if s.transport == "stdio":
+                    args_str = " ".join(s.args)
+                    mcp_info += f"- {s.name}: stdio transport, command: {s.command} {args_str}\n"
+                else:

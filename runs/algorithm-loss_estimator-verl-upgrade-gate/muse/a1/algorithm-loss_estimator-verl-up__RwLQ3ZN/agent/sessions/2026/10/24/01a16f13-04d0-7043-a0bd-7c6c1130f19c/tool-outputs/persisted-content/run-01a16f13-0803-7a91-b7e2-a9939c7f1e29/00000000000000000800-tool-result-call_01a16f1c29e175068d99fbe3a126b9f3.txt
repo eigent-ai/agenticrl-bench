@@ -1,0 +1,400 @@
+Read text file `/opt/verl/verl/workers/config/actor.py`.
+1|# Copyright 2024 Bytedance Ltd. and/or its affiliates
+2|#
+3|# Licensed under the Apache License, Version 2.0 (the "License");
+4|# you may not use this file except in compliance with the License.
+5|# You may obtain a copy of the License at
+6|#
+7|#     http://www.apache.org/licenses/LICENSE-2.0
+8|#
+9|# Unless required by applicable law or agreed to in writing, software
+10|# distributed under the License is distributed on an "AS IS" BASIS,
+11|# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+12|# See the License for the specific language governing permissions and
+13|# limitations under the License.
+14|
+15|from dataclasses import dataclass, field
+16|from typing import Any, Optional
+17|
+18|from omegaconf import MISSING
+19|
+20|from verl.base_config import BaseConfig
+21|from verl.trainer.config import CheckpointConfig, RolloutCorrectionConfig
+22|from verl.utils.profiler.config import ProfilerConfig
+23|from verl.utils.qat import QATConfig
+24|
+25|from .checkpoint import McoreCheckpointConfig
+26|from .engine import (
+27|    FSDPEngineConfig,
+28|    McoreEngineConfig,
+29|    TorchtitanEngineConfig,
+30|    VeOmniEngineConfig,
+31|)
+32|from .model import HFModelConfig
+33|from .optimizer import OptimizerConfig
+34|
+35|__all__ = [
+36|    "PolicyLossConfig",
+37|    "RouterReplayConfig",
+38|    "ActorConfig",
+39|    "FSDPActorConfig",
+40|    "McoreActorConfig",
+41|    "VeOmniActorConfig",
+42|    "QATConfig",
+43|    "TorchTitanActorConfig",
+44|]
+45|
+46|
+47|@dataclass
+48|class RouterReplayConfig(BaseConfig):
+49|    """Configuration for router replay in MoE models.
+50|
+51|    This configuration controls the routing behavior for Mixture of Experts (MoE) models,
+52|    allowing for deterministic training through route recording and replay.
+53|
+54|    Args:
+55|        mode (str): Router replay mode. Options: 'disabled', 'R2', 'R3'.
+56|            - 'disabled': No router replay functionality
+57|            - 'R2': Use Router Replay routing strategy
+58|            - 'R3': Use Rollout Router Replay routing strategy
+59|        record_file (Optional[str]): File path to save recorded routing decisions.
+60|            Required when mode is 'record', 'R2', or 'R3'.
+61|        replay_file (Optional[str]): File path to load recorded routing decisions for replay.
+62|            Required when mode is 'replay'.
+63|    """
+64|
+65|    mode: str = "disabled"
+66|    record_file: Optional[str] = None
+67|    replay_file: Optional[str] = None
+68|
+69|    def __post_init__(self):
+70|        """Validate router replay configuration."""
+71|        valid_modes = ["disabled", "R2", "R3"]
+72|        if self.mode not in valid_modes:
+73|            raise ValueError(f"Invalid router_replay mode: {self.mode}. Must be one of {valid_modes}")
+74|
+75|
+76|@dataclass
+77|class PolicyLossConfig(BaseConfig):
+78|    """Configuration for policy loss computation.
+79|
+80|    The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
+81|
+82|    Args:
+83|        loss_mode (str): Registered policy loss name. Options: 'vanilla', 'dppo_tv', 'dppo_kl', 'gspo', 'sapo',
+84|            'gpg', 'clip_cov', 'kl_cov', 'geo_mean', 'dro', 'cispo', and 'bypass_mode'.
+85|        clip_cov_ratio (float): Ratio of tokens to be clipped for clip-cov loss.
+86|        clip_cov_lb (float): Lower bound for clip-cov loss.
+87|        clip_cov_ub (float): Upper bound for clip-cov loss.
+88|        kl_cov_ratio (float): Ratio of tokens to be applied KL penalty for kl-cov loss.
+89|        ppo_kl_coef (float): KL divergence penalty coefficient.
+90|        dro_beta (Optional[float]): Quadratic log-ratio penalty for DRO. Required when loss_mode is 'dro'.
+91|        rollout_correction (RolloutCorrectionConfig): Configuration for rollout correction.
+92|    """
+93|
+94|    loss_mode: str = "vanilla"
+95|    clip_cov_ratio: float = 0.0002
+96|    clip_cov_lb: float = 1.0
+97|    clip_cov_ub: float = 5.0
+98|    kl_cov_ratio: float = 0.0002
+99|    ppo_kl_coef: float = 0.1
+100|    dro_beta: Optional[float] = None
+101|    rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
+102|
+103|
+104|@dataclass
+105|class ActorConfig(BaseConfig):
+106|    """Configuration for actor model training.
+107|
+108|    The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
+109|
+110|    Args:
+111|        strategy (str): Training strategy. Must be specified.
+112|        ppo_mini_batch_size (int): Mini-batch size for PPO training.
+113|        ppo_micro_batch_size (Optional[int]): Micro-batch size for PPO training.
+114|            If None, uses ppo_micro_batch_size_per_gpu.
+115|        ppo_micro_batch_size_per_gpu (Optional[int]): Micro-batch size per GPU for PPO training.
+116|        use_dynamic_bsz (bool): Whether to use dynamic batch sizing.
+117|        ppo_max_token_len_per_gpu (int): Maximum token length per GPU for PPO training.
+118|        clip_ratio (float): PPO clipping ratio for policy loss.
+119|        clip_ratio_low (float): Lower bound for PPO clipping ratio.
+120|        clip_ratio_high (float): Upper bound for PPO clipping ratio.
+121|        policy_loss (PolicyLossConfig): Configuration for policy loss computation.
+122|        clip_ratio_c (float): Clipping ratio for critic loss.
+123|        loss_agg_mode (str): Loss aggregation mode, including 'token-mean', 'token-sum', and sequence modes.
+124|        loss_scale_factor (Optional[int]): Scale factor for 'seq-mean-token-sum-norm' loss aggregation mode.
+125|            If None, uses response_length. Set to a constant to ensure consistent normalization.
+126|        entropy_coeff (float): Entropy coefficient for regularization.
+127|        tau_pos (float): Positive tau for SAPO smoothing (>= 1.0 keeps rewards stable).
+128|        tau_neg (float): Negative tau for SAPO smoothing (> tau_pos for asymmetry).
+129|        use_kl_loss (bool): Whether to use KL divergence loss.
+130|        use_torch_compile (bool): Whether to use torch.compile for optimization.
+131|        kl_loss_coef (float): KL divergence loss coefficient.
+132|        kl_loss_type (str): Type of KL loss to use.
+133|        ppo_epochs (int): Number of PPO epochs per training step.
+134|        shuffle (bool): Whether to shuffle data during training.
+135|        checkpoint (CheckpointConfig): Configuration for checkpointing.
+136|        optim (OptimizerConfig): Configuration for optimizer.
+137|        use_fused_kernels (bool): Whether to use custom fused kernels (e.g., FlashAttention, fused MLP).
+138|        data_loader_seed (int): Seed for data loader. If None, uses global seed.
+139|    """
+140|
+141|    _mutable_fields = BaseConfig._mutable_fields | {
+142|        "ppo_mini_batch_size",
+143|        "ppo_micro_batch_size",
+144|        "ppo_micro_batch_size_per_gpu",
+145|        "ppo_infer_micro_batch_size_per_gpu",
+146|        "engine",
+147|        "model_config",
+148|    }
+149|
+150|    strategy: str = MISSING
+151|    ppo_mini_batch_size: int = 256
+152|    ppo_micro_batch_size: Optional[int] = None  # deprecate
+153|    ppo_micro_batch_size_per_gpu: Optional[int] = None
+154|    ppo_infer_micro_batch_size_per_gpu: Optional[int] = None
+155|    use_dynamic_bsz: bool = False
+156|    ppo_max_token_len_per_gpu: int = 16384
+157|    ppo_infer_max_token_len_per_gpu: int = 16384
+158|    clip_ratio: float = 0.2
+159|    clip_ratio_low: float = 0.2
+160|    clip_ratio_high: float = 0.2
+161|    freeze_vision_tower: bool = False
+162|    policy_loss: PolicyLossConfig = field(default_factory=PolicyLossConfig)
+163|    clip_ratio_c: float = 3.0
+164|    loss_agg_mode: str = "token-mean"
+165|    loss_scale_factor: Optional[int] = None
+166|    entropy_coeff: float = 0
+167|    tau_pos: float = 1.0
+168|    tau_neg: float = 1.05
+169|    calculate_entropy: bool = False
+170|    calculate_sum_pi_squared: bool = False
+171|    use_kl_loss: bool = False
+172|    # Whether to enable PrefixGrouper-based shared-prefix forward
+173|    use_prefix_grouper: bool = False
+174|    use_torch_compile: bool = True
+175|    kl_loss_coef: float = 0.001
+176|    kl_loss_type: str = "low_var_kl"
+177|    ppo_epochs: int = 1
+178|    shuffle: bool = False
+179|    data_loader_seed: int = 42
+180|    checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
+181|    optim: OptimizerConfig = field(default_factory=OptimizerConfig)
+182|    use_fused_kernels: bool = False
+183|    profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
+184|    engine: BaseConfig = field(default_factory=BaseConfig)
+185|    rollout_n: int = MISSING  # must be override by sampling config
+186|    model_config: HFModelConfig = field(default_factory=BaseConfig)
+187|
+188|    # Store global batch info for loss aggregation:
+189|    # dp_size: data parallel size
+190|    # batch_num_tokens: number of valid tokens in global batch
+191|    # global_batch_size: global batch size
+192|    global_batch_info: dict = field(default_factory=dict)
+193|    qat: QATConfig = field(default_factory=QATConfig)
+194|
+195|    def __post_init__(self):
+196|        """Validate actor configuration parameters."""
+197|        assert self.strategy != MISSING
+198|        assert self.rollout_n != MISSING
+199|        if not self.use_dynamic_bsz:
+200|            if self.ppo_micro_batch_size is not None and self.ppo_micro_batch_size_per_gpu is not None:
+201|                raise ValueError(
+202|                    "[actor] You have set both 'actor.ppo_micro_batch_size' AND 'actor.ppo_micro_batch_size_per_gpu'. "
+203|                    "Please remove 'actor.ppo_micro_batch_size' because only '*_ppo_micro_batch_size_per_gpu' is "
+204|                    "supported (the former is deprecated)."
+205|                )
+206|            else:
+207|                assert not (self.ppo_micro_batch_size is None and self.ppo_micro_batch_size_per_gpu is None), (
+208|                    "[actor] Please set at least one of 'actor.ppo_micro_batch_size' or "
+209|                    "'actor.ppo_micro_batch_size_per_gpu' if use_dynamic_bsz is not enabled."
+210|                )
+211|
+212|        valid_loss_agg_modes = [
+213|            "token-mean",
+214|            "token-sum",
+215|            "seq-mean-token-sum",
+216|            "seq-mean-token-mean",
+217|            "seq-mean-token-sum-norm",
+218|        ]
+219|        if self.loss_agg_mode not in valid_loss_agg_modes:
+220|            raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
+221|
+222|    def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
+223|        """Validate actor configuration with runtime parameters."""
+224|        if not self.use_dynamic_bsz:
+225|            if train_batch_size < self.ppo_mini_batch_size:
+226|                raise ValueError(
+227|                    f"train_batch_size ({train_batch_size}) must be >= "
+228|                    f"actor.ppo_mini_batch_size ({self.ppo_mini_batch_size})"
+229|                )
+230|
+231|            sp_size = getattr(self, "ulysses_sequence_parallel_size", 1)
+232|            if self.ppo_micro_batch_size is not None:
+233|                if self.ppo_mini_batch_size % self.ppo_micro_batch_size != 0:
+234|                    raise ValueError(
+235|                        f"ppo_mini_batch_size ({self.ppo_mini_batch_size}) must be divisible by "
+236|                        f"ppo_micro_batch_size ({self.ppo_micro_batch_size})"
+237|                    )
+238|                if self.ppo_micro_batch_size * sp_size < n_gpus:
+239|                    raise ValueError(
+240|                        f"ppo_micro_batch_size ({self.ppo_micro_batch_size}) * "
+241|                        f"ulysses_sequence_parallel_size ({sp_size}) must be >= n_gpus ({n_gpus})"
+242|                    )
+243|
+244|    @staticmethod
+245|    def _check_mutually_exclusive(mbs, mbs_per_gpu, name: str):
+246|        """Validate mutually exclusive micro batch size configuration options."""
+247|        param = "ppo_micro_batch_size"
+248|        param_per_gpu = f"{param}_per_gpu"
+249|
+250|        if mbs is None and mbs_per_gpu is None:
+251|            raise ValueError(f"[{name}] Please set at least one of '{name}.{param}' or '{name}.{param_per_gpu}'.")
+252|
+253|        if mbs is not None and mbs_per_gpu is not None:
+254|            raise ValueError(
+255|                f"[{name}] You have set both '{name}.{param}' AND '{name}.{param_per_gpu}'. Please remove "
+256|                f"'{name}.{param}' because only '*_{param_per_gpu}' is supported (the former is deprecated)."
+257|            )
+258|
+259|
+260|@dataclass
+261|class McoreActorConfig(ActorConfig):
+262|    """Configuration for Megatron actor models.
+263|
+264|    The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
+265|
+266|    Args:
+267|        strategy (str): Training strategy set to 'megatron' for Megatron parallelism.
+268|        megatron (dict[str, Any]): Configuration for Megatron parallelism settings.
+269|        profile (dict[str, Any]): Configuration for profiling settings.
+270|        checkpoint (McoreCheckpointConfig): Megatron-specific checkpoint config
+271|            that adds ``mbridge_config`` on top of the base checkpoint fields.
+272|    """
+273|
+274|    strategy: str = "megatron"
+275|    entropy_from_logits_with_chunking: bool = False
+276|    entropy_from_logits_chunk_size: int = 2048
+277|    megatron: McoreEngineConfig = field(default_factory=McoreEngineConfig)
+278|    profile: dict[str, Any] = field(default_factory=dict)
+279|    use_rollout_log_probs: bool = False
+280|    checkpoint: McoreCheckpointConfig = field(default_factory=McoreCheckpointConfig)
+281|
+282|    def __post_init__(self):
+283|        """Validate FSDP actor configuration parameters."""
+284|        super().__post_init__()
+285|        self.engine = self.megatron
+286|
+287|
+288|@dataclass
+289|class FSDPActorConfig(ActorConfig):
+290|    """Configuration for FSDP actor models.
+291|
+292|    The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
+293|
+294|    Args:
+295|        strategy (str): Training strategy set to 'fsdp' for Fully Sharded Data Parallel.
+296|        grad_clip (float): Gradient clipping threshold.
+297|        ulysses_sequence_parallel_size (int): [DEPRECATED] Ulysses sequence parallel size for long sequences.
+298|        entropy_from_logits_with_chunking (bool): Whether to compute entropy from logits
+299|            with chunking for memory efficiency.
+300|        entropy_checkpointing (bool): Whether to use gradient checkpointing for entropy computation.
+301|        pad_to_length (bool): Whether to pad every packed micro-batch to a static token count.
+302|            Forwarded to ``fsdp_config.pad_to_length``, which is what the engine reads.
+303|        fsdp_config (dict[str, Any]): Configuration for FSDP settings.
+304|        use_remove_padding (bool): Whether to remove padding tokens in inputs during training
+305|    """
+306|
+307|    strategy: str = "fsdp"
+308|    grad_clip: float = 1.0
+309|    ulysses_sequence_parallel_size: int = 1
+310|    entropy_from_logits_with_chunking: bool = False
+311|    entropy_from_logits_chunk_size: int = 2048
+312|    entropy_checkpointing: bool = False
+313|    pad_to_length: bool = False
+314|    fsdp_config: FSDPEngineConfig = field(default_factory=FSDPEngineConfig)
+315|    use_remove_padding: bool = False
+316|    use_rollout_log_probs: bool = False
+317|
+318|    def __post_init__(self):
+319|        """Validate FSDP actor configuration parameters."""
+320|        super().__post_init__()
+321|        self.engine = self.fsdp_config
+322|        # Sync strategy to engine config so engine_workers can pick the right FSDP version.
+323|        # EngineConfig.strategy defaults to None, so without this, engine_workers.py always
+324|        # falls back to FSDP1 even when actor.strategy="fsdp2".
+325|        object.__setattr__(self.engine, "strategy", self.strategy)
+326|
+327|        # backward compatibility
+328|        if self.ulysses_sequence_parallel_size > 1:
+329|            self.fsdp_config.ulysses_sequence_parallel_size = self.ulysses_sequence_parallel_size
+330|
+331|    def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
+332|        """Validate FSDP actor configuration with runtime parameters."""
+333|        super().validate(n_gpus, train_batch_size, model_config)
+334|        if (
+335|            self.ulysses_sequence_parallel_size > 1
+336|            and model_config
+337|            and not model_config.get("use_remove_padding", False)
+338|        ):
+339|            raise ValueError(
+340|                "When using sequence parallelism for actor/ref policy, you must enable `use_remove_padding`."
+341|            )
+342|
+343|
+344|@dataclass
+345|class VeOmniActorConfig(ActorConfig):
+346|    """Configuration for VeOmni actor models.
+347|
+348|    The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
+349|
+350|    Args:
+351|        strategy (str): Training strategy set to 'veomni' for VeOmni parallelism.
+352|        veomni (dict[str, Any]): Configuration for VeOmni settings.
+353|        pad_to_length (bool): Whether to pad every packed micro-batch to a static token count.
+354|            Forwarded to ``veomni.pad_to_length``, which is what the engine reads.
+355|        use_remove_padding (bool): Whether to remove padding tokens in inputs during training
+356|    """
+357|
+358|    strategy: str = "veomni"
+359|    veomni: VeOmniEngineConfig = field(default_factory=VeOmniEngineConfig)
+360|    pad_to_length: bool = False
+361|    use_remove_padding: bool = False
+362|    use_rollout_log_probs: bool = False
+363|
+364|    def __post_init__(self):
+365|        """Validate VeOmni actor configuration parameters."""
+366|        super().__post_init__()
+367|        self.engine = self.veomni
+368|        if self.veomni.router_replay.mode != "disabled" and not self.use_remove_padding:
+369|            raise RuntimeError(
+370|                "router_replay requires use_remove_padding=True. In VeOmni engine, "
+371|                "the non-remove-padding path also disables Ulysses SP slicing and "
+372|                "the fused-kernel log_probs path, and is not a tested production "
+373|                "configuration for MoE routing replay. Set "
+374|                "actor.use_remove_padding=True or router_replay.mode='disabled'."
+375|            )
+376|
+377|
+378|@dataclass
+379|class TorchTitanActorConfig(ActorConfig):
+380|    """Configuration for TorchTitan actor models.
+381|
+382|    The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
+383|
+384|    Args:
+385|        strategy (str): Training strategy set to 'torchtitan' for TorchTitan parallelism.
+386|        torchtitan (TorchtitanEngineConfig): Configuration for TorchTitan engine settings.
+387|        use_remove_padding (bool): Whether to remove padding tokens in inputs during training
+388|        use_rollout_log_probs (bool): Whether to use log probabilities from rollout engine
+389|    """
+390|
+391|    strategy: str = "torchtitan"
+392|    torchtitan: TorchtitanEngineConfig = field(default_factory=TorchtitanEngineConfig)
+393|    use_remove_padding: bool = False
+394|    use_rollout_log_probs: bool = False
+395|
+396|    def __post_init__(self):
+397|        """Validate TorchTitan actor configuration parameters."""
+398|        super().__post_init__()
+399|        self.engine = self.torchtitan

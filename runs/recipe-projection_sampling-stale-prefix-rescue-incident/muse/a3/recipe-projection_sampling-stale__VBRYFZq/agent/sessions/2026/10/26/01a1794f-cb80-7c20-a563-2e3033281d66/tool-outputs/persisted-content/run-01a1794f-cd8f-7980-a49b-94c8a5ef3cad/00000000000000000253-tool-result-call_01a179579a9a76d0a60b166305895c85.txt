@@ -1,0 +1,141 @@
+Read text file `/root/miles/miles/rollout/generate_utils/generate_endpoint_utils.py`.
+1|"""
+2|Utils to integrate SGLang's `/generate` endpoint with RL things like Sample.
+3|"""
+4|
+5|from copy import deepcopy
+6|from typing import Any
+7|
+8|import numpy as np
+9|import pybase64
+10|
+11|from miles.utils.lora import LORA_ADAPTER_NAME, lora_rollout_enabled
+12|from miles.utils.processing_utils import encode_image_for_rollout_engine, extract_multimodal_train_inputs
+13|from miles.utils.types import Sample
+14|
+15|
+16|# Make this an isolated function because users may want to compute their own
+17|def compute_prompt_ids_from_sample(state, sample, tools=None):
+18|    prompt = sample.prompt
+19|
+20|    if state.processor and sample.multimodal_inputs and any(v is not None for v in sample.multimodal_inputs.values()):
+21|        processor_output = state.processor(text=prompt, **sample.multimodal_inputs)
+22|        prompt_ids = processor_output["input_ids"][0]
+23|
+24|        # TODO shall we move it to other places? then can make this function immutable
+25|        sample.multimodal_train_inputs = extract_multimodal_train_inputs(processor_output)
+26|
+27|        return prompt_ids
+28|    else:
+29|        if not isinstance(prompt, str):
+30|            prompt = state.tokenizer.apply_chat_template(
+31|                prompt, tokenize=False, add_generation_prompt=True, tools=tools
+32|            )
+33|
+34|        return state.tokenizer.encode(prompt, add_special_tokens=False)
+35|
+36|
+37|def policy_uses_routing_key(args) -> bool:
+38|    return args.sglang_router_policy in ("consistent_hashing", "manual")
+39|
+40|
+41|def compute_routing_headers(args, sample: Sample) -> dict[str, str] | None:
+42|    if policy_uses_routing_key(args) and not sample.routing_key:
+43|        raise ValueError(
+44|            f"router policy {args.sglang_router_policy} routes by X-SMG-Routing-Key, "
+45|            f"but sample (index={sample.index}) has no routing_key set"
+46|        )
+47|    if sample.routing_key:
+48|        return {"X-SMG-Routing-Key": sample.routing_key}
+49|    return None
+50|
+51|
+52|def compute_request_payload(
+53|    args,
+54|    input_ids: list[int],
+55|    sampling_params: dict,
+56|    multimodal_inputs: dict | None = None,
+57|) -> tuple[dict[str, Any] | None, Sample.Status | None]:
+58|    sampling_params = deepcopy(sampling_params)
+59|    max_new_tokens = sampling_params.pop("max_new_tokens", args.rollout_max_response_len)
+60|    if x := args.rollout_max_context_len:
+61|        max_new_tokens = min(max_new_tokens, x - len(input_ids))
+62|    if max_new_tokens <= 0:
+63|        return None, Sample.Status.TRUNCATED
+64|
+65|    payload = {
+66|        "input_ids": input_ids,
+67|        "sampling_params": {**sampling_params, "max_new_tokens": max_new_tokens},
+68|        "return_logprob": True,
+69|        "return_routed_experts": args.use_rollout_routing_replay,
+70|        "return_indexer_topk": args.use_rollout_indexer_replay,
+71|    }
+72|    if lora_rollout_enabled(args):
+73|        payload["lora_path"] = LORA_ADAPTER_NAME
+74|    if image_data := (multimodal_inputs or {}).get("images"):
+75|        payload["image_data"] = [encode_image_for_rollout_engine(image) for image in image_data]
+76|
+77|    return payload, None
+78|
+79|
+80|async def update_sample_from_response(
+81|    args, sample: Sample, payload: dict, output: dict, update_loss_mask: bool = False
+82|):
+83|    # Initialize sample.tokens for the first turn
+84|    if (len(sample.response) == 0) and not sample.tokens:
+85|        sample.tokens = payload["input_ids"]
+86|
+87|    if x := output["meta_info"].get("output_token_logprobs"):
+88|        new_response_tokens = [item[1] for item in x]
+89|        new_response_log_probs = [item[0] for item in x]
+90|    else:
+91|        new_response_tokens, new_response_log_probs = [], []
+92|
+93|    # Update sample with tokens directly - avoiding re-tokenization
+94|    sample.tokens = sample.tokens + new_response_tokens
+95|    sample.response_length += len(new_response_tokens)
+96|    sample.response += output["text"]
+97|
+98|    if sample.rollout_log_probs is None:
+99|        sample.rollout_log_probs = []
+100|    sample.rollout_log_probs += new_response_log_probs
+101|
+102|    if update_loss_mask:
+103|        if sample.loss_mask is None:
+104|            sample.loss_mask = []
+105|        sample.loss_mask += [1] * len(new_response_tokens)
+106|
+107|    # TODO handle multi-turn cases (may need concat instead of assignment)
+108|    sample.rollout_routed_experts = get_routed_experts_from_response(args, output, len(sample.tokens) - 1)
+109|    sample.rollout_indexer_topk = get_indexer_topk_from_response(args, output, sample)
+110|
+111|    # TODO may unify (currently there are both methods inside Sample and separate functions)
+112|    sample.update_from_meta_info(args, output["meta_info"])
+113|
+114|
+115|def _decode_topk_buffer(info: str, num_tokens: int, num_layers: int, topk: int) -> np.ndarray:
+116|    x = np.frombuffer(pybase64.b64decode(info.encode("ascii")), dtype=np.int32)
+117|    if num_tokens <= 0:
+118|        return np.empty((0, num_layers, max(0, topk)), dtype=np.int32)
+119|    if topk == -1:  # indexer: topk dim recovered from buffer length
+120|        topk = len(x) // (num_tokens * num_layers)
+121|    return x.reshape(num_tokens, num_layers, topk)
+122|
+123|
+124|def get_routed_experts_from_response(args, output, num_tokens: int):
+125|    info = output["meta_info"].get("routed_experts")
+126|    if info is None:
+127|        return None
+128|    return _decode_topk_buffer(info, num_tokens, args.num_layers, -1)
+129|
+130|
+131|def get_indexer_topk_from_response(args, output, sample):
+132|    info = output["meta_info"].get("indexer_topk")
+133|    if info is None:
+134|        return None
+135|    num_layers = output["meta_info"].get("indexer_topk_num_layers")
+136|    assert num_layers is not None, (
+137|        "Server returned indexer_topk without indexer_topk_num_layers; "
+138|        "sglang-miles must include the layer count in meta_info."
+139|    )
+140|    return _decode_topk_buffer(info, len(sample.tokens) - 1, num_layers, -1)

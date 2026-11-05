@@ -1,0 +1,71 @@
+diff --git a/test-data/unit/check-incremental.test b/test-data/unit/check-incremental.test
+--- a/test-data/unit/check-incremental.test
++++ b/test-data/unit/check-incremental.test
+@@ -5056,7 +5056,9 @@ from typing import NamedTuple
+ NT = NamedTuple('BadName', [('x', int)])
+ [builtins fixtures/tuple.pyi]
+ [out]
++tmp/b.py:2: error: First argument to namedtuple() should be 'NT', not 'BadName'
+ [out2]
++tmp/b.py:2: error: First argument to namedtuple() should be 'NT', not 'BadName'
+ tmp/a.py:3: note: Revealed type is 'Tuple[builtins.int, fallback=b.NT]'
+ 
+ [case testNewAnalyzerIncrementalBrokenNamedTupleNested]
+@@ -5076,7 +5078,9 @@ def test() -> None:
+     NT = namedtuple('BadName', ['x', 'y'])
+ [builtins fixtures/list.pyi]
+ [out]
++tmp/b.py:4: error: First argument to namedtuple() should be 'NT', not 'BadName'
+ [out2]
++tmp/b.py:4: error: First argument to namedtuple() should be 'NT', not 'BadName'
+ 
+ [case testNewAnalyzerIncrementalMethodNamedTuple]
+ 
+diff --git a/test-data/unit/check-namedtuple.test b/test-data/unit/check-namedtuple.test
+--- a/test-data/unit/check-namedtuple.test
++++ b/test-data/unit/check-namedtuple.test
+@@ -962,3 +962,14 @@ def foo():
+ Type1 = NamedTuple('Type1', [('foo', foo)])  # E: Function "b.foo" is not valid as a type  # N: Perhaps you need "Callable[...]" or a callback protocol?
+ 
+ [builtins fixtures/tuple.pyi]
++
++[case testNamedTupleTypeNameMatchesVariableName]
++from typing import NamedTuple
++from collections import namedtuple
++
++A = NamedTuple('X', [('a', int)])  # E: First argument to namedtuple() should be 'A', not 'X'
++B = namedtuple('X', ['a'])         # E: First argument to namedtuple() should be 'B', not 'X'
++
++C = NamedTuple('X', [('a', 'Y')])  # E: First argument to namedtuple() should be 'C', not 'X'
++class Y: ...
++[builtins fixtures/tuple.pyi]
+diff --git a/test-data/unit/fine-grained.test b/test-data/unit/fine-grained.test
+--- a/test-data/unit/fine-grained.test
++++ b/test-data/unit/fine-grained.test
+@@ -9622,26 +9622,3 @@ class C:
+ [out]
+ ==
+ main:5: error: Unsupported left operand type for + ("str")
+-
+-[case testReexportNamedTupleChange]
+-from m import M
+-
+-def f(x: M) -> None: ...
+-
+-f(M(0))
+-
+-[file m.py]
+-from n import M
+-
+-[file n.py]
+-from typing import NamedTuple
+-M = NamedTuple('_N', [('x', int)])
+-
+-[file n.py.2]
+-# change the line numbers
+-from typing import NamedTuple
+-M = NamedTuple('_N', [('x', int)])
+-
+-[builtins fixtures/tuple.pyi]
+-[out]
+-==

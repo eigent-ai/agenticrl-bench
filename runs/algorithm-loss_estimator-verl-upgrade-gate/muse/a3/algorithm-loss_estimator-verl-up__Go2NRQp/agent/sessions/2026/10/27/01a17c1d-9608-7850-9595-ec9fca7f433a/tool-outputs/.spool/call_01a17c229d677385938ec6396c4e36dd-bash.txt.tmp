@@ -1,0 +1,67 @@
+__init__.py
+agent_loop_tq.py
+replay_buffer.py
+trainer_base.py
+trainer_colocate_async.py
+trainer_separate_async.py
+trainer_sync.py
+utils.py
+42:from verl.experimental.teacher_loop import MultiTeacherModelManager
+64:from verl.trainer.ppo.padding_utils import upsample_batch_to_divisible_size
+66:from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+73:    need_teacher_policy,
+76:from verl.trainer.ppo.v1.utils import MetricsAggregator, compute_advantage_for_multi_trajectories
+139:        self.use_teacher_policy = need_teacher_policy(self.config)
+235:        5. [Optional] MultiTeacherModelManager: LLM teacher servers for on-policy distillation.
+367:        # 8. initialize teacher loop manager
+368:        if self.use_teacher_policy:
+369:            teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
+370:            self.teacher_model_manager = MultiTeacherModelManager(
+372:                resource_pool=teacher_resource_pool,
+376:            self.teacher_model_manager = None
+414:    def get_teacher_client(self) -> Optional[dict[str, LLMServerClient]]:
+415:        """Get the On-Policy Distillation teacher server clients.
+418:            dict[str, LLMServerClient]: The teacher server clients.
+420:        return self.teacher_model_manager.get_client() if self.use_teacher_policy else None
+567:            sample_count = sum(not tag.get("is_padding", False) for tag in batch.tags)
+614:            batch = self._compute_advantage(batch, metrics=metrics)
+858:            teacher_pool = [distillation_config.n_gpus_per_node] * distillation_config.nnodes
+859:            resource_pool_spec["teacher_pool"] = teacher_pool
+860:            self.mapping[Role.TeacherModel] = "teacher_pool"
+1610:            critic_global_mini_batch_size = self.config.critic.ppo_mini_batch_size
+1611:            critic_global_mini_batch_size *= self.config.actor_rollout_ref.rollout.n
+1612:            required_multiple = math.lcm(required_multiple, critic_global_mini_batch_size)
+1616:            actor_global_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+1617:            actor_global_mini_batch_size *= self.config.actor_rollout_ref.rollout.n
+1618:            required_multiple = math.lcm(required_multiple, actor_global_mini_batch_size)
+1636:        batch = upsample_batch_to_divisible_size(batch, batch_multiple, self.tokenizer.eos_token_id)
+1655:        rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+1656:        bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+1657:        if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
+1758:    def _compute_advantage(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
+1765:        data.batch["token_level_scores"] = data.batch["rm_scores"]
+1775:            data.batch["token_level_rewards"] = data.batch["token_level_scores"]
+1779:        # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
+1780:        rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+1781:        bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+1782:        rollout_correction = (
+1783:            rollout_corr_config is not None and "rollout_log_probs" in data.batch and not bypass_recomputing_logprobs
+1785:        if rollout_correction:
+1786:            data, is_metrics = compute_rollout_correction_and_add_to_batch(data, rollout_corr_config)
+1790:        data = compute_advantage_for_multi_trajectories(
+1804:            fields.append("token_level_rewards")
+1805:        if rollout_correction:
+1821:        ppo_mini_batch_size = self.config.critic.ppo_mini_batch_size
+1822:        ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+1824:            "global_batch_size": ppo_mini_batch_size,
+1825:            "mini_batch_size": ppo_mini_batch_size,
+1833:        output: DataProtoFuture = self.critic_wg.train_mini_batch(batch)
+1844:        ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+1845:        ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+1866:            "global_batch_size": ppo_mini_batch_size,
+1867:            "mini_batch_size": ppo_mini_batch_size,
+1885:        non_padding_mask = np.array([not tag.get("is_padding", False) for tag in batch.tags], dtype=bool)
+1894:            "token_level_rewards",
+1935:        data["token_level_scores"] = data["rm_scores"]
+1936:        if "token_level_rewards" not in data:
+1937:            data["token_level_rewards"] = data["rm_scores"]

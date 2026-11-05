@@ -1,0 +1,23 @@
+#!/bin/sh
+# Daily cleanup of stale screen sessions
+
+LOGFILE="/var/log/screen-cleanup.log"
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting screen session cleanup" >> "$LOGFILE"
+
+WIPE_OUTPUT=$(screen -wipe 2>&1)
+echo "$WIPE_OUTPUT" >> "$LOGFILE"
+
+DEAD_SESSIONS=$(echo "$WIPE_OUTPUT" | grep "Dead" | awk '{print $1}')
+for sess in $DEAD_SESSIONS; do
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Killing dead session: $sess" >> "$LOGFILE"
+    screen -X -S "$sess" kill
+done
+
+SESSION_COUNT=$(screen -ls 2>/dev/null | grep -c "\.")
+if [[ $SESSION_COUNT -gt 5 ]]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARNING: Too many sessions ($SESSION_COUNT), killing all" >> "$LOGFILE"
+    killall screen
+fi
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Cleanup complete" >> "$LOGFILE"

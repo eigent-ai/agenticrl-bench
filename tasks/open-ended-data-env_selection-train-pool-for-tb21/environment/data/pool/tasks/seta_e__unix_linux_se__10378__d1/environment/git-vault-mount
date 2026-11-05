@@ -1,0 +1,23 @@
+#!/bin/bash
+# Mount encrypted git storage
+ECRYPTFS_DIR="$HOME/.ecryptfs"
+MNT_POINT=$(cat "$ECRYPTFS_DIR/Private.mnt" 2>/dev/null)
+
+if [ -z "$MNT_POINT" ]; then
+    echo "Error: Cannot determine mount point" >&2
+    exit 1
+fi
+
+if [ -f "$MNT_POINT/.vault-active" ]; then
+    echo "Already mounted: $MNT_POINT"
+    exit 0
+fi
+
+if [ -f "$ECRYPTFS_DIR/auto-mount" ]; then
+    cp -a /srv/git-vault/* "$MNT_POINT/"
+    touch "$MNT_POINT/.vault-active"
+    echo "Mounted encrypted storage at $MNT_POINT"
+else
+    echo "Auto-mount disabled. Mount manually." >&2
+    exit 1
+fi

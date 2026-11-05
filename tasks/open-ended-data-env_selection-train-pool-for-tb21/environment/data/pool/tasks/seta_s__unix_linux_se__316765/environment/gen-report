@@ -1,0 +1,47 @@
+#!/bin/bash
+set -euo pipefail
+
+REPORTS_DIR="$HOME/reports"
+SERVICES_FILE="$HOME/app/services.txt"
+OUTPUT="$REPORTS_DIR/latest.json"
+
+mkdir -p "$REPORTS_DIR"
+
+if [ ! -f "$SERVICES_FILE" ]; then
+    echo "Error: services file not found: $SERVICES_FILE" >&2
+    exit 1
+fi
+
+export GR_SERVICES_FILE="$SERVICES_FILE"
+export GR_OUTPUT="$OUTPUT"
+
+python3 << 'PYEOF'
+import json, datetime, socket, os
+
+services_file = os.environ['GR_SERVICES_FILE']
+output_path = os.environ['GR_OUTPUT']
+
+with open('/etc/os-release') as f:
+    info = {}
+    for line in f:
+        line = line.strip()
+        if '=' in line:
+            k, v = line.split('=', 1)
+            info[k] = v.strip('"')
+
+with open(services_file) as f:
+    services = [s.strip() for s in f if s.strip()]
+
+report = {
+    'generated_at': datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+    'os_name': info.get('NAME', 'unknown'),
+    'os_version': info.get('VERSION_ID', 'unknown'),
+    'services': services,
+    'host': socket.gethostname()
+}
+
+with open(output_path, 'w') as f:
+    json.dump(report, f, indent=2)
+
+print(f"Report written to {output_path}")
+PYEOF

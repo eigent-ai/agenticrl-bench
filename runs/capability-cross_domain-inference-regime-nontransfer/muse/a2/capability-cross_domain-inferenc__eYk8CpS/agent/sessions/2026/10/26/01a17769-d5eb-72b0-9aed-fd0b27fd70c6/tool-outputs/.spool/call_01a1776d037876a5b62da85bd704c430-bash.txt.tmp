@@ -1,0 +1,93 @@
+/sgl-workspace/sglang/python/sglang/srt/disaggregation/decode.py:960:                max_new_tokens = min(
+/sgl-workspace/sglang/python/sglang/srt/disaggregation/prefill.py:308:        Set max_new_tokens = 1, so PrefillAdder memory estimation is accurate
+/sgl-workspace/sglang/python/sglang/srt/disaggregation/prefill.py:310:        req.sampling_params.max_new_tokens = 1
+/sgl-workspace/sglang/python/sglang/srt/entrypoints/http_server.py:2069:    max_new_tokens = 8 if model_info["is_generation"] else 1
+/sgl-workspace/sglang/python/sglang/srt/entrypoints/openai/serving_responses.py:2405:                    sampling_params.max_new_tokens = max(remaining_tokens, 1)
+/sgl-workspace/sglang/python/sglang/srt/managers/scheduler_components/new_token_ratio_tracker.py:43:        total_max_new_tokens = sum(r.sampling_params.max_new_tokens for r in reqs)
+/sgl-workspace/sglang/python/sglang/srt/managers/schedule_batch.py:1039:        return self.sampling_params.max_new_tokens == 0 and spec_alg is None
+/sgl-workspace/sglang/python/sglang/srt/managers/scheduler.py:1915:        req.sampling_params.max_new_tokens = max(
+/sgl-workspace/sglang/python/sglang/srt/managers/tokenizer_manager.py:990:        max_new_tokens = obj.sampling_params.get("max_new_tokens")
+/sgl-workspace/sglang/python/sglang/srt/managers/tokenizer_manager.py:1639:                tokenized_obj.sampling_params.max_new_tokens = 0
+/sgl-workspace/sglang/python/sglang/srt/managers/schedule_policy.py:777:        max_new_tokens = (
+    function: ToolChoiceFuncName
+    type: Literal["function"] = Field(default="function", examples=["function"])
+
+
+class ChatCompletionRequest(BaseModel):
+    # Ordered by official OpenAI API documentation
+    # https://platform.openai.com/docs/api-reference/chat/create
+    messages: List[ChatCompletionMessageParam]
+    model: str = Field(
+        default=DEFAULT_MODEL_NAME,
+        description="Model name. Supports LoRA adapters via 'base-model:adapter-name' syntax.",
+    )
+    frequency_penalty: float = 0.0
+    logit_bias: Optional[Dict[str, float]] = None
+    logprobs: bool = False
+    top_logprobs: Optional[int] = None
+    max_tokens: Optional[int] = Field(
+        default=None,
+        deprecated="max_tokens is deprecated in favor of the max_completion_tokens field",
+        description="The maximum number of tokens that can be generated in the chat completion. ",
+    )
+    max_completion_tokens: Optional[int] = Field(
+        default=None,
+        description="The maximum number of completion tokens for a chat completion request, "
+        "including visible output tokens and reasoning tokens. Input tokens are not included. ",
+    )
+    n: int = 1
+    presence_penalty: float = 0.0
+    response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
+    seed: Optional[int] = None
+    stop: Optional[Union[str, List[str]]] = None
+    stream: bool = False
+    stream_options: Optional[StreamOptions] = None
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    user: Optional[str] = None
+    tools: Optional[List[Tool]] = Field(default=None, examples=[None])
+    tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
+        default="auto", examples=["none"]
+    )  # noqa
+    parallel_tool_calls: bool = True
+    return_hidden_states: bool = False
+    return_routed_experts: bool = False
+    routed_experts_start_len: int = 0
+    return_cached_tokens_details: bool = False
+    return_prompt_token_ids: bool = False
+    return_meta_info: bool = False
+    reasoning_effort: Optional[Literal["none", "low", "medium", "high", "max"]] = Field(
+        default=None,
+        description="Constrains effort on reasoning for reasoning models. "
+        "'none' disables reasoning entirely, 'low' is the least effort, 'high' is the most effort. "
+    # For PD disagg — hint telling decode which prefill DP worker has the KV cache
+    disagg_prefill_dp_rank: Optional[int] = None
+    # Deprecated: use routed_dp_rank instead
+    data_parallel_rank: Optional[int] = None
+
+    # OpenAI/SGLang default sampling parameters
+    _DEFAULT_SAMPLING_PARAMS = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": -1,
+        "min_p": 0.0,
+        "repetition_penalty": 1.0,
+    }
+
+    @model_validator(mode="before")
+    @classmethod
+    def _handle_deprecated_dp_rank(cls, values):
+        return _migrate_deprecated_dp_rank(values)
+
+    @model_validator(mode="before")
+    @classmethod
+    def set_tool_choice_default(cls, values):
+        if values.get("tool_choice") is None:
+            if values.get("tools") is None:
+                values["tool_choice"] = "none"
+            else:
+                values["tool_choice"] = "auto"
+        return values
+
+    @model_validator(mode="before")
+    @classmethod

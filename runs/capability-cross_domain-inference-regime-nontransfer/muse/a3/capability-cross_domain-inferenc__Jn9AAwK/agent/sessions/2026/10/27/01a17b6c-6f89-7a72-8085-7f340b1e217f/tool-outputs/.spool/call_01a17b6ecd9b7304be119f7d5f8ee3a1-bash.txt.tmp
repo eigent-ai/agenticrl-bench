@@ -1,0 +1,72 @@
+
+    def _verify_dual_chunk_attention_config(self) -> None:
+        if hasattr(self.hf_config, "dual_chunk_attention_config"):
+            # Try loading the sparse attention config
+            sparse_attn_config = get_sparse_attention_config(self.model_path)
+            if not sparse_attn_config:
+                return
+            self.hf_config.dual_chunk_attention_config["sparse_attention_config"] = (
+                sparse_attn_config
+            )
+            if (
+                "sparse_attention_enabled"
+                not in self.hf_config.dual_chunk_attention_config
+            ):
+                self.hf_config.dual_chunk_attention_config[
+                    "sparse_attention_enabled"
+                ] = True
+
+    def _get_hf_eos_token_id(self) -> Optional[Set[int]]:
+        eos_ids = getattr(self.hf_config, "eos_token_id", None)
+        if eos_ids is not None:
+            # it can be either int or list of int
+            eos_ids = {eos_ids} if isinstance(eos_ids, int) else set(eos_ids)
+        if eos_ids is None:
+            eos_ids = set()
+        if self.hf_generation_config:
+            generation_eos_ids = getattr(
+                self.hf_generation_config, "eos_token_id", None
+            )
+            if generation_eos_ids:
+                generation_eos_ids = (
+                    {generation_eos_ids}
+                    if isinstance(generation_eos_ids, int)
+                    else set(generation_eos_ids)
+                )
+                eos_ids = eos_ids | generation_eos_ids
+        return eos_ids
+
+    def get_default_sampling_params(self) -> dict[str, Any]:
+        """
+        Get default sampling parameters from the model's generation config.
+
+        This method returns non-default sampling parameters from the model's
+        generation_config.json when sampling_defaults is set to "model".
+
+        Returns:
+            A dictionary containing the non-default sampling parameters.
+        """
+        if self.sampling_defaults != "model":
+            return {}
+
+        if self.hf_generation_config is None:
+            return {}
+
+        config = self.hf_generation_config.to_dict()
+
+        available_params = [
+            "repetition_penalty",
+            "temperature",
+            "top_k",
+            "top_p",
+34:    get_generation_config,
+240:        sampling_defaults: str = "openai",
+254:        self.sampling_defaults = sampling_defaults
+284:        self.hf_generation_config = get_generation_config(
+519:            sampling_defaults=server_args.sampling_defaults,
+1455:        if self.hf_generation_config:
+1457:                self.hf_generation_config, "eos_token_id", None
+1473:        generation_config.json when sampling_defaults is set to "model".
+1478:        if self.sampling_defaults != "model":
+1481:        if self.hf_generation_config is None:
+1484:        config = self.hf_generation_config.to_dict()

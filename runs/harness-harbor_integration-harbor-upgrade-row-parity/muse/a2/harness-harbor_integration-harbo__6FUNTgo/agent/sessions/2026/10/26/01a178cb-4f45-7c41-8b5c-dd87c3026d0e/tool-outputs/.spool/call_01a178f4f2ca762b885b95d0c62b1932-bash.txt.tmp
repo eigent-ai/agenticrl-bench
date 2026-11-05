@@ -1,0 +1,227 @@
+            result.stderr or ""
+        )
+
+    async def _paste_key(self, key: str, action: str) -> None:
+        """Deliver *key* to the pane via a tmux paste buffer.
+
+        ``tmux send-keys`` rejects commands above its internal message size
+        limit with "command too long", which previously lost long literal
+        payloads such as heredoc answer writes. Instead, the payload is
+        staged into a file inside the environment with base64 chunks
+        (``environment.exec`` does not go through tmux, so it is not subject
+        to that limit) and pasted with ``load-buffer``/``paste-buffer``,
+        which can handle arbitrarily large content. ``paste-buffer``'s
+        default newline-to-carriage-return conversion makes multi-line
+        payloads behave as if typed line by line.
+        """
+        if not key:
+            return
+
+        token = uuid.uuid4().hex
+        quoted_path = shlex.quote(f"/tmp/.harbor-tmux-paste-{token}")
+        buffer_name = f"harbor-paste-{token}"
+        payload = base64.b64encode(key.encode("utf-8")).decode("ascii")
+
+        async def _run(command: str) -> None:
+            result = await self.environment.exec(command=command, user=self._user)
+            if result.return_code != 0:
+                raise self._send_keys_error(action, command, result)
+
+        try:
+            for offset in range(0, len(payload), self._PASTE_BASE64_CHUNK_LEN):
+                chunk = payload[offset : offset + self._PASTE_BASE64_CHUNK_LEN]
+                redirect = ">>" if offset else ">"
+                await _run(f"printf %s {chunk} | base64 -d {redirect} {quoted_path}")
+
+            await _run(
+                f"tmux load-buffer -b {buffer_name} {quoted_path} && "
+                f"tmux paste-buffer -d -b {buffer_name} "
+                f"-t {shlex.quote(self._session_name)}"
+            )
+        finally:
+            await self.environment.exec(command=f"rm -f {quoted_path}", user=self._user)
+
+    async def _send_single_key(self, key: str, action: str) -> None:
+        command = self._send_keys_command([key])
+        result = await self.environment.exec(command=command, user=self._user)
+        if result.return_code == 0:
+            return
+        if self._is_command_too_long_error(result):
+            # A key too long for a send-keys command cannot be a special key
+            # name (those are all short), so pasting it literally is safe.
+            await self._paste_key(key, action)
+            return
+        raise self._send_keys_error(action, command, result)
+
+    async def _send_key_batches(self, keys: list[str], action: str) -> None:
+        for batch in self._batch_keys_for_send(keys):
+            command = self._send_keys_command(batch)
+            result = await self.environment.exec(command=command, user=self._user)
+            if result.return_code == 0:
+                continue
+            if self._is_command_too_long_error(result):
+                # This tmux build enforces a smaller command-size limit than
+                # the assumed ~16 KB; resend the keys one at a time, pasting
+                # any that this tmux still rejects.
+                self._logger.debug(
+                    "tmux rejected a send-keys command as too long; resending "
+                    "keys individually with a paste-buffer fallback"
+                )
+                for key in batch:
+                    await self._send_single_key(key, action)
+                continue
+            raise self._send_keys_error(action, command, result)
+
+    async def _send_keys_to_session(self, keys: list[str], action: str) -> None:
+        """Send *keys* in order, pasting oversized literal keys.
+
+        Keys that fit within the tmux command-length limit are sent with
+        ``send-keys`` (batched); keys that cannot fit in a single command
+        are delivered via ``_paste_key``.
+        """
+        batch: list[str] = []
+
+        async def _flush() -> None:
+            if batch:
+                await self._send_key_batches(batch, action)
+                batch.clear()
+
+        for key in keys:
+            if self._key_requires_paste(key):
+                await _flush()
+                await self._paste_key(key, action)
+            else:
+                batch.append(key)
+
+        await _flush()
+
+    async def _send_blocking_keys(
+        self,
+        keys: list[str],
+        max_timeout_sec: float,
+    ):
+        start_time_sec = time.time()
+
+        await self._send_keys_to_session(keys, action="blocking")
+
+        result = await self.environment.exec(
+            f"timeout {max_timeout_sec}s tmux wait done", user=self._user
+        )
+        if result.return_code != 0:
+            raise TimeoutError(f"Command timed out after {max_timeout_sec} seconds")
+
+        elapsed_time_sec = time.time() - start_time_sec
+        self._logger.debug(f"Blocking command completed in {elapsed_time_sec:.2f}s.")
+
+    async def _send_non_blocking_keys(
+        self,
+        keys: list[str],
+        min_timeout_sec: float,
+    ):
+        start_time_sec = time.time()
+
+        await self._send_keys_to_session(keys, action="non-blocking")
+
+        elapsed_time_sec = time.time() - start_time_sec
+
+        if elapsed_time_sec < min_timeout_sec:
+            await asyncio.sleep(min_timeout_sec - elapsed_time_sec)
+
+    async def send_keys(
+        self,
+        keys: str | list[str],
+        block: bool = False,
+        min_timeout_sec: float = 0.0,
+        max_timeout_sec: float = 180.0,
+    ):
+        """
+        Execute a command in the tmux session.
+
+        Args:
+            keys (str): The keys to send to the tmux session.
+            block (bool): Whether to wait for the command to complete.
+            min_timeout_sec (float): Minimum time in seconds to wait after executing.
+                Defaults to 0.
+            max_timeout_sec (float): Maximum time in seconds to wait for blocking
+                commands. Defaults to 3 minutes.
+        """
+        if block and min_timeout_sec > 0.0:
+            self._logger.debug("min_timeout_sec will be ignored because block is True.")
+
+        prepared_keys, is_blocking = self._prepare_keys(
+            keys=keys,
+            block=block,
+        )
+
+        self._logger.debug(
+            f"Sending keys: {prepared_keys}"
+            f" min_timeout_sec: {min_timeout_sec}"
+            f" max_timeout_sec: {max_timeout_sec}"
+        )
+
+        if is_blocking:
+            await self._send_blocking_keys(
+                keys=prepared_keys,
+                max_timeout_sec=max_timeout_sec,
+            )
+        else:
+            await self._send_non_blocking_keys(
+                keys=prepared_keys,
+                min_timeout_sec=min_timeout_sec,
+            )
+
+    async def capture_pane(self, capture_entire: bool = False) -> str:
+        result = await self.environment.exec(
+            self._tmux_capture_pane(capture_entire=capture_entire), user=self._user
+        )
+        return result.stdout or ""
+
+    async def _get_visible_screen(self) -> str:
+        return await self.capture_pane(capture_entire=False)
+
+    async def _find_new_content(self, current_buffer: str) -> str | None:
+        pb = "" if self._previous_buffer is None else self._previous_buffer.strip()
+        if pb in current_buffer:
+            idx = current_buffer.index(pb)
+            # Find the end of the previous buffer content
+            if "\n" in pb:
+                idx = pb.rfind("\n")
+            return current_buffer[idx:]
+        return None
+
+    async def get_incremental_output(self) -> str:
+        """
+        Get either new terminal output since last call, or current screen if
+        unable to determine.
+
+        This method tracks the previous buffer state and attempts to find new content
+        by comparing against the current full buffer. This provides better handling for
+        commands with large output that would overflow the visible screen.
+
+        Returns:
+            str: Formatted output with either "New Terminal Output:" or
+                 "Current Terminal Screen:"
+        """
+        current_buffer = await self.capture_pane(capture_entire=True)
+
+        # First capture - no previous state
+        if self._previous_buffer is None:
+            self._previous_buffer = current_buffer
+            visible_screen = await self._get_visible_screen()
+            return f"Current Terminal Screen:\n{visible_screen}"
+
+        # Try to find new content
+        new_content = await self._find_new_content(current_buffer)
+
+        # Update state
+        self._previous_buffer = current_buffer
+
+        if new_content is not None:
+            if new_content.strip():
+                return f"New Terminal Output:\n{new_content}"
+            else:
+                # No new content, show current screen
+                return f"Current Terminal Screen:\n{await self._get_visible_screen()}"
+        else:
+            # Couldn't reliably determine new content, fall back to current screen
+            return f"Current Terminal Screen:\n{await self._get_visible_screen()}"

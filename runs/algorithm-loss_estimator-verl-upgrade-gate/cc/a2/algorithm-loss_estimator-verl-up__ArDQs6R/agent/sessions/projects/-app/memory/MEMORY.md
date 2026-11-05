@@ -1,0 +1,1 @@
+- [verl upgrade gate](verl-upgrade-gate.md) — goal, constraints and incident history behind /app/upgrade_gate/check

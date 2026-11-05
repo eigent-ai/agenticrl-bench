@@ -1,0 +1,642 @@
+     1	import ast
+     2	import json
+     3	import logging
+     4	import re
+     5	from enum import Enum
+     6	from typing import Any, Dict, List, Optional, Tuple
+     7	
+     8	from sglang.srt.entrypoints.openai.protocol import Tool
+     9	from sglang.srt.function_call.base_format_detector import BaseFormatDetector
+    10	from sglang.srt.function_call.core_types import (
+    11	    StreamingParseResult,
+    12	    ToolCallItem,
+    13	    _GetInfoFunc,
+    14	)
+    15	from sglang.srt.function_call.utils import infer_type_from_json_schema
+    16	
+    17	logger = logging.getLogger(__name__)
+    18	
+    19	
+    20	class StreamState(str, Enum):
+    21	    """State machine states for XML to JSON streaming conversion."""
+    22	
+    23	    INIT = "INIT"
+    24	    BETWEEN = "BETWEEN"
+    25	    IN_KEY = "IN_KEY"
+    26	    WAITING_VALUE = "WAITING_VALUE"
+    27	    IN_VALUE = "IN_VALUE"
+    28	
+    29	
+    30	def get_argument_type(
+    31	    func_name: str, arg_key: str, defined_tools: List[Tool]
+    32	) -> Optional[str]:
+    33	    """Get the expected type of a function argument from tool definitions.
+    34	
+    35	    Supports complex JSON Schema definitions including:
+    36	    - Direct type field (including type arrays)
+    37	    - anyOf/oneOf: parameter can be any of multiple types
+    38	    - enum: parameter must be one of enum values
+    39	    - allOf: parameter must satisfy all type definitions
+    40	    - properties: inferred as object type
+    41	    - items: inferred as array type
+    42	
+    43	    Args:
+    44	        func_name: Name of the function/tool
+    45	        arg_key: Name of the argument
+    46	        defined_tools: List of available tools
+    47	
+    48	    Returns:
+    49	        The type string (e.g., 'string', 'number', 'object') or None if not found
+    50	    """
+    51	    name2tool = {tool.function.name: tool for tool in defined_tools}
+    52	    if func_name not in name2tool:
+    53	        return None
+    54	    tool = name2tool[func_name]
+    55	    properties = (tool.function.parameters or {}).get("properties", {})
+    56	    if not isinstance(properties, dict):
+    57	        properties = {}
+    58	    if arg_key not in properties:
+    59	        return None
+    60	
+    61	    # Use new type inference function for complex JSON Schema support
+    62	    return infer_type_from_json_schema(properties[arg_key])
+    63	
+    64	
+    65	def _convert_to_number(value: str) -> Any:
+    66	    """Convert string to appropriate number type (int or float).
+    67	
+    68	    Args:
+    69	        value: String value to convert
+    70	
+    71	    Returns:
+    72	        Converted number or original string if conversion fails
+    73	    """
+    74	    try:
+    75	        if "." in value or "e" in value.lower():
+    76	            return float(value)
+    77	        else:
+    78	            return int(value)
+    79	    except (ValueError, AttributeError):
+    80	        return value
+    81	
+    82	
+    83	def parse_arguments(
+    84	    json_value: str, arg_type: Optional[str] = None
+    85	) -> Tuple[Any, bool]:
+    86	    """Parse argument value with multiple fallback strategies.
+    87	
+    88	    Args:
+    89	        json_value: Raw string value to parse
+    90	        arg_type: Expected type hint ('string', 'number', 'object', etc.)
+    91	
+    92	    Returns:
+    93	        Tuple of (parsed_value, is_valid_json)
+    94	    """
+    95	    # Strategy 1: Direct JSON parsing
+    96	    try:
+    97	        parsed_value = json.loads(json_value)
+    98	
+    99	        # Type coercion for number type
+   100	        if arg_type == "number" and isinstance(parsed_value, str):
+   101	            parsed_value = _convert_to_number(parsed_value)
+   102	
+   103	        return parsed_value, True
+   104	    except (json.JSONDecodeError, ValueError):
+   105	        pass
+   106	
+   107	    # Strategy 2: Unescape and parse
+   108	    try:
+   109	        wrapped = json.loads('{"tmp": "' + json_value + '"}')
+   110	        parsed_value = json.loads(wrapped["tmp"])
+   111	
+   112	        if arg_type == "number" and isinstance(parsed_value, str):
+   113	            parsed_value = _convert_to_number(parsed_value)
+   114	
+   115	        return parsed_value, True
+   116	    except (json.JSONDecodeError, ValueError, KeyError):
+   117	        pass
+   118	
+   119	    # Strategy 3: ast.literal_eval
+   120	    try:
+   121	        parsed_value = ast.literal_eval(json_value)
+   122	        return parsed_value, True
+   123	    except (ValueError, SyntaxError):
+   124	        pass
+   125	
+   126	    # Strategy 4: Treat as string
+   127	    try:
+   128	        quoted_value = json.dumps(str(json_value))
+   129	        return json.loads(quoted_value), True
+   130	    except (json.JSONDecodeError, ValueError):
+   131	        return json_value, False
+   132	
+   133	
+   134	class Glm4MoeDetector(BaseFormatDetector):
+   135	    """
+   136	    Detector for GLM-4.5 and GLM-4.6 models.
+   137	    Assumes function call format (with actual newlines):
+   138	      <tool_call>get_weather
+   139	      <arg_key>city</arg_key>
+   140	      <arg_value>北京</arg_value>
+   141	      <arg_key>date</arg_key>
+   142	      <arg_value>2024-06-27</arg_value>
+   143	      </tool_call>
+   144	
+   145	    Or with literal \n characters (escaped as \\n in the output):
+   146	      <tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>北京</arg_value>\n</tool_call>
+   147	
+   148	    Uses a streaming state machine to convert XML to JSON incrementally for maximum speed.
+   149	    """
+   150	
+   151	    def __init__(self):
+   152	        super().__init__()
+   153	        self.bot_token = "<tool_call>"
+   154	        self.eot_token = "</tool_call>"
+   155	        self.func_call_regex = r"<tool_call>.*?</tool_call>"
+   156	        self.func_detail_regex = re.compile(
+   157	            r"<tool_call>(.*?)(?:\\n|\n)(.*)</tool_call>", re.DOTALL
+   158	        )
+   159	        self.func_arg_regex = re.compile(
+   160	            r"<arg_key>(.*?)</arg_key>(?:\\n|\s)*<arg_value>(.*?)</arg_value>",
+   161	            re.DOTALL,
+   162	        )
+   163	        self._last_arguments = ""
+   164	        self.current_tool_id = -1
+   165	        self.current_tool_name_sent = False
+   166	        self._streamed_raw_length = 0
+   167	        self._reset_streaming_state()
+   168	
+   169	    def _reset_streaming_state(self) -> None:
+   170	        """Reset the streaming state machine for a new tool call."""
+   171	        self._stream_state = StreamState.INIT
+   172	        self._current_key = ""
+   173	        self._current_value = ""
+   174	        self._xml_tag_buffer = ""
+   175	        self._is_first_param = True
+   176	        self._value_started = False
+   177	        self._cached_value_type: Optional[str] = (
+   178	            None  # Cache the value type for consistency
+   179	        )
+   180	
+   181	    def has_tool_call(self, text: str) -> bool:
+   182	        """Check if the text contains a glm-4.5 / glm-4.6 format tool call."""
+   183	        return self.bot_token in text
+   184	
+   185	    def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
+   186	        """
+   187	        One-time parsing: Detects and parses tool calls in the provided text.
+   188	
+   189	        :param text: The complete text to parse.
+   190	        :param tools: List of available tools.
+   191	        :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
+   192	        """
+   193	        idx = text.find(self.bot_token)
+   194	        normal_text = text[:idx].strip() if idx != -1 else text
+   195	        if self.bot_token not in text:
+   196	            return StreamingParseResult(normal_text=normal_text, calls=[])
+   197	        match_result_list = re.findall(self.func_call_regex, text, re.DOTALL)
+   198	        calls = []
+   199	        try:
+   200	            for match_result in match_result_list:
+   201	                # Get function name
+   202	                func_detail = self.func_detail_regex.search(match_result)
+   203	                if func_detail is None:
+   204	                    continue
+   205	                func_name = func_detail.group(1) if func_detail.group(1) else ""
+   206	                func_args = func_detail.group(2) if func_detail.group(2) else ""
+   207	                pairs = self.func_arg_regex.findall(func_args)
+   208	
+   209	                # Parse arguments using shared method
+   210	                arguments = self._parse_argument_pairs(pairs, func_name, tools)
+   211	
+   212	                # construct match_result for parse_base_json
+   213	                match_result = {"name": func_name, "parameters": arguments}
+   214	                calls.extend(self.parse_base_json(match_result, tools))
+   215	            return StreamingParseResult(normal_text=normal_text, calls=calls)
+   216	        except Exception as e:
+   217	            logger.error(f"Error in detect_and_parse: {e}", exc_info=True)
+   218	            # return the normal text if parsing fails
+   219	            return StreamingParseResult(normal_text=text)
+   220	
+   221	    def _get_value_type(self, func_name: str, key: str, tools: List[Tool]) -> str:
+   222	        """Get parameter type from tool definition, with fallback to auto-detection.
+   223	
+   224	        Args:
+   225	            func_name: Name of the function
+   226	            key: Parameter name
+   227	            tools: List of available tools
+   228	
+   229	        Returns:
+   230	            Type string: 'string', 'number', 'object', 'array', or 'boolean'
+   231	        """
+   232	        arg_type = get_argument_type(func_name, key, tools)
+   233	        if arg_type:
+   234	            return arg_type
+   235	
+   236	        # Improved auto-detection type from value (best effort)
+   237	        value_content = self._current_value.strip() if self._current_value else ""
+   238	
+   239	        if not value_content:
+   240	            return "string"
+   241	
+   242	        # Try to parse as valid JSON first
+   243	        try:
+   244	            parsed = json.loads(value_content)
+   245	            if isinstance(parsed, dict):
+   246	                return "object"
+   247	            elif isinstance(parsed, list):
+   248	                return "array"
+   249	            elif isinstance(parsed, bool):
+   250	                return "boolean"
+   251	            elif isinstance(parsed, (int, float)):
+   252	                return "number"
+   253	            # For string values, check if they look like numbers
+   254	            elif isinstance(parsed, str):
+   255	                if parsed.isdigit() or (
+   256	                    parsed.startswith("-") and parsed[1:].isdigit()
+   257	                ):
+   258	                    return "number"
+   259	                return "string"
+   260	        except json.JSONDecodeError:
+   261	            # Not valid JSON, try heuristic detection
+   262	            first_char = value_content[0] if value_content else ""
+   263	
+   264	            if first_char.isdigit() or first_char in ["-", "."]:
+   265	                return "number"
+   266	            elif first_char in ["{", "["]:
+   267	                return "object"
+   268	            elif first_char in ['"', "'"]:
+   269	                return "string"
+   270	
+   271	        # Default to string (safest fallback)
+   272	        return "string"
+   273	
+   274	    def _format_value_complete(self, value: str, value_type: str) -> str:
+   275	        """Format complete value based on type.
+   276	
+   277	        Args:
+   278	            value: Raw value string
+   279	            value_type: Expected type ('string', 'number', 'object')
+   280	
+   281	        Returns:
+   282	            Properly formatted JSON value string
+   283	        """
+   284	        if value_type == "string":
+   285	            # Ensure proper JSON string formatting with quotes
+   286	            return json.dumps(value, ensure_ascii=False)
+   287	        elif value_type == "number":
+   288	            try:
+   289	                num = _convert_to_number(value.strip())
+   290	                return str(num)
+   291	            except (ValueError, AttributeError):
+   292	                # Fallback to string if not a valid number
+   293	                logger.warning(
+   294	                    f"Failed to parse '{value}' as number, treating as string"
+   295	                )
+   296	                return json.dumps(str(value), ensure_ascii=False)
+   297	        else:
+   298	            # For object/array types, return as-is (should already be valid JSON)
+   299	            return value
+   300	
+   301	    def _process_xml_to_json_streaming(
+   302	        self, raw_increment: str, func_name: str, tools: List[Tool]
+   303	    ) -> str:
+   304	        """Convert XML increment to JSON streaming output using state machine.
+   305	
+   306	        This method processes XML fragments character by character and converts them
+   307	        to JSON format incrementally. It maintains state across calls to handle
+   308	        partial XML tags and values.
+   309	
+   310	        Args:
+   311	            raw_increment: New XML content to process
+   312	            func_name: Name of the function being called
+   313	            tools: List of available tools for type inference
+   314	
+   315	        Returns:
+   316	            JSON string increment to append to the output
+   317	        """
+   318	        json_output = ""
+   319	
+   320	        for char in raw_increment:
+   321	            self._xml_tag_buffer += char
+   322	
+   323	            if self._stream_state in [StreamState.INIT, StreamState.BETWEEN]:
+   324	                if self._xml_tag_buffer.endswith("<arg_key>"):
+   325	                    self._stream_state = StreamState.IN_KEY
+   326	                    self._current_key = ""
+   327	                    self._xml_tag_buffer = ""
+   328	                    json_output += "{" if self._is_first_param else ", "
+   329	                    self._is_first_param = False
+   330	
+   331	            elif self._stream_state == StreamState.IN_KEY:
+   332	                if self._xml_tag_buffer.endswith("</arg_key>"):
+   333	                    self._current_key = self._xml_tag_buffer[:-10].strip()
+   334	                    self._xml_tag_buffer = ""
+   335	                    self._stream_state = StreamState.WAITING_VALUE
+   336	                    json_output += (
+   337	                        json.dumps(self._current_key, ensure_ascii=False) + ": "
+   338	                    )
+   339	
+   340	            elif self._stream_state == StreamState.WAITING_VALUE:
+   341	                if self._xml_tag_buffer.endswith("<arg_value>"):
+   342	                    self._stream_state = StreamState.IN_VALUE
+   343	                    self._current_value = ""
+   344	                    self._xml_tag_buffer = ""
+   345	                    self._value_started = False
+   346	                    # Determine and cache the value type at the start
+   347	                    self._cached_value_type = self._get_value_type(
+   348	                        func_name, self._current_key, tools
+   349	                    )
+   350	
+   351	            elif self._stream_state == StreamState.IN_VALUE:
+   352	                if self._xml_tag_buffer.endswith("</arg_value>"):
+   353	                    final_value = self._xml_tag_buffer[:-12]
+   354	                    self._current_value += final_value
+   355	
+   356	                    # Use cached value type for consistency
+   357	                    value_type = self._cached_value_type or "string"
+   358	
+   359	                    if self._value_started:
+   360	                        # Output any remaining content
+   361	                        if final_value:
+   362	                            if value_type == "string":
+   363	                                json_output += json.dumps(
+   364	                                    final_value, ensure_ascii=False
+   365	                                )[1:-1]
+   366	                            else:
+   367	                                json_output += final_value
+   368	                        # Always output closing quote for string type when value was started
+   369	                        if value_type == "string":
+   370	                            json_output += '"'
+   371	                    else:
+   372	                        # Value was never started (empty or complete in one chunk)
+   373	                        json_output += self._format_value_complete(
+   374	                            self._current_value, value_type
+   375	                        )
+   376	
+   377	                    self._xml_tag_buffer = ""
+   378	                    self._stream_state = StreamState.BETWEEN
+   379	                    self._current_value = ""
+   380	                    self._value_started = False
+   381	                    self._cached_value_type = None  # Reset cached type
+   382	                else:
+   383	                    closing_tag = "</arg_value>"
+   384	                    is_potential_closing = len(self._xml_tag_buffer) <= len(
+   385	                        closing_tag
+   386	                    ) and closing_tag.startswith(self._xml_tag_buffer)
+   387	
+   388	                    if not is_potential_closing:
+   389	                        content = self._xml_tag_buffer
+   390	                        # Use cached value type for consistency
+   391	                        value_type = self._cached_value_type or "string"
+   392	
+   393	                        if value_type == "string":
+   394	                            if not self._value_started:
+   395	                                json_output += '"'
+   396	                                self._value_started = True
+   397	                            if content:
+   398	                                json_output += json.dumps(content, ensure_ascii=False)[
+   399	                                    1:-1
+   400	                                ]
+   401	                                self._current_value += content
+   402	                                self._xml_tag_buffer = ""
+   403	                        elif value_type == "number":
+   404	                            if content:
+   405	                                if not self._value_started:
+   406	                                    self._value_started = True
+   407	                                json_output += content
+   408	                                self._current_value += content
+   409	                                self._xml_tag_buffer = ""
+   410	                        else:
+   411	                            # For object/array types, output as-is
+   412	                            if content:
+   413	                                if not self._value_started:
+   414	                                    self._value_started = True
+   415	                                json_output += content
+   416	                                self._current_value += content
+   417	                                self._xml_tag_buffer = ""
+   418	
+   419	        return json_output
+   420	
+   421	    def parse_streaming_increment(
+   422	        self, new_text: str, tools: List[Tool]
+   423	    ) -> StreamingParseResult:
+   424	        """
+   425	        Streaming incremental parsing tool calls for GLM-4.5 and GLM-4.6 format.
+   426	        Uses a state machine to convert XML to JSON incrementally for true character-by-character streaming.
+   427	        Outputs JSON increments immediately as XML data arrives.
+   428	        """
+   429	        self._buffer += new_text
+   430	        current_text = self._buffer
+   431	
+   432	        # Check if we have a tool call
+   433	        has_tool_call = self.bot_token in current_text
+   434	
+   435	        if not has_tool_call:
+   436	            # Check if buffer could be the start of a tool call
+   437	            # Keep buffer if it could be a partial match of bot_token
+   438	            is_potential_start = any(
+   439	                self.bot_token.startswith(current_text[-i:])
+   440	                for i in range(1, min(len(current_text), len(self.bot_token)) + 1)
+   441	            )
+   442	
+   443	            if not is_potential_start:
+   444	                # Not a potential tool call, return as normal text
+   445	                # Must return the entire buffer (current_text), not just new_text,
+   446	                # because buffer may contain previously accumulated characters like '<'
+   447	                # that turned out not to be part of a tool call
+   448	                output_text = current_text
+   449	                self._buffer = ""
+   450	                if self.eot_token in output_text:
+   451	                    output_text = output_text.replace(self.eot_token, "")
+   452	                return StreamingParseResult(normal_text=output_text)
+   453	            else:
+   454	                # Could be start of tool call, keep buffering
+   455	                return StreamingParseResult(normal_text="", calls=[])
+   456	
+   457	        if not hasattr(self, "_tool_indices"):
+   458	            self._tool_indices = self._get_tool_indices(tools)
+   459	
+   460	        calls: list[ToolCallItem] = []
+   461	        try:
+   462	            # Try to match a partial or complete tool call
+   463	            partial_match = re.search(
+   464	                pattern=r"<tool_call>(.*?)(?:\\n|\n)(.*?)(</tool_call>|$)",
+   465	                string=current_text,
+   466	                flags=re.DOTALL,
+   467	            )
+   468	            if partial_match:
+   469	                func_name_raw = partial_match.group(1)
+   470	                func_args_raw = partial_match.group(2)
+   471	                is_tool_end = partial_match.group(3)
+   472	
+   473	                # Only proceed if we have a non-empty function name
+   474	                if func_name_raw is None or not func_name_raw.strip():
+   475	                    # If we only have the start token without a function name,
+   476	                    # continue buffering until we get more content
+   477	                    return StreamingParseResult(normal_text="", calls=[])
+   478	
+   479	                func_name = func_name_raw.strip()
+   480	                func_args_raw = func_args_raw.strip() if func_args_raw else ""
+   481	
+   482	                # Initialize state if this is the first tool call
+   483	                if self.current_tool_id == -1:
+   484	                    self.current_tool_id = 0
+   485	                    self.prev_tool_call_arr = []
+   486	                    self.streamed_args_for_tool = [""]
+   487	                    self._streamed_raw_length = 0
+   488	                    self.current_tool_name_sent = False
+   489	                    self._reset_streaming_state()
+   490	
+   491	                # Ensure we have enough entries in our tracking arrays
+   492	                while len(self.prev_tool_call_arr) <= self.current_tool_id:
+   493	                    self.prev_tool_call_arr.append({})
+   494	                while len(self.streamed_args_for_tool) <= self.current_tool_id:
+   495	                    self.streamed_args_for_tool.append("")
+   496	
+   497	                # Send tool name first if not sent yet
+   498	                if not self.current_tool_name_sent:
+   499	                    calls.append(
+   500	                        ToolCallItem(
+   501	                            tool_index=self.current_tool_id,
+   502	                            name=func_name,
+   503	                            parameters="",
+   504	                        )
+   505	                    )
+   506	                    self.current_tool_name_sent = True
+   507	                    self._streamed_raw_length = 0
+   508	                    self._reset_streaming_state()
+   509	                    # Store the tool call info
+   510	                    self.prev_tool_call_arr[self.current_tool_id] = {
+   511	                        "name": func_name,
+   512	                        "arguments": {},
+   513	                    }
+   514	                else:
+   515	                    # Process XML to JSON streaming
+   516	                    current_raw_length = len(func_args_raw)
+   517	
+   518	                    if current_raw_length > self._streamed_raw_length:
+   519	                        # Get the new raw XML content
+   520	                        raw_increment = func_args_raw[self._streamed_raw_length :]
+   521	
+   522	                        # Convert XML increment to JSON increment using state machine
+   523	                        json_increment = self._process_xml_to_json_streaming(
+   524	                            raw_increment, func_name, tools
+   525	                        )
+   526	
+   527	                        # CRITICAL: Update streamed length BEFORE checking json_increment
+   528	                        # Even if json_increment is empty, the input has been consumed by the state machine
+   529	                        self._streamed_raw_length = current_raw_length
+   530	
+   531	                        if json_increment:
+   532	                            calls.append(
+   533	                                ToolCallItem(
+   534	                                    tool_index=self.current_tool_id,
+   535	                                    name=None,
+   536	                                    parameters=json_increment,
+   537	                                )
+   538	                            )
+   539	                            self._last_arguments += json_increment
+   540	                            self.streamed_args_for_tool[
+   541	                                self.current_tool_id
+   542	                            ] += json_increment
+   543	
+   544	                    if is_tool_end == self.eot_token:
+   545	                        if self._is_first_param:
+   546	                            empty_object = "{}"
+   547	                            calls.append(
+   548	                                ToolCallItem(
+   549	                                    tool_index=self.current_tool_id,
+   550	                                    name=None,
+   551	                                    parameters=empty_object,
+   552	                                )
+   553	                            )
+   554	                            self._last_arguments += empty_object
+   555	                        elif not self._last_arguments.endswith("}"):
+   556	                            closing_brace = "}"
+   557	                            calls.append(
+   558	                                ToolCallItem(
+   559	                                    tool_index=self.current_tool_id,
+   560	                                    name=None,
+   561	                                    parameters=closing_brace,
+   562	                                )
+   563	                            )
+   564	                            self._last_arguments += closing_brace
+   565	                            self.streamed_args_for_tool[
+   566	                                self.current_tool_id
+   567	                            ] += closing_brace
+   568	
+   569	                        try:
+   570	                            pairs = self.func_arg_regex.findall(func_args_raw)
+   571	                            if pairs:
+   572	                                arguments = self._parse_argument_pairs(
+   573	                                    pairs, func_name, tools
+   574	                                )
+   575	                                self.prev_tool_call_arr[self.current_tool_id][
+   576	                                    "arguments"
+   577	                                ] = arguments
+   578	                        except Exception as e:
+   579	                            logger.debug(
+   580	                                f"Failed to parse arguments: {e}", exc_info=True
+   581	                            )
+   582	
+   583	                        # Remove the completed tool call from buffer
+   584	                        self._buffer = current_text[partial_match.end(3) :]
+   585	
+   586	                        result = StreamingParseResult(normal_text="", calls=calls)
+   587	                        self.current_tool_id += 1
+   588	                        self._last_arguments = ""
+   589	                        self.current_tool_name_sent = False
+   590	                        self._streamed_raw_length = 0
+   591	                        self._reset_streaming_state()
+   592	                        return result
+   593	
+   594	            return StreamingParseResult(normal_text="", calls=calls)
+   595	
+   596	        except Exception as e:
+   597	            logger.error(f"Error in parse_streaming_increment: {e}", exc_info=True)
+   598	            return StreamingParseResult(normal_text=current_text)
+   599	
+   600	    def _parse_argument_pairs(
+   601	        self, pairs: List[Tuple[str, str]], func_name: str, tools: List[Tool]
+   602	    ) -> Dict[str, Any]:
+   603	        """Parse argument key-value pairs with type coercion.
+   604	
+   605	        Args:
+   606	            pairs: List of (key, value) tuples from regex matching
+   607	            func_name: Name of the function
+   608	            tools: List of available tools
+   609	
+   610	        Returns:
+   611	            Dictionary of parsed arguments
+   612	        """
+   613	        arguments = {}
+   614	        for arg_key, arg_value in pairs:
+   615	            arg_key = arg_key.strip()
+   616	            arg_value = arg_value.strip()
+   617	            arg_type = get_argument_type(func_name, arg_key, tools)
+   618	            parsed_value, is_good_json = parse_arguments(arg_value, arg_type)
+   619	
+   620	            if arg_type == "string":
+   621	                # Only convert to string if explicitly defined as string type
+   622	                if isinstance(parsed_value, str):
+   623	                    arguments[arg_key] = parsed_value
+   624	                elif isinstance(parsed_value, (dict, list)):
+   625	                    # If parsed as dict/list but schema says string, convert to JSON string
+   626	                    arguments[arg_key] = json.dumps(parsed_value, ensure_ascii=False)
+   627	                else:
+   628	                    arguments[arg_key] = str(parsed_value)
+   629	            elif arg_type is None:
+   630	                # If type is not defined, keep the parsed value as-is
+   631	                arguments[arg_key] = parsed_value if is_good_json else arg_value
+   632	            else:
+   633	                # For other types (number, object, array, etc.), use parsed value
+   634	                arguments[arg_key] = parsed_value if is_good_json else arg_value
+   635	
+   636	        return arguments
+   637	
+   638	    def supports_structural_tag(self) -> bool:
+   639	        return False
+   640	
+   641	    def structure_info(self) -> _GetInfoFunc:
+   642	        raise NotImplementedError()

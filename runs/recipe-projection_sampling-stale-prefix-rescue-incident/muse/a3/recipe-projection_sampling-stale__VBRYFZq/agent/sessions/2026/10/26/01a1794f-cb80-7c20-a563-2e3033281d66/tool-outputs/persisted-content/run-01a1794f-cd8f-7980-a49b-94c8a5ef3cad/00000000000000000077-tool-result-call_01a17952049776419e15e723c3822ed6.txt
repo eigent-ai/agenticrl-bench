@@ -1,0 +1,123 @@
+Read text file `/root/miles/examples/sql_agent/rescue/episode.py`.
+1|"""Token-level SQL-agent episodes for the rescue sampler.
+2|
+3|An episode is the response part of a trajectory: the policy's turns and the tool responses appended between them, kept
+4|as token ids so that the same response can be placed after a different prompt (the hinted prompt while sampling, the
+5|plain prompt for scoring). Generation and tool handling follow `miles.rollout.generate_hub.multi_turn`.
+6|"""
+7|
+8|from __future__ import annotations
+9|
+10|from dataclasses import dataclass, field
+11|
+12|from miles.rollout.generate_utils.generate_endpoint_utils import compute_request_payload
+13|from miles.rollout.generate_utils.tool_call_utils import (
+14|    create_tool_call_parser,
+15|    execute_tool_calls,
+16|    tokenize_tool_responses,
+17|)
+18|from miles.utils.http_utils import post
+19|from miles.utils.misc import load_function
+20|
+21|
+22|@dataclass
+23|class Episode:
+24|    ids: list[int] = field(default_factory=list)  # response tokens (policy turns + tool responses)
+25|    logprobs: list[float] = field(default_factory=list)  # log-probs returned while generating (hinted prompt)
+26|    student: list[float] | None = None  # log-probs under the student's own (plain) prompt, filled by the sampler
+27|    turns: list[tuple[int, int]] = field(default_factory=list)  # [start, end) of each turn in `ids`
+28|    text: str = ""
+29|    finished: bool = False  # the policy gave its answer (a turn without a tool call)
+30|    truncated: bool = False
+31|
+32|    @property
+33|    def num_turns(self) -> int:
+34|        return len(self.turns)
+35|
+36|    def prefix(self, j: int) -> "Episode":
+37|        """The first `j` turns (everything before turn `j` starts)."""
+38|        if j == 0:
+39|            return Episode()
+40|        cut = self.turns[j][0] if j < len(self.turns) else len(self.ids)
+41|        return Episode(
+42|            ids=self.ids[:cut],
+43|            logprobs=self.logprobs[:cut],
+44|            turns=list(self.turns[:j]),
+45|            text="",  # not needed for continuation; rebuilt by the runner
+46|        )
+47|
+48|    def mask(self) -> list[int]:
+49|        """1 on the policy's own tokens, 0 elsewhere."""
+50|        m = [0] * len(self.ids)
+51|        for s, e in self.turns:
+52|            m[s:e] = [1] * (e - s)
+53|        return m
+54|
+55|
+56|class EpisodeRunner:
+57|    """Runs SQL-agent turns against the rollout engine, from an arbitrary prompt and response prefix."""
+58|
+59|    def __init__(self, args, tokenizer, sampling_params: dict):
+60|        self.args = args
+61|        self.tokenizer = tokenizer
+62|        self.sampling_params = dict(sampling_params)
+63|        self.tool_specs = load_function(args.generate_tool_specs_path)
+64|        self.execute_tool = load_function(args.generate_execute_tool_function_path)
+65|        self.max_turns = args.generate_max_turns
+66|
+67|    @property
+68|    def url(self) -> str:
+69|        # the router address is only known once the engines are up, after the rollout function is built
+70|        return f"http://{self.args.sglang_router_ip}:{self.args.sglang_router_port}/generate"
+71|
+72|    def encode(self, text: str) -> list[int]:
+73|        return self.tokenizer.encode(text, add_special_tokens=False)
+74|
+75|    async def continue_episode(self, prompt_ids: list[int], prefix: Episode) -> Episode:
+76|        """Generate turns after `prompt_ids + prefix.ids` until the policy answers or a limit is hit."""
+77|        ep = Episode(ids=list(prefix.ids), logprobs=list(prefix.logprobs), turns=list(prefix.turns))
+78|        parser = create_tool_call_parser(self.tool_specs, self.args.generate_tool_call_parser)
+79|        while ep.num_turns < self.max_turns:
+80|            payload, _ = compute_request_payload(self.args, prompt_ids + ep.ids, self.sampling_params)
+81|            if payload is None:
+82|                ep.truncated = True
+83|                break
+84|            output = await post(self.url, payload)
+85|            items = output["meta_info"].get("output_token_logprobs") or []
+86|            start = len(ep.ids)
+87|            ep.ids += [item[1] for item in items]
+88|            ep.logprobs += [item[0] for item in items]
+89|            if output["meta_info"]["finish_reason"]["type"] in ("abort", "length"):
+90|                ep.turns.append((start, len(ep.ids)))
+91|                ep.truncated = True
+92|                break
+93|            ep.turns.append((start, len(ep.ids)))  # the policy's tokens only, not the tool response after them
+94|            _, calls = parser.parse_non_stream(output["text"])
+95|            if not calls:
+96|                ep.finished = True
+97|                break
+98|            tool_messages = await execute_tool_calls(calls, self.execute_tool)
+99|            obs = tokenize_tool_responses(tool_messages, tokenizer=self.tokenizer)
+100|            ep.ids += obs
+101|            ep.logprobs += [0.0] * len(obs)
+102|        ep.text = self.tokenizer.decode(ep.ids)
+103|        return ep
+104|
+105|    async def token_logprobs(self, ids: list[int], start: int) -> list[float]:
+106|        """Log-probs of `ids[start:]` from a prefill on the rollout engine (nothing generated).
+107|
+108|        SGLang returns input_token_logprobs aligned to ids[logprob_start_len:] with None in front (no logits before
+109|        the first scored position), so start one token earlier and drop that entry.
+110|        """
+111|        assert start >= 1, "need at least one context token"
+112|        payload = {
+113|            "input_ids": ids,
+114|            "sampling_params": {"max_new_tokens": 0, "temperature": 0, "skip_special_tokens": False},
+115|            "return_logprob": True,
+116|            "logprob_start_len": start - 1,
+117|        }
+118|        output = await post(self.url, payload)
+119|        items = output["meta_info"]["input_token_logprobs"][1:]
+120|        if [item[1] for item in items] != ids[start:]:
+121|            raise ValueError("prefill scoring returned misaligned tokens")
+122|        return [float(item[0]) for item in items]

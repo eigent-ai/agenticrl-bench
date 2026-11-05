@@ -1,0 +1,63 @@
+        # Subtract the other N - 1 pages to keep queue admission schedulable.
+        token_capacity = (
+            self.max_total_num_tokens * self.kv_shard_widening
+            - self.page_size * (self.kv_shard_widening - 1)
+        )
+        max_new_tokens = self.token_to_kv_pool_allocator.max_new_tokens_for_memory(
+            input_len,
+            max_new_tokens,
+            token_capacity=token_capacity,
+            sliding_window_size=self.sliding_window_size,
+            chunk_size=self.chunked_prefill_size,
+        )
+        if max_new_tokens is None:
+            req.set_finish_with_abort(
+                f"Request prompt exceeds the KV memory budget: input_len={input_len}."
+            )
+            max_new_tokens = 0
+
+        req.sampling_params.max_new_tokens = max(0, max_new_tokens)
+        # Clipping above can push max_new_tokens below min_new_tokens, which
+        # would suppress EOS for the whole generation. Restore the invariant.
+        if req.sampling_params.min_new_tokens > req.sampling_params.max_new_tokens:
+            req.sampling_params.min_new_tokens = req.sampling_params.max_new_tokens
+
+    def _process_and_broadcast_mm_inputs(
+        self,
+        raw_mm_inputs,
+    ):
+        """Materialize MultimodalInputs once on the entry rank and broadcast to others.
+
+        Entry rank:
+                self.batch_size = 1
+                self.is_single = True
+
+        if not self.is_single:
+            self._validate_mm_batch_lengths()
+
+        # Fill in default arguments
+        if self.is_single:
+            if self.rid is None:
+                self.rid = uuid.uuid4().hex
+            if self.sampling_params is None:
+                self.sampling_params = {}
+            self.sampling_params["max_new_tokens"] = 0
+        else:
+            if self.rid is None:
+                self.rid = [uuid.uuid4().hex for _ in range(self.batch_size)]
+            else:
+                assert isinstance(self.rid, list), "The rid should be a list."
+
+            if self.sampling_params is None:
+                self.sampling_params = [{}] * self.batch_size
+            elif isinstance(self.sampling_params, dict):
+                self.sampling_params = [self.sampling_params] * self.batch_size
+            for i in range(self.batch_size):
+                self.sampling_params[i]["max_new_tokens"] = 0
+
+43:    from jinja2.sandbox import ImmutableSandboxedEnvironment
+441:        def __init__(self, environment: ImmutableSandboxedEnvironment):
+484:    def raise_exception(message):
+495:    jinja_env = ImmutableSandboxedEnvironment(
+496:        trim_blocks=True, lstrip_blocks=True, extensions=[AssistantTracker, jinja2.ext.loopcontrols]
+499:    jinja_env.globals["raise_exception"] = raise_exception

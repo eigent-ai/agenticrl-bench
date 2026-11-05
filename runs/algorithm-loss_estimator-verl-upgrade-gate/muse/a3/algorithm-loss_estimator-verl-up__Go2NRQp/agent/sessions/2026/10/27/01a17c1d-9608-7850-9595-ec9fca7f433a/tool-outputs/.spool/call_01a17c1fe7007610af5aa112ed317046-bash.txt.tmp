@@ -1,0 +1,84 @@
+239:        fsdp_size = self.engine_config.fsdp_size
+241:        self.device_mesh = create_device_mesh(world_size=world_size, fsdp_size=fsdp_size)
+245:        dp_size = self.get_data_parallel_size()
+248:                device_name, mesh_shape=(dp_size, self.ulysses_sequence_parallel_size), mesh_dim_names=["dp", "sp"]
+725:        # note that the global_batch_size should include data on all the dp
+730:        batch_num_tokens = data["loss_mask"].sum().to(get_device_id())
+732:            batch_num_tokens, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
+734:        tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
+735:        tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
+1115:        if self.engine.engine_config.fsdp_size > 1:
+===
+/opt/verl/verl/workers/engine/base.py:361:        This allows for dynamic instantiation of engine classes by their registered key.
+/opt/verl/verl/workers/engine/utils.py:28:from verl.utils.seqlen_balancing import rearrange_micro_batches, restore_dynamic_batch
+/opt/verl/verl/workers/engine/utils.py:92:def prepare_micro_batches(
+/opt/verl/verl/workers/engine/utils.py:98:    use_dynamic_bsz_balance=True,
+/opt/verl/verl/workers/engine/utils.py:103:    use_dynamic_bsz = tu.get_non_tensor_data(data=data, key="use_dynamic_bsz", default=True)
+/opt/verl/verl/workers/engine/utils.py:108:    if use_dynamic_bsz:
+/opt/verl/verl/workers/engine/utils.py:109:        assert "max_token_len_per_gpu" in data.keys(), "max_token_len_per_gpu must be set when use_dynamic_bsz is True"
+/opt/verl/verl/workers/engine/utils.py:119:            use_dynamic_bsz_balance=use_dynamic_bsz_balance,
+/opt/verl/verl/workers/engine/utils.py:167:    use_dynamic_bsz = tu.get_non_tensor_data(data=data, key="use_dynamic_bsz", default=True)
+/opt/verl/verl/workers/engine/utils.py:198:        # reverse with dynamic bsz
+/opt/verl/verl/workers/engine/utils.py:199:        if use_dynamic_bsz:
+/opt/verl/verl/workers/engine/utils.py:200:            model_output[key] = restore_dynamic_batch(model_output[key], indices)
+/opt/verl/verl/workers/engine/automodel/transformer_impl.py:115:            torch.compile(entropy_from_logits, dynamic=True)
+/opt/verl/verl/workers/engine/fsdp/transformer_impl.py:184:            torch.compile(entropy_from_logits, dynamic=True)
+/opt/verl/verl/workers/engine/fsdp/transformer_impl.py:672:        the budget itself, which would leave every over-budget micro-batch fully dynamic while
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:37:from verl.utils.dynamic_cp_scheduler import (
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:43:    get_megatron_dynamic_cp_scheduler_cls,
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:44:    postprocess_dynamic_cp_batch,
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:79:from verl.utils.seqlen_balancing import restore_dynamic_batch
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:104:    """Validate the topology accepted by Megatron-Core's dynamic group builder."""
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:113:    if not engine_config.dynamic_context_parallel:
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:116:        raise ValueError("dynamic_context_parallel requires use_remove_padding=True")
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:118:        raise NotImplementedError("dynamic_context_parallel does not support pad_to_length")
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:241:        if self.engine_config.dynamic_context_parallel:
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:242:            get_megatron_dynamic_cp_scheduler_cls()
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:245:            if self.engine_config.dynamic_context_parallel:
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:249:                    mpu.get_dynamic_data_context_parallel_groups(group_size=1)
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:253:                        "initialized without dynamic DPxCP groups. Enable dynamic_context_parallel consistently "
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:260:        if self.engine_config.dynamic_context_parallel:
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:261:            assert "dynamic_context_parallel" in inspect.signature(mpu.initialize_model_parallel).parameters, (
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:262:                "dynamic_context_parallel is not supported in your megatron version, "
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:269:            extra_args["dynamic_context_parallel"] = self.engine_config.dynamic_context_parallel
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:306:        if self.engine_config.dynamic_context_parallel:
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:312:                    "dynamic_context_parallel": False,
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:317:            self.engine_config.context_parallel_size > 1 or self.engine_config.dynamic_context_parallel
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:322:                    "sequence_packing_scheduler": "default_dynamic_cp",
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:573:            and (not self.engine_config.dynamic_context_parallel or mpu.get_data_parallel_rank() == 0)
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:751:        if self.engine_config.dynamic_context_parallel:
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:757:        if self.engine_config.dynamic_context_parallel:
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:763:        if self.engine_config.dynamic_context_parallel:
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:765:            return mpu.get_dynamic_data_context_parallel_groups(group_size=1)
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:843:        if not self.engine_config.dynamic_context_parallel:
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:857:            if not self.engine_config.dynamic_context_parallel:
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:880:        if self.engine_config.dynamic_context_parallel:
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:1001:            use_dynamic_bsz = tu.get_non_tensor_data(data=data, key="use_dynamic_bsz", default=True)
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:1002:            if use_dynamic_bsz and indices is not None:
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:1003:                layers_topk_idx = restore_dynamic_batch(layers_topk_idx, indices)
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:1013:                output = postprocess_dynamic_cp_batch(
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:1284:        if self.engine_config.dynamic_context_parallel and local_cp_size is None:
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:1287:        if self.engine_config.dynamic_context_parallel:
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:1457:        if forward_only or not self.engine_config.dynamic_context_parallel:
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:1460:        if self.engine_config.dynamic_context_parallel:
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py:1481:            if self.engine_config.dynamic_context_parallel:
+/opt/verl/verl/workers/engine/torchtitan/transformer_impl.py:239:            torch.compile(entropy_from_logits, dynamic=True)
+/opt/verl/verl/workers/engine/veomni/transformer_impl.py:204:            torch.compile(entropy_from_logits, dynamic=True)
+/opt/verl/verl/utils/seqlen_balancing.py:355:    use_dynamic_bsz_balance=True,
+/opt/verl/verl/utils/seqlen_balancing.py:368:        use_dynamic_bsz_balance (bool, optional): balance the computational workload between micro-batches
+/opt/verl/verl/utils/seqlen_balancing.py:476:    if use_dynamic_bsz_balance:
+/opt/verl/verl/utils/seqlen_balancing.py:525:def prepare_dynamic_batch(
+/opt/verl/verl/utils/seqlen_balancing.py:532:    use_dynamic_bsz_balance=True,
+/opt/verl/verl/utils/seqlen_balancing.py:535:    Prepare a batch for dynamic batching.
+/opt/verl/verl/utils/seqlen_balancing.py:539:        max_token_len (int): The maximum token length for dynamic batching.
+/opt/verl/verl/utils/seqlen_balancing.py:552:        use_dynamic_bsz_balance=use_dynamic_bsz_balance,
+/opt/verl/verl/utils/seqlen_balancing.py:564:def restore_dynamic_batch(data: torch.Tensor, batch_idx_list: list[list[int]]) -> torch.Tensor:
+/opt/verl/verl/utils/seqlen_balancing.py:566:    Restore a batch from dynamic batching.
+===
+/opt/verl/verl/experimental/agent_loop/agent_loop.py
+/opt/verl/verl/experimental/teacher_loop/teacher_manager.py
+/opt/verl/verl/trainer/distillation/losses.py
+/opt/verl/verl/trainer/ppo/padding_utils.py
+/opt/verl/verl/trainer/ppo/v1/agent_loop_tq.py
+/opt/verl/verl/workers/engine/veomni/transformer_impl.py
+/opt/verl/verl/workers/utils/padding.py

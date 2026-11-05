@@ -1,0 +1,1 @@
+- [SQL-agent fidelity check](sql-agent-fidelity-check.md) — /app/fidelity gate for rollout-engine changes; deterministic-inference HOLD is a judgment call; how screens run on the box

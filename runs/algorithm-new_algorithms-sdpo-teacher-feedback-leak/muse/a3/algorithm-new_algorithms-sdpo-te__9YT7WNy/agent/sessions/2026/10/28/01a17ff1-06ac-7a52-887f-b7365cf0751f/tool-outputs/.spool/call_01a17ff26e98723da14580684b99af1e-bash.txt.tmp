@@ -1,0 +1,712 @@
+"""Tool agent loop for terminal tasks: every trajectory gets its own workspace (the task's public files, if any), which
+the bash tool works in and which is handed to the reward (non_tensor_batch["workspace"]) when the trajectory ends."""
+
+import os
+import shutil
+import uuid
+from pathlib import Path
+from typing import Any
+
+from verl.experimental.agent_loop.agent_loop import AgentLoopOutput
+from verl.experimental.agent_loop.tool_agent_loop import AgentState, ToolAgentLoop
+
+NOBODY = 65534
+
+
+def new_workspace(task_id: str) -> Path:
+    root = Path(os.environ["SMOKE_RUN_DIR"]) / "workspaces"
+    root.mkdir(parents=True, exist_ok=True)
+    ws = root / uuid.uuid4().hex
+    public = Path(os.environ.get("TERMINAL_POOL", "/data/sdpo_terminal/pool")) / "tasks" / task_id / "public"
+    if public.is_dir():
+        shutil.copytree(public, ws)
+    else:
+        ws.mkdir()
+    if os.geteuid() == 0:
+        for dp, dn, fn in os.walk(ws):
+            for p in [dp] + [os.path.join(dp, f) for f in fn]:
+                os.chown(p, NOBODY, NOBODY)
+    return ws
+
+
+class TerminalToolAgentLoop(ToolAgentLoop):
+    async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
+        extra_info = kwargs.get("extra_info") or {}
+        self._workspace = await self.loop.run_in_executor(None, new_workspace, extra_info["task_id"])
+        output = await super().run(sampling_params, **kwargs)
+        output.extra_fields["workspace"] = str(self._workspace)
+        return output
+
+    async def _handle_pending_state(self, agent_data, sampling_params: dict[str, Any]) -> AgentState:
+        agent_data.extra_fields["workspace"] = str(self._workspace)
+        return await super()._handle_pending_state(agent_data, sampling_params)
+"""Teacher-context dump for the smoke run (installed in the trainer process by runner.SmokeTaskRunner).
+
+Wraps RayPPOTrainer._maybe_build_self_distillation_batch: after the trainer has built the self-teacher batch of a step,
+every sample of that step is written to SMOKE_RUN_DIR/steps/step_NNN.jsonl with what went into it (prompt and response
+token ids and masks, the recorded attempt, score, feedback, self-distillation mask, the decoded teacher prompt, and
+the actor's and the rollout's log-probs of the response). run.json (start) and done.json (end) hold the run's
+configuration and a manifest of the SDPO tree the run used.
+"""
+
+import hashlib
+import json
+import os
+import platform
+import time
+from pathlib import Path
+
+SDPO_ROOT = Path("/opt/SDPO")
+SKIP_DIRS = {"__pycache__", ".git"}
+
+
+def code_manifest(root: Path = SDPO_ROOT) -> dict:
+    files = {}
+    for dp, dn, fn in os.walk(root):
+        dn[:] = sorted(d for d in dn if d not in SKIP_DIRS)
+        for f in sorted(fn):
+            if f.endswith((".pyc", ".pyo")):
+                continue
+            p = os.path.join(dp, f)
+            rel = os.path.relpath(p, root)
+            if os.path.islink(p):
+                files[rel] = "symlink:" + os.readlink(p)
+            elif os.path.isfile(p):
+                h = hashlib.sha256()
+                with open(p, "rb") as fh:
+                    for b in iter(lambda: fh.read(1 << 20), b""):
+                        h.update(b)
+                files[rel] = h.hexdigest()
+    return files
+
+
+def _run_dir() -> Path:
+    return Path(os.environ["SMOKE_RUN_DIR"])
+
+
+def _write_json(path: Path, obj):
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=1))
+    tmp.replace(path)
+
+
+def _versions() -> dict:
+    out = {"python": platform.python_version()}
+    for name in ("torch", "vllm", "transformers", "tokenizers", "ray"):
+        try:
+            out[name] = __import__(name).__version__
+        except Exception as e:  # noqa: BLE001
+            out[name] = f"unavailable: {type(e).__name__}"
+    return out
+
+
+def start(config):
+    from omegaconf import OmegaConf
+
+    rd = _run_dir()
+    (rd / "steps").mkdir(parents=True, exist_ok=True)
+    try:
+        cfg = OmegaConf.to_container(config, resolve=True, throw_on_missing=False)
+    except Exception as e:  # noqa: BLE001
+        cfg = {"unresolved": str(e)}
+    _write_json(rd / "run.json", {"started_at": time.time(), "run_dir": str(rd), "versions": _versions(),
+                                  "host": platform.node(), "config": cfg, "code": code_manifest()})
+    _install()
+
+
+def finish(ok: bool, error: str = ""):
+    rd = _run_dir()
+    steps = sorted(int(p.stem.split("_")[1]) for p in (rd / "steps").glob("step_*.jsonl"))
+    n = sum(1 for p in (rd / "steps").glob("step_*.jsonl") for line in open(p) if line.strip())
+    _write_json(rd / "done.json", {"finished_at": time.time(), "ok": ok, "error": error[-4000:], "steps": steps,
+                                   "samples": n, "code": code_manifest()})
+
+
+def _install():
+    from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+
+    orig = RayPPOTrainer._maybe_build_self_distillation_batch
+    if getattr(orig, "_smoke_dump", False):
+        return
+
+    def wrapped(self, batch, reward_tensor, reward_extra_infos_dict=None):
+        out = orig(self, batch, reward_tensor, reward_extra_infos_dict)
+        dump_step(self, batch, reward_tensor, reward_extra_infos_dict, out)
+        return out
+
+    wrapped._smoke_dump = True
+    RayPPOTrainer._maybe_build_self_distillation_batch = wrapped
+
+
+def _floats(t, n):
+    return [round(float(x), 6) for x in t[:n].tolist()]
+
+
+def _messages(msgs):
+    return [{"role": str(m["role"]), "content": m["content"] if isinstance(m["content"], str) else str(m["content"])}
+            for m in msgs]
+
+
+def dump_step(trainer, batch, reward_tensor, reward_extra_infos_dict, out):
+    rd = _run_dir()
+    step = int(trainer.global_steps)
+    tok = trainer.tokenizer
+    b, nt = batch.batch, batch.non_tensor_batch
+    p_len, r_len = b["prompts"].shape[1], b["responses"].shape[1]
+    attn = b["attention_mask"]
+    feedback = list((reward_extra_infos_dict or {}).get("feedback", []))
+    sd = out[0].batch if out is not None else None
+    rows = []
+    for i in range(len(batch)):
+        pm = attn[i, :p_len].bool()
+        n_resp = int(attn[i, p_len:].sum())
+        info = dict(nt["extra_info"][i])
+        rec = {
+            "step": step,
+            "index": i,
+            "uid": str(nt["uid"][i]),
+            "task_id": info.get("task_id"),
+            "attempt": os.path.basename(str(info.get("recorded_run", ""))),
+            "extra_info": {k: (v if isinstance(v, (str, bool)) or v is None else int(v))
+                           for k, v in info.items() if k in ("split", "task_id", "index")},
+            "raw_prompt": _messages(nt["raw_prompt"][i]),
+            "num_turns": int(nt["__num_turns__"][i]) if "__num_turns__" in nt else None,
+            "prompt_ids": b["prompts"][i][pm].tolist(),
+            "response_ids": b["responses"][i][:n_resp].tolist(),
+            "response_mask": b["response_mask"][i][:n_resp].tolist(),
+            "score": float(reward_tensor[i].sum()),
+            "feedback": feedback[i] if i < len(feedback) else None,
+            "old_log_probs": _floats(b["old_log_probs"][i], n_resp) if "old_log_probs" in b.keys() else None,
+            "rollout_log_probs": _floats(b["rollout_log_probs"][i], n_resp) if "rollout_log_probs" in b.keys() else None,
+        }
+        if sd is not None:
+            tp = sd["teacher_input_ids"][i, :-r_len][sd["teacher_attention_mask"][i, :-r_len].bool()]
+            rec["sd_mask"] = float(sd["self_distillation_mask"][i])
+            rec["teacher_prompt"] = tok.decode(tp.tolist())
+        rows.append(rec)
+    path = rd / "steps" / f"step_{step:03d}.jsonl"
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+    tmp.replace(path)
+    print(f"[smoke] step {step}: {len(rows)} samples -> {path}", flush=True)
+"""`bash` tool for the smoke run: runs the command in the trajectory's own workspace on this box (the sandbox fleet's
+stand-in). The workspace comes from the agent loop (agent_data.extra_fields["workspace"]); commands run unprivileged
+(uid/gid 65534) when the trainer runs as root, with a wall-clock limit and an output cap."""
+
+import asyncio
+import os
+import signal
+from typing import Any
+
+from verl.tools.base_tool import BaseTool
+from verl.tools.schemas import ToolResponse
+
+NOBODY = 65534
+SAFE_PATH = "/usr/local/go/bin:/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin"
+
+
+class LocalBashTool(BaseTool):
+    def __init__(self, config: dict, tool_schema):
+        super().__init__(config, tool_schema)
+        self.timeout = float(config.get("timeout", 30))
+        self.max_output = int(config.get("max_output_bytes", 65536))
+
+    async def execute(self, instance_id: str, parameters: dict[str, Any], **kwargs) -> tuple[ToolResponse, float, dict]:
+        agent_data = kwargs.get("agent_data")
+        workspace = getattr(agent_data, "extra_fields", {}).get("workspace") if agent_data is not None else None
+        command = parameters.get("command") if isinstance(parameters, dict) else None
+        if not workspace or not os.path.isdir(workspace):
+            return ToolResponse(text="error: no workspace for this trajectory"), 0.0, {}
+        if not isinstance(command, str) or not command.strip():
+            return ToolResponse(text="error: missing 'command'"), 0.0, {}
+        prefix = []
+        if os.geteuid() == 0:
+            prefix = ["/usr/bin/setpriv", f"--reuid={NOBODY}", f"--regid={NOBODY}", "--clear-groups", "--"]
+        env = {"PATH": SAFE_PATH, "HOME": workspace, "LANG": "C.UTF-8", "TERM": "dumb", "PYTHONDONTWRITEBYTECODE": "1",
+               "RUSTUP_HOME": "/usr/local/rustup", "CARGO_HOME": os.path.join(workspace, ".cargo"),
+               "GOTOOLCHAIN": "local", "GOFLAGS": "-mod=mod", "TMPDIR": "/tmp"}
+        proc = await asyncio.create_subprocess_exec(
+            *prefix, "/bin/bash", "-c", command, cwd=workspace, env=env, stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, start_new_session=True)
+        chunks, size, timed_out = [], 0, False
+
+        async def pump():
+            nonlocal size
+            while True:
+                b = await proc.stdout.read(8192)
+                if not b:
+                    return
+                if size < self.max_output:
+                    chunks.append(b[: self.max_output - size])
+                size += len(b)
+                if size >= self.max_output:
+                    _kill(proc.pid)
+
+        try:
+            await asyncio.wait_for(pump(), timeout=self.timeout)
+        except asyncio.TimeoutError:
+            timed_out = True
+            _kill(proc.pid)
+        try:
+            rc = await asyncio.wait_for(proc.wait(), timeout=10)
+        except asyncio.TimeoutError:
+            rc = -9
+        text = b"".join(chunks).decode("utf-8", "replace")
+        if timed_out:
+            text += f"\n[command timed out after {self.timeout:.0f}s]"
+        elif size > self.max_output:
+            text += "\n[output truncated]"
+        if rc not in (0, None) and not timed_out:
+            text += f"\n[exit code {rc}]"
+        return ToolResponse(text=text), 0.0, {}
+
+
+def _kill(pid: int):
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError:
+        pass
+"""Entry point of the smoke run (see experiments/terminal/run_sdpo_terminal_smoke.sh): verl.trainer.main_ppo with the
+smoke config and the smoke TaskRunner."""
+
+from pathlib import Path
+
+import hydra
+import ray
+
+import verl
+from verl.trainer.main_ppo import run_ppo
+from verl.utils.device import auto_set_device
+
+CONFIG_DIR = str(Path(verl.__file__).resolve().parent / "trainer" / "config")
+
+
+@hydra.main(config_path=CONFIG_DIR, config_name="sdpo_terminal_smoke", version_base=None)
+def main(config):
+    auto_set_device(config)
+    from experiments.terminal.smoke.runner import SmokeTaskRunner
+
+    run_ppo(config, task_runner_class=ray.remote(num_cpus=1)(SmokeTaskRunner))
+    ray.shutdown()  # stop the rollout servers and workers now rather than at interpreter exit
+
+
+if __name__ == "__main__":
+    main()
+"""Build the smoke dataset (one row per pool task) in the format the trainer reads.
+
+    python -m experiments.terminal.smoke.make_dataset --pool /data/sdpo_terminal/pool --out DIR
+"""
+
+import argparse
+from pathlib import Path
+
+import pandas as pd
+
+SYSTEM_PROMPT = (
+    "You are a coding agent working in a Linux terminal. Use the bash tool to inspect the workspace, write files and "
+    "run commands. The task's hidden tests are run on your workspace when you finish."
+)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pool", required=True)
+    ap.add_argument("--out", required=True)
+    args = ap.parse_args()
+    pool = Path(args.pool)
+    rows = []
+    for d in sorted((pool / "tasks").iterdir()):
+        if not (d / "prompt.md").is_file() or not (pool / "private" / d.name / "run.sh").is_file():
+            continue
+        rows.append({
+            "data_source": "terminal",
+            "prompt": [{"role": "system", "content": SYSTEM_PROMPT},
+                       {"role": "user", "content": (d / "prompt.md").read_text()}],
+            "ability": "terminal",
+            "reward_model": {"ground_truth": d.name, "style": "rule"},
+            "extra_info": {"split": "train", "task_id": d.name, "index": len(rows)},
+        })
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_parquet(out / "train.parquet")
+    print(f"[smoke] dataset: {len(rows)} tasks -> {out / 'train.parquet'}")
+
+
+if __name__ == "__main__":
+    main()
+"""Reward manager for the smoke run: records every attempt the way the rollout recorder does for the full run
+(SMOKE_RUN_DIR/attempts/<attempt_id>/: meta.json, response.txt, workspace/, runner.log = the task's tests run on the
+workspace the trajectory left behind), then scores it with the configured reward function from that record
+(extra_info["recorded_run"]), so everything the reward and the self-teacher saw is in the run directory."""
+
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import numpy as np
+
+from verl import DataProto
+from verl.workers.reward_manager.naive import NaiveRewardManager
+
+POOL = Path(os.environ.get("TERMINAL_POOL", "/data/sdpo_terminal/pool"))
+TEST_TIMEOUT_S = 180
+
+
+def run_task_tests(task_id: str, workspace: Path) -> tuple[int, str]:
+    """the task's tests on a copy of the workspace, as in the rollout sandbox"""
+    private = POOL / "private" / task_id
+    with tempfile.TemporaryDirectory(prefix="tt_") as tmp:
+        app, tests = Path(tmp) / "app", Path(tmp) / "tests"
+        shutil.copytree(workspace, app, symlinks=True)
+        shutil.copytree(private, tests)
+        env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV")}
+        env["PATH"] = ":".join(p for p in env.get("PATH", "/usr/local/bin:/usr/bin:/bin").split(":")
+                               if not p.startswith("/opt/sdpo-gpu"))
+        env.update(TESTS=str(tests), PYTEST_ADDOPTS="-q")
+        try:
+            proc = subprocess.run(["bash", str(tests / "run.sh")], cwd=app, env=env, stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=TEST_TIMEOUT_S)
+            exit_code, output = proc.returncode, proc.stdout.decode("utf-8", "replace")
+        except subprocess.TimeoutExpired as e:
+            exit_code = 124
+            output = (e.stdout or b"").decode("utf-8", "replace") + f"\n[tests timed out after {TEST_TIMEOUT_S}s]"
+        output = output.replace(str(tests), "/tests").replace(str(app), "/app")
+    return exit_code, output
+
+
+def _snapshot_ignore(root: Path):
+    """the snapshot keeps the student's files: no VCS/bytecode dirs, no links that point outside the workspace"""
+    root = os.path.realpath(root)
+
+    def ignore(d, names):
+        out = set()
+        for n in names:
+            p = os.path.join(d, n)
+            if n in (".git", "__pycache__"):
+                out.add(n)
+            elif os.path.islink(p):
+                t = os.readlink(p)
+                if os.path.isabs(t) or not os.path.realpath(p).startswith(root + os.sep):
+                    out.add(n)
+        return out
+
+    return ignore
+
+
+class RecordingRewardManager(NaiveRewardManager):
+    def __init__(self, tokenizer, num_examine, compute_score=None, reward_fn_key="data_source", **kwargs):
+        super().__init__(tokenizer, num_examine, compute_score=compute_score, reward_fn_key=reward_fn_key)
+        self.run_dir = Path(os.environ["SMOKE_RUN_DIR"])
+
+    def _record(self, i: int, data: DataProto) -> str:
+        nt = data.non_tensor_batch
+        info = dict(nt["extra_info"][i])
+        task_id = info["task_id"]
+        workspace = Path(nt["workspace"][i])
+        uid = str(nt["uid"][i]) if "uid" in nt else ""
+        attempt_id = hashlib.sha1(f"{uid}-{i}-{workspace.name}-{time.time_ns()}".encode()).hexdigest()[:10]
+        d = self.run_dir / "attempts" / attempt_id
+        d.mkdir(parents=True)
+        shutil.copytree(workspace, d / "workspace", symlinks=True, ignore=_snapshot_ignore(workspace))
+        exit_code, output = run_task_tests(task_id, d / "workspace")
+        p_len = data.batch["prompts"].shape[1]
+        n_resp = int(data.batch["attention_mask"][i, p_len:].sum())
+        response = self.tokenizer.decode(data.batch["responses"][i][:n_resp].tolist())
+        (d / "response.txt").write_text(response)
+        (d / "runner.log").write_text(output)
+        (d / "meta.json").write_text(json.dumps({"attempt_id": attempt_id, "task_id": task_id, "uid": uid,
+                                                 "workspace": workspace.name, "exit_code": exit_code,
+                                                 "passed": exit_code == 0}, indent=1))
+        return str(d)
+
+    def __call__(self, data: DataProto, return_dict: bool = True):
+        nt = data.non_tensor_batch
+        if "workspace" in nt and not all(isinstance(e, dict) and e.get("recorded_run") for e in nt["extra_info"]):
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                recorded = list(ex.map(lambda i: self._record(i, data), range(len(data))))
+            infos = np.empty(len(data), dtype=object)
+            infos[:] = [{**dict(nt["extra_info"][i]), "recorded_run": recorded[i]} for i in range(len(data))]
+            nt["extra_info"] = infos
+        return super().__call__(data, return_dict)
+"""TaskRunner for the smoke run: the standard one, with the teacher-context dump installed in the trainer process."""
+
+import traceback
+
+from verl.trainer.main_ppo import TaskRunner
+
+
+class SmokeTaskRunner(TaskRunner):
+    def run(self, config):
+        from experiments.terminal.smoke import dump
+
+        dump.start(config)
+        try:
+            super().run(config)
+        except BaseException:
+            dump.finish(ok=False, error=traceback.format_exc())
+            raise
+        dump.finish(ok=True)
+==MAKE==
+"""Build the smoke dataset (one row per pool task) in the format the trainer reads.
+
+    python -m experiments.terminal.smoke.make_dataset --pool /data/sdpo_terminal/pool --out DIR
+"""
+
+import argparse
+from pathlib import Path
+
+import pandas as pd
+
+SYSTEM_PROMPT = (
+    "You are a coding agent working in a Linux terminal. Use the bash tool to inspect the workspace, write files and "
+    "run commands. The task's hidden tests are run on your workspace when you finish."
+)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pool", required=True)
+    ap.add_argument("--out", required=True)
+    args = ap.parse_args()
+    pool = Path(args.pool)
+    rows = []
+    for d in sorted((pool / "tasks").iterdir()):
+        if not (d / "prompt.md").is_file() or not (pool / "private" / d.name / "run.sh").is_file():
+            continue
+        rows.append({
+            "data_source": "terminal",
+            "prompt": [{"role": "system", "content": SYSTEM_PROMPT},
+                       {"role": "user", "content": (d / "prompt.md").read_text()}],
+            "ability": "terminal",
+            "reward_model": {"ground_truth": d.name, "style": "rule"},
+            "extra_info": {"split": "train", "task_id": d.name, "index": len(rows)},
+        })
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows).to_parquet(out / "train.parquet")
+    print(f"[smoke] dataset: {len(rows)} tasks -> {out / 'train.parquet'}")
+
+
+if __name__ == "__main__":
+    main()
+==AGENT==
+"""Tool agent loop for terminal tasks: every trajectory gets its own workspace (the task's public files, if any), which
+the bash tool works in and which is handed to the reward (non_tensor_batch["workspace"]) when the trajectory ends."""
+
+import os
+import shutil
+import uuid
+from pathlib import Path
+from typing import Any
+
+from verl.experimental.agent_loop.agent_loop import AgentLoopOutput
+from verl.experimental.agent_loop.tool_agent_loop import AgentState, ToolAgentLoop
+
+NOBODY = 65534
+
+
+def new_workspace(task_id: str) -> Path:
+    root = Path(os.environ["SMOKE_RUN_DIR"]) / "workspaces"
+    root.mkdir(parents=True, exist_ok=True)
+    ws = root / uuid.uuid4().hex
+    public = Path(os.environ.get("TERMINAL_POOL", "/data/sdpo_terminal/pool")) / "tasks" / task_id / "public"
+    if public.is_dir():
+        shutil.copytree(public, ws)
+    else:
+        ws.mkdir()
+    if os.geteuid() == 0:
+        for dp, dn, fn in os.walk(ws):
+            for p in [dp] + [os.path.join(dp, f) for f in fn]:
+                os.chown(p, NOBODY, NOBODY)
+    return ws
+
+
+class TerminalToolAgentLoop(ToolAgentLoop):
+    async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
+        extra_info = kwargs.get("extra_info") or {}
+        self._workspace = await self.loop.run_in_executor(None, new_workspace, extra_info["task_id"])
+        output = await super().run(sampling_params, **kwargs)
+        output.extra_fields["workspace"] = str(self._workspace)
+        return output
+
+    async def _handle_pending_state(self, agent_data, sampling_params: dict[str, Any]) -> AgentState:
+        agent_data.extra_fields["workspace"] = str(self._workspace)
+        return await super()._handle_pending_state(agent_data, sampling_params)
+==DUMP==
+"""Teacher-context dump for the smoke run (installed in the trainer process by runner.SmokeTaskRunner).
+
+Wraps RayPPOTrainer._maybe_build_self_distillation_batch: after the trainer has built the self-teacher batch of a step,
+every sample of that step is written to SMOKE_RUN_DIR/steps/step_NNN.jsonl with what went into it (prompt and response
+token ids and masks, the recorded attempt, score, feedback, self-distillation mask, the decoded teacher prompt, and
+the actor's and the rollout's log-probs of the response). run.json (start) and done.json (end) hold the run's
+configuration and a manifest of the SDPO tree the run used.
+"""
+
+import hashlib
+import json
+import os
+import platform
+import time
+from pathlib import Path
+
+SDPO_ROOT = Path("/opt/SDPO")
+SKIP_DIRS = {"__pycache__", ".git"}
+
+
+def code_manifest(root: Path = SDPO_ROOT) -> dict:
+    files = {}
+    for dp, dn, fn in os.walk(root):
+        dn[:] = sorted(d for d in dn if d not in SKIP_DIRS)
+        for f in sorted(fn):
+            if f.endswith((".pyc", ".pyo")):
+                continue
+            p = os.path.join(dp, f)
+            rel = os.path.relpath(p, root)
+            if os.path.islink(p):
+                files[rel] = "symlink:" + os.readlink(p)
+            elif os.path.isfile(p):
+                h = hashlib.sha256()
+                with open(p, "rb") as fh:
+                    for b in iter(lambda: fh.read(1 << 20), b""):
+                        h.update(b)
+                files[rel] = h.hexdigest()
+    return files
+
+
+def _run_dir() -> Path:
+    return Path(os.environ["SMOKE_RUN_DIR"])
+
+
+def _write_json(path: Path, obj):
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=1))
+    tmp.replace(path)
+
+
+def _versions() -> dict:
+    out = {"python": platform.python_version()}
+    for name in ("torch", "vllm", "transformers", "tokenizers", "ray"):
+        try:
+            out[name] = __import__(name).__version__
+        except Exception as e:  # noqa: BLE001
+            out[name] = f"unavailable: {type(e).__name__}"
+    return out
+
+
+def start(config):
+    from omegaconf import OmegaConf
+
+    rd = _run_dir()
+    (rd / "steps").mkdir(parents=True, exist_ok=True)
+    try:
+        cfg = OmegaConf.to_container(config, resolve=True, throw_on_missing=False)
+    except Exception as e:  # noqa: BLE001
+        cfg = {"unresolved": str(e)}
+    _write_json(rd / "run.json", {"started_at": time.time(), "run_dir": str(rd), "versions": _versions(),
+                                  "host": platform.node(), "config": cfg, "code": code_manifest()})
+    _install()
+
+
+def finish(ok: bool, error: str = ""):
+    rd = _run_dir()
+    steps = sorted(int(p.stem.split("_")[1]) for p in (rd / "steps").glob("step_*.jsonl"))
+    n = sum(1 for p in (rd / "steps").glob("step_*.jsonl") for line in open(p) if line.strip())
+    _write_json(rd / "done.json", {"finished_at": time.time(), "ok": ok, "error": error[-4000:], "steps": steps,
+                                   "samples": n, "code": code_manifest()})
+
+
+def _install():
+    from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+
+    orig = RayPPOTrainer._maybe_build_self_distillation_batch
+    if getattr(orig, "_smoke_dump", False):
+        return
+
+    def wrapped(self, batch, reward_tensor, reward_extra_infos_dict=None):
+        out = orig(self, batch, reward_tensor, reward_extra_infos_dict)
+        dump_step(self, batch, reward_tensor, reward_extra_infos_dict, out)
+        return out
+
+    wrapped._smoke_dump = True
+    RayPPOTrainer._maybe_build_self_distillation_batch = wrapped
+
+
+def _floats(t, n):
+    return [round(float(x), 6) for x in t[:n].tolist()]
+
+
+def _messages(msgs):
+    return [{"role": str(m["role"]), "content": m["content"] if isinstance(m["content"], str) else str(m["content"])}
+            for m in msgs]
+
+
+def dump_step(trainer, batch, reward_tensor, reward_extra_infos_dict, out):
+    rd = _run_dir()
+    step = int(trainer.global_steps)
+    tok = trainer.tokenizer
+    b, nt = batch.batch, batch.non_tensor_batch
+    p_len, r_len = b["prompts"].shape[1], b["responses"].shape[1]
+    attn = b["attention_mask"]
+    feedback = list((reward_extra_infos_dict or {}).get("feedback", []))
+    sd = out[0].batch if out is not None else None
+    rows = []
+    for i in range(len(batch)):
+        pm = attn[i, :p_len].bool()
+        n_resp = int(attn[i, p_len:].sum())
+        info = dict(nt["extra_info"][i])
+        rec = {
+            "step": step,
+            "index": i,
+            "uid": str(nt["uid"][i]),
+            "task_id": info.get("task_id"),
+            "attempt": os.path.basename(str(info.get("recorded_run", ""))),
+            "extra_info": {k: (v if isinstance(v, (str, bool)) or v is None else int(v))
+                           for k, v in info.items() if k in ("split", "task_id", "index")},
+            "raw_prompt": _messages(nt["raw_prompt"][i]),
+            "num_turns": int(nt["__num_turns__"][i]) if "__num_turns__" in nt else None,
+            "prompt_ids": b["prompts"][i][pm].tolist(),
+            "response_ids": b["responses"][i][:n_resp].tolist(),
+            "response_mask": b["response_mask"][i][:n_resp].tolist(),
+            "score": float(reward_tensor[i].sum()),
+            "feedback": feedback[i] if i < len(feedback) else None,
+            "old_log_probs": _floats(b["old_log_probs"][i], n_resp) if "old_log_probs" in b.keys() else None,
+            "rollout_log_probs": _floats(b["rollout_log_probs"][i], n_resp) if "rollout_log_probs" in b.keys() else None,
+        }
+        if sd is not None:
+            tp = sd["teacher_input_ids"][i, :-r_len][sd["teacher_attention_mask"][i, :-r_len].bool()]
+            rec["sd_mask"] = float(sd["self_distillation_mask"][i])
+            rec["teacher_prompt"] = tok.decode(tp.tolist())
+        rows.append(rec)
+    path = rd / "steps" / f"step_{step:03d}.jsonl"
+    tmp = path.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+    tmp.replace(path)
+    print(f"[smoke] step {step}: {len(rows)} samples -> {path}", flush=True)
+"""TaskRunner for the smoke run: the standard one, with the teacher-context dump installed in the trainer process."""
+
+import traceback
+
+from verl.trainer.main_ppo import TaskRunner
+
+
+class SmokeTaskRunner(TaskRunner):
+    def run(self, config):
+        from experiments.terminal.smoke import dump
+
+        dump.start(config)
+        try:
+            super().run(config)
+        except BaseException:
+            dump.finish(ok=False, error=traceback.format_exc())
+            raise
+        dump.finish(ok=True)

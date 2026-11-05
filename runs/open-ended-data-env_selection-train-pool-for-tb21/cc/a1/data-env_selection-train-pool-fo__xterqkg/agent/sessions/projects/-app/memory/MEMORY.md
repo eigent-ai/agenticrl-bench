@@ -1,0 +1,2 @@
+- [Session timeline](session-timeline.md) — start 05:20 UTC Oct 27, deadline ~21:20 UTC
+- [TB2.1 RL plan/state](tb21-rl-plan.md) — work dirs, jobs launched, key findings

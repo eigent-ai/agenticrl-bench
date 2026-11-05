@@ -1,0 +1,76 @@
+edited
+changed lines: lines 1101-1103
+--- original
++++ updated
+@@
+-    out["limit_output"] = [agent._limit_output_length(s) for s in battery]
+-    out["single_step"] = await _single_step_probe()
+-    return out
++    out["limit_output"] = [agent._limit_output_length(s) for s in battery]
++    out["single_step"] = await _single_step_probe()
++    return out
++
++
++def _sanitize_headers(reqs):
++    keep = ("authorization", "x-session-id", "content-type")
++    for r in reqs:
++        h = {}
++        for k in keep:
++            if k in r["headers"]:
++                v = r["headers"][k]
++                if k == "authorization":
++                    v = "sha256:" + hashlib.sha256(v.encode()).hexdigest()[:16]
++                h[k] = v
++        r["headers"] = h
++
++
++def run_scenarios(scen_path, out_path, work_dir):
++    import asyncio
++    # Retry backoff durations are wall-clock, not behavior: cap sleeps equally
++    # for both stacks so error scenarios stay inside the gate's time budget.
++    _real_sleep = asyncio.sleep
++    async def _fast_sleep(delay, *a, **kw):
++        return await _real_sleep(min(float(delay or 0), 0.02), *a, **kw)
++    asyncio.sleep = _fast_sleep
++    doc = json.loads(Path(scen_path).read_text())
++    work = Path(work_dir)
++    work.mkdir(parents=True, exist_ok=True)
++    server = _FakeServer()
++    outcomes = {}
++
++    async def main():
++        for scen in doc["scenarios"]:
++            sid = scen["id"]
++            sw = work / re.sub(r"[^A-Za-z0-9_.-]+", "_", sid)
++            try:
++                if scen["kind"] == "chat":
++                    outcomes[sid] = await _run_chat(doc, scen, server, str(sw))
++                elif scen["kind"] == "loop":
++                    outcomes[sid] = await _run_loop(doc, scen, server, str(sw))
++                elif scen["kind"] == "parser":
++                    outcomes[sid] = _run_parser(scen)
++                elif scen["kind"] == "verifier":
++                    outcomes[sid] = await _run_verifier(scen, str(sw))
++                elif scen["kind"] == "llm_errors":
++                    outcomes[sid] = await _run_llm_errors(doc, scen, server, str(sw))
++                elif scen["kind"] == "tmux":
++                    outcomes[sid] = await _run_tmux(str(sw))
++                elif scen["kind"] == "probes":
++                    outcomes[sid] = await _run_probes(doc, scen, server, str(sw))
++            except BaseException as e:  # noqa: BLE001
++                import traceback
++                outcomes[sid] = {"harness_exception": type(e).__name__,
++                                 "detail": (str(e) + "\n" + traceback.format_exc())[-500:]}
++            print(f"gate-run: {sid} done", file=sys.stderr, flush=True)
++    asyncio.run(main())
++    _sanitize_headers(server.requests)
++    import importlib.metadata as _md
++    versions = {}
++    for pkg in ("harbor", "litellm"):
++        try:
++            versions[pkg] = _md.version(pkg)
++        except Exception:
++            versions[pkg] = None
++    Path(out_path).write_text(json.dumps(
++        {"versions": versions, "requests": server.requests, "outcomes": outcomes}))
++    print(f"gate-run: {len(server.requests)} requests, {len(outcomes)} scenarios", file=sys.stderr)

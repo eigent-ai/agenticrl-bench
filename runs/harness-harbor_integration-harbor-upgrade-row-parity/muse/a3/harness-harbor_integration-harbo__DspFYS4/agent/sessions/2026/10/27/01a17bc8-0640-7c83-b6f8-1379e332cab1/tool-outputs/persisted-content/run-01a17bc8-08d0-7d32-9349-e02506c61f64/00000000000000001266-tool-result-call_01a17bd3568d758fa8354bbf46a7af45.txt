@@ -1,0 +1,502 @@
+Read text file `/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/models/trial/config.py`.
+1|import hashlib
+2|import json
+3|import warnings
+4|from enum import Enum
+5|from pathlib import Path
+6|from typing import Any, Literal, NotRequired, override, TypedDict
+7|from uuid import UUID
+8|
+9|from pydantic import (
+10|    BaseModel,
+11|    Field,
+12|    SerializationInfo,
+13|    field_serializer,
+14|    field_validator,
+15|    model_validator,
+16|)
+17|from shortuuid import ShortUUID
+18|
+19|from harbor.models.agent.name import AgentName
+20|from harbor.models.bridge import BridgeConfig
+21|from harbor.models.environment_type import EnvironmentType
+22|from harbor.models.task.config import (
+23|    ArtifactConfig,
+24|    MCPServerConfig,
+25|    TpuSpec,
+26|    normalize_allowed_hosts,
+27|)
+28|from harbor.models.task.id import GitTaskId, LocalTaskId, PackageTaskId
+29|from harbor.utils.env import templatize_sensitive_env
+30|
+31|
+32|class ServiceVolumeBind(TypedDict):
+33|    create_host_path: NotRequired[Literal[False]]
+34|    selinux: NotRequired[Literal["z", "Z"]]
+35|
+36|
+37|class ServiceVolumeVolume(TypedDict):
+38|    subpath: NotRequired[str]
+39|
+40|
+41|class ServiceVolumeImage(TypedDict):
+42|    subpath: NotRequired[str]
+43|
+44|
+45|class ServiceVolumeConfig(TypedDict):
+46|    type: Literal["bind", "volume", "image"]
+47|    source: str
+48|    target: str
+49|    read_only: NotRequired[Literal[True]]
+50|    bind: NotRequired[ServiceVolumeBind]
+51|    volume: NotRequired[ServiceVolumeVolume]
+52|    image: NotRequired[ServiceVolumeImage]
+53|
+54|
+55|class ResourceMode(str, Enum):
+56|    AUTO = "auto"
+57|    LIMIT = "limit"
+58|    REQUEST = "request"
+59|    GUARANTEE = "guarantee"
+60|    IGNORE = "ignore"
+61|
+62|
+63|class AgentConfig(BaseModel):
+64|    name: str | None = None
+65|    import_path: str | None = None
+66|    model_name: str | None = None
+67|    n_concurrent: int | None = Field(
+68|        default=None,
+69|        ge=1,
+70|        description=(
+71|            "Per-agent cap on concurrent agent.run() phases. Must not exceed "
+72|            "the job's n_concurrent_trials and is usually useful only when lower. "
+73|            "When omitted, agent execution is only limited by n_concurrent_trials."
+74|        ),
+75|    )
+76|    concurrency_group: str | None = Field(
+77|        default=None,
+78|        description=(
+79|            "Optional shared concurrency pool name for agent configs that should "
+80|            "use the same n_concurrent limit."
+81|        ),
+82|    )
+83|    skills: list[str | Path] = Field(
+84|        default_factory=list,
+85|        description=(
+86|            "Skill directories or source strings (git URLs, org/name[@ref] "
+87|            "shorthand, or local paths). Job.create() / Trial.create() "
+88|            "resolve any non-local entries to cached directories in-place."
+89|        ),
+90|    )
+91|
+92|    @field_validator("skills", mode="after")
+93|    @classmethod
+94|    def _normalize_skills_to_str(cls, v: list[str | Path]) -> list[str]:
+95|        """Normalize Path objects to str so model_dump() is stable across
+96|        JSON round-trips (Path -> JSON str -> str != Path on reload)."""
+97|        return [str(s) for s in v]
+98|
+99|    override_timeout_sec: float | None = None
+100|    override_setup_timeout_sec: float | None = None
+101|    max_timeout_sec: float | None = None
+102|    resume_trajectory: bool = Field(
+103|        default=False,
+104|        description=(
+105|            "For multi-step tasks, resume the agent's native session from the "
+106|            "previous step instead of starting a fresh conversation on each "
+107|            "step. Requires an agent with native resume support "
+108|            "(capabilities.resume); the trial fails fast otherwise. No effect on "
+109|            "single-step tasks."
+110|        ),
+111|    )
+112|    load_trajectory: str | None = Field(
+113|        default=None,
+114|        description=(
+115|            "Path to a trajectory to load as the agent's session before the "
+116|            "first step, which then resumes it instead of starting fresh. A "
+117|            ".jsonl file is the agent's native session format (lossless, same "
+118|            "agent only; capabilities.load_native_trajectory); a .json file is an "
+119|            "ATIF trajectory converted to the agent's native format (portable "
+120|            "across supported agents; capabilities.load_atif_trajectory). The "
+121|            "trial fails fast if the agent lacks the needed support. Composes "
+122|            "with resume_trajectory."
+123|        ),
+124|    )
+125|    extra_allowed_hosts: list[str] = Field(
+126|        default_factory=list,
+127|        description=(
+128|            "Run-specific hostnames or IP addresses merged into the effective "
+129|            "agent phase allowlist during agent.run() only."
+130|        ),
+131|    )
+132|    include_logs: list[str] = Field(
+133|        default_factory=list,
+134|        exclude_if=lambda v: not v,
+135|        description=(
+136|            "Glob patterns of agent log files to download, relative to the "
+137|            "agent logs directory. When set, only matching files are kept."
+138|        ),
+139|    )
+140|    exclude_logs: list[str] = Field(
+141|        default_factory=list,
+142|        exclude_if=lambda v: not v,
+143|        description=(
+144|            "Glob patterns of agent log files to skip when downloading. "
+145|            "Applied after include_logs, so exclude wins on overlap."
+146|        ),
+147|    )
+148|    kwargs: dict[str, Any] = Field(default_factory=dict)
+149|    env: dict[str, str] = Field(default_factory=dict, exclude_if=lambda v: not v)
+150|    mcp_servers: list[MCPServerConfig] = Field(default_factory=list)
+151|
+152|    @field_validator("extra_allowed_hosts")
+153|    @classmethod
+154|    def validate_extra_allowed_hosts(cls, hosts: list[str]) -> list[str]:
+155|        return normalize_allowed_hosts(hosts)
+156|
+157|    @field_serializer("env")
+158|    @classmethod
+159|    def _serialize_env(
+160|        cls, env: dict[str, str], info: SerializationInfo
+161|    ) -> dict[str, str]:
+162|        if info.context and info.context.get("redact_sensitive_env") is False:
+163|            return env
+164|        return templatize_sensitive_env(env)
+165|
+166|    @model_validator(mode="after")
+167|    def set_default_name(self):
+168|        if self.name is None and self.import_path is None:
+169|            self.name = AgentName.ORACLE.value
+170|        return self
+171|
+172|    @property
+173|    def concurrency_key(self) -> str:
+174|        if self.concurrency_group is not None:
+175|            return f"group:{self.concurrency_group}"
+176|
+177|        identity = self.model_dump(
+178|            mode="json",
+179|            exclude={"concurrency_group", "n_concurrent"},
+180|            exclude_none=True,
+181|            context={"redact_sensitive_env": False},
+182|        )
+183|        serialized_identity = json.dumps(
+184|            identity,
+185|            sort_keys=True,
+186|            separators=(",", ":"),
+187|        )
+188|        return "agent:" + hashlib.sha256(serialized_identity.encode()).hexdigest()
+189|
+190|
+191|class UserAgentConfig(AgentConfig):
+192|    user_persona_path: Path | None = None
+193|    user_prompt_template_path: Path | None = None
+194|    bridge: BridgeConfig
+195|
+196|
+197|class EnvironmentConfig(BaseModel):
+198|    type: EnvironmentType | None = None
+199|    import_path: str | None = None
+200|    force_build: bool = False
+201|    delete: bool = True
+202|    stream: bool = False
+203|    cpu_enforcement_policy: ResourceMode = ResourceMode.AUTO
+204|    memory_enforcement_policy: ResourceMode = ResourceMode.AUTO
+205|    override_cpus: int | None = None
+206|    override_memory_mb: int | None = None
+207|    override_storage_mb: int | None = None
+208|    override_gpus: int | None = None
+209|    override_tpu: TpuSpec | None = None
+210|    suppress_override_warnings: bool = Field(
+211|        default=False,
+212|        exclude=True,
+213|        description="Deprecated; has no effect.",
+214|    )
+215|    mounts: list[ServiceVolumeConfig] | None = Field(
+216|        default=None,
+217|        description="Additional mounts for the agent environment only.",
+218|    )
+219|    extra_docker_compose: list[Path] = Field(
+220|        default_factory=list,
+221|        description="Additional Docker Compose overlays for the agent environment only.",
+222|    )
+223|    env: dict[str, str] = Field(default_factory=dict, exclude_if=lambda v: not v)
+224|    kwargs: dict[str, Any] = Field(default_factory=dict)
+225|    extra_allowed_hosts: list[str] = Field(
+226|        default_factory=list,
+227|        description=(
+228|            "Run-specific hostnames or IP addresses merged into the "
+229|            "[environment] network baseline at agent env start."
+230|        ),
+231|    )
+232|
+233|    @field_validator("extra_allowed_hosts")
+234|    @classmethod
+235|    def validate_extra_allowed_hosts(cls, hosts: list[str]) -> list[str]:
+236|        return normalize_allowed_hosts(hosts)
+237|
+238|    @model_validator(mode="before")
+239|    @classmethod
+240|    def _accept_legacy_mounts_json(cls, data: Any) -> Any:
+241|        """Accept the legacy ``mounts_json`` input key as an alias for ``mounts``."""
+242|        if isinstance(data, dict) and "mounts_json" in data:
+243|            legacy = data.pop("mounts_json")
+244|            if "mounts" not in data:
+245|                warnings.warn(
+246|                    "EnvironmentConfig.mounts_json is deprecated; "
+247|                    "use 'mounts' instead.",
+248|                    DeprecationWarning,
+249|                    stacklevel=2,
+250|                )
+251|                data["mounts"] = legacy
+252|        if isinstance(data, dict) and "suppress_override_warnings" in data:
+253|            warnings.warn(
+254|                "EnvironmentConfig.suppress_override_warnings is deprecated and "
+255|                "has no effect; resource override warnings are no longer emitted.",
+256|                DeprecationWarning,
+257|                stacklevel=2,
+258|            )
+259|        return data
+260|
+261|    @field_validator(
+262|        "cpu_enforcement_policy",
+263|        "memory_enforcement_policy",
+264|        mode="before",
+265|    )
+266|    @classmethod
+267|    def _normalize_resource_mode(cls, value: Any) -> Any:
+268|        if isinstance(value, str):
+269|            return value.lower()
+270|        return value
+271|
+272|    @property
+273|    def mounts_json(self) -> list[ServiceVolumeConfig] | None:
+274|        """Deprecated alias for :attr:`mounts`. Will be removed in a future release."""
+275|        warnings.warn(
+276|            "EnvironmentConfig.mounts_json is deprecated; use 'mounts' instead.",
+277|            DeprecationWarning,
+278|            stacklevel=2,
+279|        )
+280|        return self.mounts
+281|
+282|    @mounts_json.setter
+283|    def mounts_json(self, value: list[ServiceVolumeConfig] | None) -> None:
+284|        warnings.warn(
+285|            "EnvironmentConfig.mounts_json is deprecated; use 'mounts' instead.",
+286|            DeprecationWarning,
+287|            stacklevel=2,
+288|        )
+289|        self.mounts = value
+290|
+291|    @field_serializer("env")
+292|    @classmethod
+293|    def _serialize_env(cls, env: dict[str, str]) -> dict[str, str]:
+294|        return templatize_sensitive_env(env)
+295|
+296|    @field_validator("env", mode="before")
+297|    @classmethod
+298|    def _env_list_to_dict(cls, v: list[str] | dict[str, str]) -> dict[str, str]:
+299|        """Accept legacy YAML list of KEY=VALUE strings or the canonical dict."""
+300|        if isinstance(v, dict):
+301|            return v
+302|        if isinstance(v, list):
+303|            warnings.warn(
+304|                "List-style 'environment.env' is deprecated. "
+305|                "Use a mapping of env var names to values instead.",
+306|                DeprecationWarning,
+307|                stacklevel=2,
+308|            )
+309|            out: dict[str, str] = {}
+310|            for item in v:
+311|                if "=" not in item:
+312|                    raise ValueError(
+313|                        f"Invalid env var format: {item!r}. Expected KEY=VALUE"
+314|                    )
+315|                key, value = item.split("=", 1)
+316|                out[key.strip()] = value.strip()
+317|            return out
+318|        return v
+319|
+320|    @model_validator(mode="after")
+321|    def set_default_type(self):
+322|        if self.type is None and self.import_path is None:
+323|            self.type = EnvironmentType.DOCKER
+324|        return self
+325|
+326|
+327|class VerifierConfig(BaseModel):
+328|    override_timeout_sec: float | None = None
+329|    max_timeout_sec: float | None = None
+330|    include_logs: list[str] = Field(
+331|        default_factory=list,
+332|        exclude_if=lambda v: not v,
+333|        description=(
+334|            "Glob patterns of verifier log files to download, relative to "
+335|            "the verifier logs directory. When set, only matching files are "
+336|            "kept; the reward file is always downloaded."
+337|        ),
+338|    )
+339|    exclude_logs: list[str] = Field(
+340|        default_factory=list,
+341|        exclude_if=lambda v: not v,
+342|        description=(
+343|            "Glob patterns of verifier log files to skip when downloading. "
+344|            "Applied after include_logs, so exclude wins on overlap."
+345|        ),
+346|    )
+347|    env: dict[str, str] = Field(default_factory=dict, exclude_if=lambda v: not v)
+348|    import_path: str | None = Field(default=None, exclude_if=lambda v: v is None)
+349|    kwargs: dict[str, Any] = Field(default_factory=dict, exclude_if=lambda v: not v)
+350|    disable: bool = False
+351|
+352|    @field_serializer("env")
+353|    @classmethod
+354|    def _serialize_env(cls, env: dict[str, str]) -> dict[str, str]:
+355|        return templatize_sensitive_env(env)
+356|
+357|
+358|class TaskConfig(BaseModel):
+359|    path: Path | None = None
+360|    git_url: str | None = None
+361|    git_commit_id: str | None = None
+362|    name: str | None = None  # org/name format (e.g. "harbor/hello-world")
+363|    ref: str | None = (
+364|        None  # tag, revision, or digest (e.g. "latest", "3", "sha256:...")
+365|    )
+366|    overwrite: bool = False
+367|    download_dir: Path | None = None
+368|    source: str | None = None
+369|
+370|    @model_validator(mode="after")
+371|    def validate_task_source(self):
+372|        has_path = self.path is not None
+373|        has_package = self.name is not None
+374|
+375|        if not has_path and not has_package:
+376|            raise ValueError("Either 'path' or 'name' must be set.")
+377|
+378|        if has_path and has_package:
+379|            raise ValueError("Cannot set both 'path' and 'name'.")
+380|
+381|        if self.ref is not None and not has_package:
+382|            raise ValueError("'ref' requires 'name' to be set.")
+383|
+384|        if self.git_commit_id is not None and self.git_url is None:
+385|            raise ValueError("'git_commit_id' requires 'git_url' to be set.")
+386|
+387|        return self
+388|
+389|    def is_git_task(self) -> bool:
+390|        """Check if this is a Git-based task."""
+391|        return self.git_url is not None
+392|
+393|    def is_package_task(self) -> bool:
+394|        """Check if this is a package-based task."""
+395|        return self.name is not None
+396|
+397|    def get_task_id(self) -> LocalTaskId | GitTaskId | PackageTaskId:
+398|        """Get the appropriate TaskId based on configuration."""
+399|        if self.is_package_task():
+400|            assert self.name is not None
+401|            org, name = self.name.split("/", 1)
+402|            return PackageTaskId(org=org, name=name, ref=self.ref)
+403|        if self.is_git_task():
+404|            if self.git_url is None or self.path is None:
+405|                raise ValueError("git_url and path must be set for a git task.")
+406|
+407|            return GitTaskId(
+408|                git_url=self.git_url, git_commit_id=self.git_commit_id, path=self.path
+409|            )
+410|        if self.path is None:
+411|            raise ValueError("path must be set for a local task.")
+412|        return LocalTaskId(path=self.path)
+413|
+414|    def get_local_path(self) -> Path:
+415|        return self.get_task_id().get_local_path()
+416|
+417|
+418|class SourceTrialConfig(BaseModel):
+419|    """A source trial this trial derives from.
+420|
+421|    ``action`` names the derivation and must be stated explicitly; only
+422|    ``regrade`` exists today. A ``hub`` source records only the hub trial
+423|    UUID (the bytes are downloaded or read from the local cache); a
+424|    ``local`` source records the trial directory path plus its UUID when
+425|    known.
+426|    """
+427|
+428|    action: Literal["regrade"]
+429|    type: Literal["local", "hub"]
+430|    trial_id: UUID | None = None
+431|    path: Path | None = None
+432|
+433|    @model_validator(mode="after")
+434|    def _validate_source(self):
+435|        if self.type == "hub":
+436|            if self.trial_id is None:
+437|                raise ValueError("A hub source_trial requires trial_id.")
+438|            if self.path is not None:
+439|                raise ValueError(
+440|                    "A hub source_trial records only trial_id; the local "
+441|                    "materialization lives in the trials cache, not the config."
+442|                )
+443|        if self.type == "local" and self.path is None:
+444|            raise ValueError("A local source_trial requires path.")
+445|        return self
+446|
+447|
+448|class TrialConfig(BaseModel):
+449|    # If replay-affecting fields are added or changed here, update TrialLock in
+450|    # harbor.models.job.lock so lock.json records the same resolved run input.
+451|    task: TaskConfig
+452|    trial_name: str = ""
+453|    trials_dir: Path = Path("trials")
+454|    install_only: bool = Field(
+455|        default=False,
+456|        description="Only run agent setup/install, then exit (skips agent run + verification).",
+457|    )
+458|    timeout_multiplier: float = 1.0
+459|    agent_timeout_multiplier: float | None = None
+460|    verifier_timeout_multiplier: float | None = None
+461|    agent_setup_timeout_multiplier: float | None = None
+462|    environment_build_timeout_multiplier: float | None = None
+463|    agent: AgentConfig = Field(default_factory=AgentConfig)
+464|    user_agent: UserAgentConfig | None = Field(
+465|        default=None,
+466|        description=(
+467|            "Optional simulated-user agent that communicates with the primary "
+468|            "agent through its configured bridge."
+469|        ),
+470|    )
+471|    environment: EnvironmentConfig = Field(default_factory=EnvironmentConfig)
+472|    verifier: VerifierConfig = Field(default_factory=VerifierConfig)
+473|    artifacts: list[str | ArtifactConfig] = Field(default_factory=list)
+474|    extra_instruction_paths: list[Path] = Field(
+475|        default_factory=list,
+476|        description=(
+477|            "Paths to extra instruction files appended to the task instruction. "
+478|            "File contents are appended before ``extra_instructions``."
+479|        ),
+480|    )
+481|    extra_instructions: list[str] = Field(
+482|        default_factory=list,
+483|        description=(
+484|            "Inline extra instructions appended to the task instruction. "
+485|            "Appended after any ``extra_instruction_paths`` contents."
+486|        ),
+487|    )
+488|    job_id: UUID | None = None
+489|    source_trial: "SourceTrialConfig | None" = Field(
+490|        default=None,
+491|        description=(
+492|            "Source trial this trial derives from. When set with "
+493|            "action='regrade', the trial skips the agent phase: it seeds "
+494|            "its agent logs and artifacts from the source trial, then "
+495|            "re-runs verification against them in a separate verifier "
+496|            "environment. The source trial is never modified."
+497|        ),
+498|    )
+499|
+500|    @property
+(more lines below)

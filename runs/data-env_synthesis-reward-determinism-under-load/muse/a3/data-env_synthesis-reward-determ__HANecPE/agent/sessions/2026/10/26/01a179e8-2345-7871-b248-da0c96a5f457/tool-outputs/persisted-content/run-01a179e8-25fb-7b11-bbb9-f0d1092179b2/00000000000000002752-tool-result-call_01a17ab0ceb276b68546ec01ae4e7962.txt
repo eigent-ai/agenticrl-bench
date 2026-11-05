@@ -1,0 +1,79 @@
+edited
+changed lines: lines 19-43
+--- original
++++ updated
+@@
+-def _start_xorg(display_num: int, timeout: float = 10.0):
+-    """Start Xorg with the dummy driver on *display_num* and wait until ready."""
+-    lock = f"/tmp/.X{display_num}-lock"
+-    if os.path.exists(lock):
+-        try:
+-            os.remove(lock)
+-        except OSError:
+-            pass
+-
+-    proc = subprocess.Popen(
+-        ["Xorg", f":{display_num}", "-config", "/etc/X11/xorg-dummy.conf",
+-         "-noreset", "-ac"],
+-        stdout=subprocess.DEVNULL,
+-        stderr=subprocess.DEVNULL,
+-    )
+-
+-    deadline = time.time() + timeout
+-    while time.time() < deadline:
+-        if os.path.exists(lock):
+-            time.sleep(0.5)
+-            return proc
+-        time.sleep(0.2)
+-
+-    time.sleep(2)
+-    return proc
++def _x_ready(display_num: int) -> bool:
++    """True when the X server on *display_num* accepts a connection."""
++    import socket as _socket
++    s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
++    s.settimeout(2)
++    try:
++        s.connect(f"/tmp/.X11-unix/X{display_num}")
++        return True
++    except OSError:
++        return False
++    finally:
++        s.close()
++
++
++def _start_xorg(display_num: int, timeout: float = 60.0):
++    """Start Xorg with the dummy driver on *display_num* and wait until ready.
++
++    Readiness is polled on the X socket: the lock file appears before the
++    server accepts connections, and under training CPU contention Xorg
++    startup can take far longer than the old fixed 10s window allowed.
++    If Xorg dies, fail fast instead of burning the whole timeout.
++    """
++    lock = f"/tmp/.X{display_num}-lock"
++    sock = f"/tmp/.X11-unix/X{display_num}"
++    for path in (lock, sock):
++        if os.path.exists(path):
++            try:
++                os.remove(path)
++            except OSError:
++                pass
++
++    proc = subprocess.Popen(
++        ["Xorg", f":{display_num}", "-config", "/etc/X11/xorg-dummy.conf",
++         "-noreset", "-ac"],
++        stdout=subprocess.DEVNULL,
++        stderr=subprocess.DEVNULL,
++    )
++
++    deadline = time.time() + timeout
++    while time.time() < deadline:
++        if _x_ready(display_num):
++            return proc
++        if proc.poll() is not None:
++            break
++        time.sleep(0.2)
++
++    raise AssertionError(
++        f"Xorg on :{display_num} never became ready within {timeout}s"
++    )

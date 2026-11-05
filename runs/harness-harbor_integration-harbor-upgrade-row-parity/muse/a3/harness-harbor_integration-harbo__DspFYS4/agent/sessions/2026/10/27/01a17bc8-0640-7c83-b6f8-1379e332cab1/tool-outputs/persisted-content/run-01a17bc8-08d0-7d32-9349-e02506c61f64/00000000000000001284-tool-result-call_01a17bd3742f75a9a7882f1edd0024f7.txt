@@ -1,0 +1,421 @@
+Read text file `/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/trial/artifact_handler.py`.
+1|import json
+2|import logging
+3|import shutil
+4|from collections.abc import Collection, Sequence
+5|from pathlib import Path, PurePath, PurePosixPath
+6|
+7|from harbor.environments.base import BaseEnvironment, EnvironmentPath
+8|from harbor.models.task.artifacts import (
+9|    effective_artifact_service,
+10|    is_convention_entry,
+11|    source_host_path,
+12|    with_convention_entry,
+13|)
+14|from harbor.models.trial.artifact_manifest import (
+15|    ArtifactManifest,
+16|    ArtifactManifestEntry,
+17|)
+18|from harbor.models.trial.config import ArtifactConfig
+19|from harbor.utils.path_safety import directory_move_plan
+20|
+21|_MANIFEST_FILENAME = "manifest.json"
+22|
+23|
+24|def artifact_host_path(artifacts_dir: Path, artifact: ArtifactConfig) -> Path:
+25|    """Canonical host location of an entry under the artifacts dir.
+26|
+27|    Entries with an explicit destination land at that (relative) path;
+28|    all other entries — regardless of service — mirror their absolute
+29|    source path directly under the shared ``artifacts/`` base dir
+30|    (e.g. ``/var/log/x`` → ``artifacts/var/log/x``).
+31|    """
+32|    if artifact.destination:
+33|        return artifacts_dir / _relative_host_destination(artifact.destination)
+34|
+35|    return source_host_path(artifacts_dir, artifact.source)
+36|
+37|
+38|def _relative_host_destination(destination: str) -> Path:
+39|    destination_path = PurePosixPath(destination)
+40|    parts = [part for part in destination_path.parts if part not in ("", "/", "..")]
+41|    return Path(*parts) if parts else Path(".")
+42|
+43|
+44|class ArtifactHandler:
+45|    """Collects artifacts from agent environments and re-materializes them in
+46|    separate verifier environments.
+47|
+48|    Host layout (under the trial's ``artifacts/`` dir) — a single flat base dir
+49|    shared by every compose service:
+50|
+51|    - ``<abs source path>`` — source-derived entries from ANY service, mirrored
+52|      directly under ``artifacts/`` (no per-service subtree). The agent's
+53|      conventional publish dir lands at ``artifacts/logs/artifacts/``.
+54|    - ``<destination>`` — entries with an explicit (relative) destination.
+55|    - ``manifest.json`` — record of every collection attempt.
+56|
+57|    Because services share the base dir, two services that export the same
+58|    source path collide on the host; collection keeps the first and logs a
+59|    warning for the rest (it never overwrites).
+60|
+61|    Verifier-side placement never depends on ``destination``: every entry
+62|    re-materializes at its original ``source`` path ("no translation"), and
+63|    the convention dir maps to the verifier's convention dir.
+64|    """
+65|
+66|    def __init__(
+67|        self,
+68|        *,
+69|        artifacts: Sequence[str | ArtifactConfig],
+70|        logger: logging.Logger,
+71|    ):
+72|        self.artifacts = list(artifacts)
+73|        self.logger = logger
+74|        # (host target path, source) claims, in collection order. Scoped to one
+75|        # collection pass (reset via begin_collection) and persists across that
+76|        # pass's main + sidecar phases, so a later entry whose host path equals
+77|        # or nests with an already-claimed one is warned and skipped instead of
+78|        # overwriting (or polluting) the first claimant's content.
+79|        self._claimed_targets: list[tuple[Path, str]] = []
+80|
+81|    def begin_collection(self) -> None:
+82|        """Reset collision claims at the start of a collection pass.
+83|
+84|        Claims must span the main + sidecar phases of one pass, not the whole
+85|        trial: multi-step trials vacate the shared host artifacts dir between
+86|        steps (outputs are archived under ``steps/<name>/``), so a prior step's
+87|        claims would otherwise skip later entries that no longer collide.
+88|        """
+89|        self._claimed_targets.clear()
+90|
+91|    def _find_conflicting_claim(self, target: Path, source: str) -> str | None:
+92|        """Return the source that already claimed a host path overlapping
+93|        *target* (equal or nested either way), or None. Re-collection of the
+94|        same *source* is never a conflict (multi-step re-runs overwrite their
+95|        own files)."""
+96|        for claimed_target, claimed_source in self._claimed_targets:
+97|            if claimed_source == source:
+98|                continue
+99|            if (
+100|                claimed_target == target
+101|                or claimed_target in target.parents
+102|                or target in claimed_target.parents
+103|            ):
+104|                return claimed_source
+105|        return None
+106|
+107|    @staticmethod
+108|    def move_dir_contents(src: Path, dst: Path) -> None:
+109|        """Move all contents from src to dst, leaving src empty."""
+110|        ArtifactHandler.move_dir_contents_preserving(src, dst, preserve_dirs=[])
+111|
+112|    @staticmethod
+113|    def move_dir_contents_preserving(
+114|        src: Path,
+115|        dst: Path,
+116|        *,
+117|        preserve_dirs: Sequence[Path],
+118|    ) -> None:
+119|        """Move entries while retaining live mount directories and their ancestors."""
+120|        moves = directory_move_plan(src, dst, preserve_dirs=preserve_dirs)
+121|        for item, target in moves:
+122|            target.parent.mkdir(parents=True, exist_ok=True)
+123|            if target.is_junction():
+124|                target.rmdir()
+125|            elif target.exists() or target.is_symlink():
+126|                if target.is_dir() and not target.is_symlink():
+127|                    shutil.rmtree(target)
+128|                else:
+129|                    target.unlink()
+130|            shutil.move(str(item), target)
+131|
+132|    async def download_artifacts(
+133|        self,
+134|        source_env: BaseEnvironment,
+135|        artifacts_dir: Path,
+136|        *,
+137|        source_artifacts_dir: EnvironmentPath,
+138|        artifacts: Sequence[str | ArtifactConfig] | None = None,
+139|        services: Collection[str] | None = None,
+140|    ) -> ArtifactManifest:
+141|        """Best-effort artifact download with a manifest of attempted sources.
+142|
+143|        When *services* is given, only entries targeting those services are
+144|        collected; the manifest on disk accumulates entries across calls so
+145|        a collection split into per-service passes still produces one
+146|        complete manifest.
+147|        """
+148|        artifacts_dir.mkdir(parents=True, exist_ok=True)
+149|        entries: list[ArtifactManifestEntry] = []
+150|        convention_source = self._environment_path_str(source_artifacts_dir)
+151|
+152|        for artifact in self._normalized_artifacts(artifacts, convention_source):
+153|            if (
+154|                services is not None
+155|                and effective_artifact_service(artifact) not in services
+156|            ):
+157|                continue
+158|            entries.append(
+159|                await self._download_artifact(
+160|                    source_env=source_env,
+161|                    artifacts_dir=artifacts_dir,
+162|                    artifact=artifact,
+163|                    convention_source=convention_source,
+164|                )
+165|            )
+166|
+167|        return self._write_manifest(artifacts_dir, entries)
+168|
+169|    async def upload_artifacts(
+170|        self,
+171|        target_env: BaseEnvironment,
+172|        artifacts_dir: Path,
+173|        *,
+174|        source_artifacts_dir: EnvironmentPath,
+175|        target_artifacts_dir: EnvironmentPath,
+176|        artifacts: Sequence[str | ArtifactConfig] | None = None,
+177|    ) -> None:
+178|        """Re-materialize collected artifacts inside a verifier environment.
+179|
+180|        Every entry is uploaded to its original ``source`` path; the
+181|        convention entry is uploaded to the target environment's convention
+182|        dir (which differs from the source's only across OSes). Parent
+183|        directories are created so verifier images do not need to pre-create
+184|        them.
+185|        """
+186|        source_convention = self._environment_path_str(source_artifacts_dir)
+187|        target_convention = self._environment_path_str(target_artifacts_dir)
+188|
+189|        for artifact in self._normalized_artifacts(artifacts, source_convention):
+190|            host_path = self._host_path(artifacts_dir, artifact, source_convention)
+191|            if not host_path.exists():
+192|                continue
+193|
+194|            target_source = self._upload_target_source(
+195|                artifact,
+196|                source_convention=source_convention,
+197|                target_convention=target_convention,
+198|            )
+199|            if host_path.is_dir():
+200|                await target_env.empty_dirs([target_source], chmod=True)
+201|                await target_env.upload_dir(
+202|                    source_dir=host_path,
+203|                    target_dir=target_source,
+204|                )
+205|                continue
+206|
+207|            parent = PurePosixPath(target_source).parent.as_posix()
+208|            if parent and parent != target_source:
+209|                await target_env.ensure_dirs([parent], chmod=True)
+210|            await target_env.upload_file(
+211|                source_path=host_path,
+212|                target_path=target_source,
+213|            )
+214|
+215|    def sidecar_services(
+216|        self,
+217|        artifacts: Sequence[str | ArtifactConfig] | None = None,
+218|    ) -> set[str]:
+219|        """Names of non-main services referenced by the effective artifact set."""
+220|        from harbor.models.task.artifacts import sidecar_services
+221|
+222|        return sidecar_services([*self.artifacts, *(artifacts or [])])
+223|
+224|    def _normalized_artifacts(
+225|        self,
+226|        artifacts: Sequence[str | ArtifactConfig] | None,
+227|        convention_source: str,
+228|    ) -> list[ArtifactConfig]:
+229|        return with_convention_entry(
+230|            [*self.artifacts, *(artifacts or [])],
+231|            convention_source=convention_source,
+232|        )
+233|
+234|    async def _download_artifact(
+235|        self,
+236|        *,
+237|        source_env: BaseEnvironment,
+238|        artifacts_dir: Path,
+239|        artifact: ArtifactConfig,
+240|        convention_source: str,
+241|    ) -> ArtifactManifestEntry:
+242|        source = artifact.source
+243|        service = effective_artifact_service(artifact)
+244|        target = self._host_path(artifacts_dir, artifact, convention_source)
+245|        manifest_destination = self._manifest_destination(artifacts_dir, target)
+246|
+247|        # All services share one flat host base dir, so two services that export
+248|        # the same path map to the same host target. Keep the first claimant and
+249|        # skip later ones rather than overwriting (persists across the main and
+250|        # sidecar collection passes via self._claimed_targets).
+251|        prior = self._find_conflicting_claim(target, source)
+252|        if prior is not None:
+253|            artifact_type = "file" if PurePosixPath(source).suffix else "directory"
+254|            self.logger.warning(
+255|                "Artifact collision: source %r (service %r) maps to host path "
+256|                "%s, which overlaps content already claimed by source %r; "
+257|                "keeping the first and skipping this one.",
+258|                source,
+259|                service,
+260|                target,
+261|                prior,
+262|            )
+263|            return ArtifactManifestEntry(
+264|                source=source,
+265|                destination=manifest_destination,
+266|                type=artifact_type,
+267|                status="skipped",
+268|                service=artifact.service,
+269|                exclude=list(artifact.exclude) if artifact_type == "directory" else [],
+270|            )
+271|        self._claimed_targets.append((target, source))
+272|
+273|        if (
+274|            is_convention_entry(artifact, convention_source)
+275|            and not artifact.destination
+276|            and source_env.capabilities.mounted
+277|            and not artifact.exclude
+278|        ):
+279|            return self._record_mounted_artifacts_dir(
+280|                source=source,
+281|                target=target,
+282|                manifest_destination=manifest_destination,
+283|                service=artifact.service,
+284|                exclude=artifact.exclude,
+285|            )
+286|
+287|        try:
+288|            is_dir = await source_env.service_is_dir(
+289|                source, service=artifact.service, user="root"
+290|            )
+291|        except Exception:
+292|            is_dir = not Path(source).suffix
+293|
+294|        try:
+295|            if is_dir:
+296|                target.mkdir(parents=True, exist_ok=True)
+297|                if artifact.exclude:
+298|                    await source_env.service_download_dir_with_exclusions(
+299|                        source_dir=source,
+300|                        target_dir=target,
+301|                        exclude=artifact.exclude,
+302|                        service=artifact.service,
+303|                    )
+304|                else:
+305|                    await source_env.service_download_dir(
+306|                        source_dir=source,
+307|                        target_dir=target,
+308|                        service=artifact.service,
+309|                    )
+310|                artifact_type = "directory"
+311|            else:
+312|                target.parent.mkdir(parents=True, exist_ok=True)
+313|                await source_env.service_download_file(
+314|                    source_path=source,
+315|                    target_path=target,
+316|                    service=artifact.service,
+317|                )
+318|                artifact_type = "file"
+319|
+320|            return ArtifactManifestEntry(
+321|                source=source,
+322|                destination=manifest_destination,
+323|                type=artifact_type,
+324|                status="ok",
+325|                service=artifact.service,
+326|                exclude=list(artifact.exclude) if is_dir else [],
+327|            )
+328|        except Exception:
+329|            self.logger.debug(
+330|                f"Failed to download artifact '{source}' from service "
+331|                f"'{service}' (best-effort)",
+332|                exc_info=True,
+333|            )
+334|            return ArtifactManifestEntry(
+335|                source=source,
+336|                destination=manifest_destination,
+337|                type="directory" if is_dir else "file",
+338|                status="failed",
+339|                service=artifact.service,
+340|                exclude=list(artifact.exclude) if is_dir else [],
+341|            )
+342|
+343|    def _record_mounted_artifacts_dir(
+344|        self,
+345|        *,
+346|        source: str,
+347|        target: Path,
+348|        manifest_destination: str,
+349|        service: str | None,
+350|        exclude: Sequence[str],
+351|    ) -> ArtifactManifestEntry:
+352|        has_contents = target.exists() and any(target.iterdir())
+353|        return ArtifactManifestEntry(
+354|            source=source,
+355|            destination=manifest_destination,
+356|            type="directory",
+357|            status="ok" if has_contents else "empty",
+358|            service=service,
+359|            exclude=list(exclude),
+360|        )
+361|
+362|    def _host_path(
+363|        self,
+364|        artifacts_dir: Path,
+365|        artifact: ArtifactConfig,
+366|        convention_source: str,
+367|    ) -> Path:
+368|        return artifact_host_path(artifacts_dir, artifact)
+369|
+370|    def _upload_target_source(
+371|        self,
+372|        artifact: ArtifactConfig,
+373|        *,
+374|        source_convention: str,
+375|        target_convention: str,
+376|    ) -> str:
+377|        if is_convention_entry(artifact, source_convention):
+378|            return target_convention
+379|        return artifact.source
+380|
+381|    @staticmethod
+382|    def _environment_path_str(path: EnvironmentPath) -> str:
+383|        if isinstance(path, PurePath):
+384|            return path.as_posix()
+385|        return path
+386|
+387|    def _manifest_destination(self, artifacts_dir: Path, target: Path) -> str:
+388|        if target == artifacts_dir:
+389|            return "artifacts"
+390|        return f"artifacts/{target.relative_to(artifacts_dir).as_posix()}"
+391|
+392|    def _write_manifest(
+393|        self,
+394|        artifacts_dir: Path,
+395|        new_entries: list[ArtifactManifestEntry],
+396|    ) -> ArtifactManifest:
+397|        """Write the manifest, appending to entries from earlier passes."""
+398|        manifest_path = artifacts_dir / _MANIFEST_FILENAME
+399|
+400|        existing_entries: list[ArtifactManifestEntry] = []
+401|        if manifest_path.exists():
+402|            try:
+403|                existing_entries = [
+404|                    ArtifactManifestEntry.model_validate(entry)
+405|                    for entry in json.loads(manifest_path.read_text())
+406|                ]
+407|            except Exception:
+408|                self.logger.debug(
+409|                    "Failed to read existing artifacts manifest", exc_info=True
+410|                )
+411|
+412|        manifest = ArtifactManifest(entries=[*existing_entries, *new_entries])
+413|        if not manifest.entries:
+414|            return manifest
+415|
+416|        try:
+417|            manifest_path.write_text(json.dumps(manifest.to_json_data(), indent=2))
+418|        except Exception:
+419|            self.logger.debug("Failed to write artifacts manifest", exc_info=True)
+420|        return manifest

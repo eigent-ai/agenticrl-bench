@@ -1,0 +1,131 @@
+"""Utilities for loss function snapshot testing.
+
+Provides deterministic input generation, snapshot save/load, and recursive
+tensor comparison. Designed to be reusable across refactors — any code path
+that implements the same function signatures can be validated against snapshots.
+
+Usage:
+    # Generate inputs for a config
+    parallel_state = make_parallel_state()
+    args = make_args(advantage_estimator="grpo", loss_type="policy_loss")
+    inputs = make_inputs(seed=42, batch_size=3, prompt_lens=[20, 64, 40],
+                         response_lens=[10, 48, 32], vocab_size=128, args=args)
+
+    # Run functions, collect outputs
+    outputs = run_all_functions(args, parallel_state, inputs)
+
+    # Save / load
+    save_snapshot(path, inputs, outputs)
+    loaded_inputs, loaded_outputs = load_snapshot(path)
+"""
+
+from __future__ import annotations
+
+import copy
+import subprocess
+from argparse import Namespace
+from pathlib import Path
+
+import torch
+import torch.distributed as dist
+
+from miles.backends.training_utils.parallel import GroupInfo, ParallelState, set_parallel_state
+
+ARTIFACTS_REPO = "https://github.com/yueming-yuan/miles-artifacts.git"
+ARTIFACTS_CACHE = Path.home() / ".cache" / "miles-test-artifacts"
+
+
+# ---------------------------------------------------------------------------
+# ParallelState (single-process, no distributed)
+# ---------------------------------------------------------------------------
+
+
+def make_parallel_state(is_pp_last_stage: bool = True) -> ParallelState:
+    def _trivial_group() -> GroupInfo:
+        return GroupInfo(rank=0, size=1, group=None)
+
+    # The fused vocab-parallel CE needs a real group object; use the 1-rank
+    # world group when the test initialized one.
+    tp_group = dist.group.WORLD if dist.is_initialized() else None
+    state = ParallelState(
+        intra_dp=_trivial_group(),
+        intra_dp_cp=_trivial_group(),
+        cp=_trivial_group(),
+        tp=GroupInfo(rank=0, size=1, group=tp_group),
+        pp=_trivial_group() if is_pp_last_stage else GroupInfo(rank=0, size=2, group=None),
+        ep=_trivial_group(),
+        etp=_trivial_group(),
+        indep_dp=_trivial_group(),
+        is_pp_last_stage=is_pp_last_stage,
+    )
+    set_parallel_state(state)
+    return state
+
+
+# ---------------------------------------------------------------------------
+# Args
+# ---------------------------------------------------------------------------
+
+_ARGS_DEFAULTS = dict(
+    # get_responses / get_log_probs_and_entropy / get_values
+    qkv_format="thd",
+    rollout_temperature=1.0,
+    allgather_cp=False,
+    log_probs_chunk_size=-1,
+    true_on_policy_mode=True,
+    debug_unified_grad_fused_logprob=False,
+    # compute_advantages_and_returns
+    advantage_estimator="grpo",
+    use_rollout_logprobs=False,
+    use_sampling_support_replay=False,
+    skip_actor_forward_only=False,
+    kl_coef=0.1,
+    kl_loss_type="k1",
+    gamma=1.0,
+    lambd=0.95,
+    normalize_advantages=False,
+    # on-policy distillation (OPD); orthogonal to the advantage estimator
+    use_opd=False,
+    opd_type=None,
+    opd_kl_coef=1.0,
+    # policy_loss_function
+    loss_type="policy_loss",
+    eps_clip=0.2,
+    eps_clip_high=0.2,
+    entropy_coef=0.01,
+    use_kl_loss=False,
+    kl_loss_coef=0.0,
+    use_unbiased_kl=False,
+    use_tis=False,
+    get_mismatch_metrics=False,
+    tis_clip=1.5,
+    tis_clip_low=0.5,
+    custom_tis_function_path=None,
+    custom_pg_loss_reducer_function_path=None,
+    use_opsm=False,
+    opsm_delta=0.1,
+    calculate_per_token_loss=False,
+    # value_loss_function
+    value_clip=0.2,
+    # loss_function dispatcher
+    global_batch_size=1,  # overridden by make_inputs
+    use_dynamic_global_batch_size=False,
+    recompute_loss_function=False,
+)
+
+
+def make_args(**overrides) -> Namespace:
+    d = {**_ARGS_DEFAULTS, **overrides}
+    return Namespace(**d)
+
+conftest.py
+__init__.py
+loss_test_utils.py
+README.md
+test_advantages_pp_stage_guard.py
+test_loss_cp2_consistency.py
+test_loss_snapshot.py
+test_opd.py
+test_tinker_explicit_targets.py
+test_tinker_loss_outputs.py
+test_training_logprob_reuse.py

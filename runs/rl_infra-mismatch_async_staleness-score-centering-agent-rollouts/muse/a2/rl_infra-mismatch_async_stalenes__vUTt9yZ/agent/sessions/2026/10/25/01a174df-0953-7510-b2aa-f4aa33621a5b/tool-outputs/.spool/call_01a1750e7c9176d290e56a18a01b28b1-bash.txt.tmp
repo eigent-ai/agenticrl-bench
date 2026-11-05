@@ -1,0 +1,71 @@
+                    correct_total_lengths, correct_response_lengths, correct_loss_masks, denominators=None
+                )
+                correct_entropy = sum_of_sample_mean(torch.cat(correct_entropy, dim=0))
+                rollout_data["correct_entropy"] = [correct_entropy.item()] * num_correct_responses
+            else:
+                rollout_data["correct_entropy"] = [0] * num_correct_responses
+
+
+def log_multi_turn_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatch) -> None:
+    """
+    Log multi-turn auxiliary metrics such as raw/observed response lengths and rounds.
+
+    Operates only on PP last stage and TP rank 0. Uses GPU tensors when available
+    to compute statistics without host transfers.
+    """
+    parallel_state = get_parallel_state()
+    if parallel_state.tp.rank == 0 and parallel_state.is_pp_last_stage:
+        log_dict = {}
+        for key, val in rollout_data.items():
+            if key == "loss_masks":
+                if val:  # Check if val is not empty
+                    device = val[0].device  # Get device from first tensor
+
+                    # Vectorized length calculation using torch
+                    raw_response_lengths = torch.tensor([v.shape[0] for v in val], dtype=torch.float32, device=device)
+                    log_dict["raw_response_length/response_length_mean"] = raw_response_lengths.mean().item()
+                    log_dict["raw_response_length/response_length_max"] = raw_response_lengths.max().item()
+                    log_dict["raw_response_length/response_length_min"] = raw_response_lengths.min().item()
+                    log_dict["raw_response_length/response_length_clip_ratio"] = (
+                        (raw_response_lengths >= args.rollout_max_response_len).float().mean().item()
+                    )
+
+                    # Vectorized sum calculation using torch - stay on GPU
+                    wo_obs_response_lengths = torch.tensor(
+                        [v.sum().item() for v in val], dtype=torch.float32, device=device
+                    )
+                    log_dict["wo_obs_response_length/response_length_mean"] = wo_obs_response_lengths.mean().item()
+                    log_dict["wo_obs_response_length/response_length_max"] = wo_obs_response_lengths.max().item()
+                    log_dict["wo_obs_response_length/response_length_min"] = wo_obs_response_lengths.min().item()
+            if key == "round_number":
+                # Use numpy for vectorized round number statistics
+                round_number_array = np.array(val)
+                log_dict["multi_turn_metric/round_number_mean"] = np.mean(round_number_array)
+                log_dict["multi_turn_metric/round_number_max"] = np.max(round_number_array)
+                log_dict["multi_turn_metric/round_number_min"] = np.min(round_number_array)
+        gather_log_data(
+            "multi_turn",
+            args,
+            rollout_id,
+            log_dict,
+            reduction_by_key=_MULTI_TURN_REDUCTION_BY_KEY,
+        )
+
+
+def log_perf_data(rollout_id: int, args: Namespace, extra_metrics: dict | None = None) -> None:
+    parallel_state = get_parallel_state()
+    perf.log_perf_data_raw(
+        rollout_id=rollout_id,
+        args=args,
+        is_primary_rank=(
+            parallel_state.tp.rank == 0
+            and parallel_state.is_pp_last_stage
+            and parallel_state.effective_dp_cp.rank == 0
+        ),
+        compute_total_fwd_flops=lambda seq_lens: fwd_tflops_per_gpu(seq_lens, args, dist.get_world_size()),
+        extra_metrics=extra_metrics,
+    )
+
+
+def log_cpu_memory(rollout_id: int, args: Namespace, label: str) -> None:
+    """Log current system CPU memory usage to wandb/tensorboard.

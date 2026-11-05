@@ -1,0 +1,63 @@
+1499:        _global_state.tokenizer_manager.abort_request(abort_all=True)
+1686:@app.post("/abort_request")
+1688:async def abort_request(obj: Annotated[AbortReq, Body()], request: Request):
+1691:        _global_state.tokenizer_manager.abort_request(
+191:from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
+1116:    if not get_serving().admin_api_key:
+1117:        return _admin_api_key_missing_response()
+1148:    if not get_serving().admin_api_key:
+1149:        return _admin_api_key_missing_response()
+1172:    if not get_serving().admin_api_key:
+1173:        return _admin_api_key_missing_response()
+2182:# (even when neither api-key nor admin-api-key is configured).
+2184:# For now, we simulate ADMIN_FORCE by explicitly checking the admin API key parameter.
+2186:# admin endpoints, we should switch this logic to use ADMIN_FORCE directly.
+2187:def _admin_api_key_missing_response(
+2193:                "This endpoint requires admin API key, but this server was started "
+2194:                "without one (admin-api-key). Restart with --admin-api-key to enable."
+2465:    freeze_key = get_serving().admin_api_key or get_serving().api_key
+2672:        #   admin_api_key is not configured.
+2675:            or get_serving().admin_api_key
+2676:            or app_has_admin_force_endpoints(app)
+2683:                admin_api_key=get_serving().admin_api_key,
+                    f"routed_dp_rank={obj.routed_dp_rank} is ignored because num_dp_ranks={num_dp_ranks}"
+                )
+            elif obj.routed_dp_rank < 0 or obj.routed_dp_rank >= num_dp_ranks:
+                raise ValueError(
+                    f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {num_dp_ranks})"
+                )
+
+        self._init_req_state(obj, request)
+        request_states = {
+            rid: self.rid_to_state[rid]
+            for rid in ([obj.rid] if obj.is_single else obj.rid)
+        }
+        try:
+            if get_disagg().language_only:
+                self._handle_epd_disaggregation_encode_request(obj)
+
+            # Log the request
+            self.request_logger.log_received_request(obj, self.tokenizer, request)
+
+            async with self.is_pause_cond:
+                await self.is_pause_cond.wait_for(lambda: not self.is_pause)
+
+            async with self.model_update_lock.reader_lock:
+                await self._validate_and_resolve_lora(obj)
+
+                # Tokenize the request and send it to the scheduler
+                if obj.is_single:
+                    tokenized_obj = await self._tokenize_one_request(obj)
+                    state = self.rid_to_state[obj.rid]
+                    if obj.return_prompt_token_ids:
+                        state.prompt_token_ids = list(tokenized_obj.input_ids)
+                    await self._send_one_request(tokenized_obj)
+                    async for response in self._wait_one_response(obj, request):
+                        yield response
+                else:
+                    async for response in self._handle_batch_request(
+                        obj, request, request_states
+                    ):
+                        yield response
+        except BaseException:
+            # _init_req_state created a rid_to_state entry per (sub-)request up

@@ -1,0 +1,102 @@
+{#- Terminal-agent template (based on GLM-4.7-Flash's). Two changes for long terminal episodes:
+    1. reasoning is rendered for the 2 most recent assistant turns (and, as upstream, for every turn after the last
+       user turn); clear_thinking=false keeps all of it, as upstream;
+    2. user turns older than the 4 most recent ones (except the first, the task) keep only their first 400
+       characters. -#}
+[gMASK]<sop>
+{%- if tools -%}
+<|system|>
+# Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+{% for tool in tools %}
+{{ tool | tojson(ensure_ascii=False) }}
+{% endfor %}
+</tools>
+
+For each function call, output the function name and arguments within the following XML format:
+<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>{%- endif -%}
+{%- macro visible_text(content) -%}
+    {%- if content is string -%}
+        {{- content }}
+    {%- elif content is iterable and content is not mapping -%}
+        {%- for item in content -%}
+            {%- if item is mapping and item.type == 'text' -%}
+                {{- item.text }}
+            {%- elif item is string -%}
+                {{- item }}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- else -%}
+        {{- content }}
+    {%- endif -%}
+{%- endmacro -%}
+{%- set ns = namespace(last_user_index=-1, n_assistant=0, seen_assistant=0, n_user=0, seen_user=0) %}
+{%- for m in messages %}
+    {%- if m.role == 'user' %}
+        {% set ns.last_user_index = loop.index0 -%}
+        {%- set ns.n_user = ns.n_user + 1 %}
+    {%- endif %}
+    {%- if m.role == 'assistant' %}
+        {%- set ns.n_assistant = ns.n_assistant + 1 %}
+    {%- endif %}
+{%- endfor %}
+{% for m in messages %}
+{%- if m.role == 'user' -%}
+{%- set ns.seen_user = ns.seen_user + 1 -%}
+{%- set utext = visible_text(m.content) -%}
+{%- if ns.seen_user > 1 and ns.seen_user <= ns.n_user - 4 and utext|length > 400 -%}
+{%- set utext = utext[:400] + '\n[... ' ~ (utext|length - 400) ~ ' more characters of earlier output ...]' -%}
+{%- endif -%}
+<|user|>{{ utext }}
+{%- elif m.role == 'assistant' -%}
+<|assistant|>
+{%- set reasoning_content = '' %}
+{%- set content = visible_text(m.content) %}
+{%- if m.reasoning_content is string %}
+    {%- set reasoning_content = m.reasoning_content %}
+{%- else %}
+    {%- if '</think>' in content %}
+        {%- set reasoning_content = content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n') %}
+        {%- set content = content.split('</think>')[-1].lstrip('\n') %}
+    {%- endif %}
+{%- endif %}
+{%- set ns.seen_assistant = ns.seen_assistant + 1 %}
+{%- if ((clear_thinking is defined and not clear_thinking) or loop.index0 > ns.last_user_index or ns.seen_assistant > ns.n_assistant - 2) and reasoning_content -%}
+{{ '<think>' + reasoning_content.strip() +  '</think>'}}
+{%- else -%}
+{{ '</think>' }}
+{%- endif -%}
+{%- if content.strip() -%}
+{{ content.strip() }}
+{%- endif -%}
+{% if m.tool_calls %}
+{% for tc in m.tool_calls %}
+{%- if tc.function %}
+    {%- set tc = tc.function %}
+{%- endif %}
+{{- '<tool_call>' + tc.name -}}
+{% set _args = tc.arguments %}{% for k, v in _args.items() %}<arg_key>{{ k }}</arg_key><arg_value>{{ v | tojson(ensure_ascii=False) if v is not string else v }}</arg_value>{% endfor %}</tool_call>{% endfor %}
+{% endif %}
+{%- elif m.role == 'tool' -%}
+{%- if m.content is string -%}
+{%- if loop.first or (messages[loop.index0 - 1].role != "tool") %}
+    {{- '<|observation|>' }}
+{%- endif %}
+{{- '<tool_response>' }}
+{{- m.content }}
+{{- '</tool_response>' }}
+{%- else -%}
+<|observation|>{% for tr in m.content %}
+<tool_response>{{ tr.output if tr.output is defined else tr }}</tool_response>{% endfor -%}
+{% endif -%}
+{%- elif m.role == 'system' -%}
+<|system|>{{ visible_text(m.content) }}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    <|assistant|>{{- '</think>' if (enable_thinking is defined and not enable_thinking) else '<think>' -}}
+{%- endif -%}

@@ -1,0 +1,2 @@
+- [Score centering for the SQL agent](score-centering-sql-agent.md) — what was built in /app/miles, key design choices, measured memory vs PPO
+- [Offline dev box testing](offline-dev-box-testing.md) — HF_HUB_OFFLINE for fast failures, environmental baseline, snapshot trick, tool quirks

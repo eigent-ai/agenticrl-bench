@@ -1,0 +1,223 @@
+Read text file `/opt/verl/verl/workers/engine/fsdp/transformer_impl.py`.
+(699 line(s) above)
+700|        unsharded gradients until the final backward.
+701|        """
+702|        defer_sync = getattr(
+703|            self.engine_config,
+704|            "use_no_sync_for_gradient_accumulation",
+705|            True,
+706|        )
+707|        if is_last_micro_batch or not defer_sync:
+708|            yield
+709|            return
+710|
+711|        version = fsdp_version(self.module)
+712|        if version == 1:
+713|            with self.module.no_sync():
+714|                yield
+715|        elif version == 2:
+716|            self.module.set_requires_gradient_sync(False)
+717|            try:
+718|                yield
+719|            finally:
+720|                self.module.set_requires_gradient_sync(True)
+721|        else:
+722|            yield
+723|
+724|    def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> list[TensorDict]:
+725|        # note that the global_batch_size should include data on all the dp
+726|        tu.assign_non_tensor(data, sp_size=self.ulysses_sequence_parallel_size)
+727|        return_model_output = tu.get_non_tensor_data(data=data, key="return_model_output", default=False)
+728|
+729|        # compute num_tokens in global batch for loss normalization
+730|        batch_num_tokens = data["loss_mask"].sum().to(get_device_id())
+731|        torch.distributed.all_reduce(
+732|            batch_num_tokens, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
+733|        )
+734|        tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
+735|        tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
+736|
+737|        micro_batches, indices = prepare_micro_batches(
+738|            data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
+739|        )
+740|
+741|        output_lst = []
+742|
+743|        ctx = torch.no_grad() if forward_only else nullcontext()
+744|
+745|        # getattr fallback: some subclasses (e.g. VeOmniEngine) bypass FSDPEngine.__init__
+746|        # and _build_fsdp_module, so self.scaler may not be set.
+747|        scaler = getattr(self, "scaler", None)
+748|
+749|        for micro_batch_idx, micro_batch in enumerate(micro_batches):
+750|            sync_ctx = (
+751|                nullcontext()
+752|                if forward_only
+753|                else self._gradient_sync_context(is_last_micro_batch=micro_batch_idx == len(micro_batches) - 1)
+754|            )
+755|            # Name each micro-batch in the trace. Without this a forward-only stage
+756|            # (compute_log_prob / compute_ref_log_prob) is a single row with anonymous forwards
+757|            # inside; here every micro-batch forward (and, when training, its backward) becomes a
+758|            # distinguishable "micro_batch<i>" row -- nested under the update loop's "mini_batch<i>"
+759|            # when training, or directly under the stage for log-prob.
+760|            with ctx, sync_ctx, torch.profiler.record_function(f"micro_batch{micro_batch_idx}"):
+761|                loss, meta_info = self.forward_step(micro_batch, loss_function=loss_function, forward_only=forward_only)
+762|
+763|                if not forward_only:
+764|                    if scaler is not None:
+765|                        scaler.scale(loss).backward()
+766|                    else:
+767|                        loss.backward()
+768|                    if not return_model_output:
+769|                        # Standard training discards model_output (train_batch pops it); keeping it accumulates
+770|                        # full-length nested tensors across the mini-batch (∝ ppo_mini_batch * rollout_n) → OOM.
+771|                        # Specialized callers such as Tinker may opt in when their response requires these outputs.
+772|                        meta_info.pop("model_output", None)
+773|
+774|            output_lst.append(meta_info)
+775|
+776|        # postprocess and return
+777|        return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
+778|
+779|    def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
+780|        raise NotImplementedError("forward_step must be implemented in subclass")
+781|
+782|    def optimizer_zero_grad(self):
+783|        """
+784|        Zero gradients and enforce FSDP grad-clipping logic.
+785|        """
+786|        self.optimizer.zero_grad()
+787|
+788|    def optimizer_step(self):
+789|        """
+790|        Clip gradients, skip update if non-finite, and step optimizer.
+791|
+792|        Returns:
+793|            grad_norm (float): Norm of gradients before clipping.
+794|        """
+795|        assert self.optimizer_config.clip_grad is not None
+796|
+797|        # getattr fallback: some subclasses (e.g. VeOmniEngine) bypass FSDPEngine.__init__.
+798|        scaler = getattr(self, "scaler", None)
+799|
+800|        # Unscale gradients before clip so the clip threshold is applied to true gradient
+801|        # magnitudes, not scaled ones. scaler.step() will skip the update if any grad is inf/nan.
+802|        if scaler is not None:
+803|            scaler.unscale_(self.optimizer)
+804|
+805|        if isinstance(self.module, FSDP):
+806|            grad_norm = self.module.clip_grad_norm_(self.optimizer_config.clip_grad)
+807|        elif isinstance(self.module, FSDPModule):
+808|            grad_norm = fsdp2_clip_grad_norm_(self.module.parameters(), max_norm=self.optimizer_config.clip_grad)
+809|        else:
+810|            grad_norm = torch.nn.utils.clip_grad_norm_(
+811|                self.module.parameters(), max_norm=self.optimizer_config.clip_grad
+812|            )
+813|
+814|        if isinstance(grad_norm, DTensor):
+815|            grad_norm = grad_norm.full_tensor()
+816|
+817|        if scaler is not None:
+818|            # scaler handles inf/nan skipping internally via _check_inf_per_device.
+819|            scaler.step(self.optimizer)
+820|            scaler.update()
+821|        else:
+822|            # if grad_norm is not finite, skip the update
+823|            if not torch.isfinite(grad_norm):
+824|                print(f"WARN: grad_norm is not finite: {grad_norm}")
+825|                self.optimizer.zero_grad()
+826|            else:
+827|                self.optimizer.step()
+828|
+829|        if self._qat_enabled:
+830|            from verl.utils.qat.core import invalidate_all_scales
+831|
+832|            invalidate_all_scales(self.module)
+833|
+834|        return grad_norm.item()
+835|
+836|    def lr_scheduler_step(self):
+837|        """
+838|        Advance FSDP scheduler and return updated learning rate.
+839|        """
+840|        self.lr_scheduler.step()
+841|        lr = self.lr_scheduler.get_last_lr()[0]  # only return the first group
+842|        return lr
+843|
+844|    def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
+845|        """
+846|        Move FSDP model and/or optimizer to CPU or GPU with offload support.
+847|        Note that this function executes irrespective of offload config. It serves as manual control
+848|        """
+849|        super().to(device=device, model=model, optimizer=optimizer, grad=grad)
+850|
+851|        if self.engine_config.forward_only:
+852|            # force cpu_offload
+853|            return
+854|
+855|        device_name = get_device_name()
+856|
+857|        assert device in (device_name, "cpu")
+858|        if device == device_name:
+859|            if model:
+860|                load_fsdp_model_to_gpu(self.module)
+861|            if optimizer and self.optimizer is not None:
+862|                load_fsdp_optimizer(self.optimizer, device)
+863|        elif device == "cpu":
+864|            if model:
+865|                offload_fsdp_model_to_cpu(self.module)
+866|            if optimizer and self.optimizer is not None:
+867|                offload_fsdp_optimizer(self.optimizer)
+868|        else:
+869|            raise ValueError(f"Invalid device type: {device}")
+870|
+871|    def save_checkpoint(
+872|        self,
+873|        local_path: str,
+874|        hdfs_path: Optional[str] = None,
+875|        global_step: int = 0,
+876|        max_ckpt_to_keep: Optional[int] = None,
+877|        **kwargs,
+878|    ) -> None:
+879|        """
+880|        Save FSDP checkpoint, handling parameter offload as needed.
+881|        """
+882|        origin_module_device = next(self.module.parameters()).device.type
+883|        if (self._is_offload_param or origin_module_device == "cpu") and not getattr(
+884|            self, "_uses_fsdp2_cpu_offload_policy", False
+885|        ):
+886|            load_fsdp_model_to_gpu(self.module)
+887|
+888|        self.checkpoint_manager.save_checkpoint(
+889|            local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
+890|        )
+891|
+892|        torch.distributed.barrier()
+893|        if self._is_offload_param:
+894|            offload_fsdp_model_to_cpu(self.module)
+895|
+896|    def load_checkpoint(
+897|        self, local_path: str, hdfs_path: Optional[str] = None, del_local_after_load: int = True, **kwargs
+898|    ) -> None:
+899|        """
+900|        Load FSDP checkpoint, restoring parameters and optimizer state.
+901|        """
+902|        import torch
+903|
+904|        if self._is_offload_param:
+905|            load_fsdp_model_to_gpu(self.module)
+906|
+907|        self.checkpoint_manager.load_checkpoint(
+908|            local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load
+909|        )
+910|
+911|        torch.distributed.barrier()
+912|        if self._is_offload_param:
+913|            offload_fsdp_model_to_cpu(self.module)
+914|
+915|        if self._is_offload_optimizer:
+916|            offload_fsdp_optimizer(self.optimizer)
+917|
+918|    def get_per_tensor_param_shard(self, **kwargs):
+919|        """Like :meth:`get_per_tensor_param`, but yields each rank's *local* FSDP shard
+(more lines below)

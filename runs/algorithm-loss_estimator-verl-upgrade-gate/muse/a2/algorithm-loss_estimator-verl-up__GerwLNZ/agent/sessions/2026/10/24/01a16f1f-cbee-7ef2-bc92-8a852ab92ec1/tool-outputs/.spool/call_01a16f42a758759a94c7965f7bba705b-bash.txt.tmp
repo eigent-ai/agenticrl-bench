@@ -1,0 +1,21 @@
+            )
+            metrics.update(off_policy_metrics)
+            batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+            self.on_sample_end()
+
+        # 2. [OPTIONAL] compute reward score with colocated reward model
+        if self.reward_loop_manager.reward_loop_worker_handles is None:
+            with marked_timer("reward", timing_raw, color="yellow"):
+                batch = self._compute_reward_colocate(batch, metrics=metrics)
+
+        # 3. balance batch across data parallel groups
+        batch = self._balance_batch(batch, metrics=metrics)
+
+        # 4. compute old_log_prob
+        with marked_timer("old_log_prob", timing_raw, color="blue"):
+            batch = self._compute_old_log_prob(batch, metrics=metrics)
+
+        # 5. [OPTIONAL] compute ref_log_prob
+        if self.use_reference_policy:
+            with marked_timer("ref", timing_raw, color="olive"):
+                batch = self._compute_ref_log_prob(batch, metrics=metrics)

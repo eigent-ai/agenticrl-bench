@@ -1,0 +1,100 @@
+#!/bin/bash
+SNAPSHOT_DIR="/var/lib/pkg-tracker"
+SNAPSHOT_FILE="$SNAPSHOT_DIR/baseline.snap"
+ARCHIVE_DIR="/var/cache/pkg-archive"
+REPORT_FILE="$SNAPSHOT_DIR/drift-report.json"
+
+snapshot() {
+    mkdir -p "$SNAPSHOT_DIR"
+    local pkg_list="$SNAPSHOT_DIR/tracked-packages.list"
+    if [ ! -f "$pkg_list" ]; then
+        echo "No tracked packages list found at $pkg_list" >&2; exit 1
+    fi
+    : > "$SNAPSHOT_FILE"
+    while read -r pkg; do
+        ver=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null)
+        [ -n "$ver" ] && echo "$pkg $ver" >> "$SNAPSHOT_FILE"
+    done < "$pkg_list"
+    echo "Snapshot saved to $SNAPSHOT_FILE"
+}
+
+diff_packages() {
+    [ ! -f "$SNAPSHOT_FILE" ] && { echo "No baseline snapshot found." >&2; exit 1; }
+    local found=0
+    while IFS=' ' read -r pkg snap_ver; do
+        current_ver=$(dpkg -l "$pkg" 2>/dev/null | grep "^ii" | tr -s ' ' | cut -d' ' -f4)
+        if [ -n "$current_ver" ] && [ "$current_ver" != "$snap_ver" ]; then
+            echo "DRIFT: $pkg (baseline=$snap_ver, current=$current_ver)"
+            found=1
+        fi
+    done < "$SNAPSHOT_FILE"
+    [ "$found" -eq 0 ] && echo "No drift detected."
+}
+
+restore() {
+    [ ! -f "$SNAPSHOT_FILE" ] && { echo "No baseline snapshot found." >&2; exit 1; }
+    local errors=0
+    while IFS=' ' read -r pkg snap_ver; do
+        current_ver=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null)
+        if [ "$current_ver" != "$snap_ver" ]; then
+            deb_file="$ARCHIVE_DIR/${pkg}_${snap_ver}_amd64.deb"
+            if [ -f "$deb_file" ]; then
+                echo "Restoring $pkg: $current_ver -> $snap_ver"
+                dpkg -i --force-downgrade "$deb_file" 2>&1 | tail -1
+            else
+                echo "ERROR: $deb_file not found" >&2
+                errors=$((errors + 1))
+            fi
+        fi
+    done < "$SNAPSHOT_FILE"
+    [ "$errors" -eq 0 ] && echo "Restore complete." || echo "Restore finished with $errors error(s)." >&2
+}
+
+report() {
+    [ ! -f "$SNAPSHOT_FILE" ] && { echo "No baseline snapshot found." >&2; exit 1; }
+    python3 - <<'PYEOF'
+import subprocess, json
+from datetime import datetime, timezone
+
+baseline = {}
+with open("/var/lib/pkg-tracker/baseline.snap") as f:
+    for line in f:
+        parts = line.strip().split()
+        if len(parts) == 2:
+            baseline[parts[0]] = parts[1]
+
+result = subprocess.run(
+    ["dpkg-query", "-W", "-f=${Package} ${Version}\n"],
+    capture_output=True, text=True
+)
+current = {}
+for line in result.stdout.strip().split('\n'):
+    parts = line.split()
+    if len(parts) >= 2:
+        current[parts[0]] = parts[1]
+
+drifted = []
+clean = []
+for pkg, snap_ver in sorted(baseline.items()):
+    curr_ver = current.get(pkg, "")
+    if curr_ver != snap_ver:
+        drifted.append({"package": pkg, "baseline": snap_ver, "current": curr_ver or "not installed"})
+
+output = {
+    "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "drifted_count": len(drifted),
+    "clean_count": len(clean),
+    "drifted": drifted,
+    "clean": clean
+}
+print(json.dumps(output, indent=2))
+PYEOF
+}
+
+case "$1" in
+    snapshot) snapshot ;;
+    diff)     diff_packages ;;
+    restore)  restore ;;
+    report)   report > "$REPORT_FILE" && echo "Report written to $REPORT_FILE" ;;
+    *)        echo "Usage: pkg-tracker {snapshot|diff|restore|report}" >&2; exit 1 ;;
+esac

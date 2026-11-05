@@ -1,0 +1,100 @@
+reference/harbor-0.23.0/harbor/trial/multi_step.py:111:        if step_result.exception_info is not None:
+reference/harbor-0.23.0/harbor/trial/multi_step.py:177:            step_result.exception_info = ExceptionInfo.from_exception(exc)
+reference/harbor-0.23.0/harbor/trial/multi_step.py:186:        if step_result.exception_info and not step_result.verifier_result:
+reference/harbor-0.23.0/harbor/trial/multi_step.py:303:            step_result.exception_info = ExceptionInfo.from_exception(exc)
+reference/harbor-0.23.0/harbor/trial/multi_step.py:310:        if step.healthcheck is None or step_result.exception_info is not None:
+reference/harbor-0.23.0/harbor/trial/multi_step.py:317:            step_result.exception_info = ExceptionInfo.from_exception(exc)
+reference/harbor-0.23.0/harbor/trial/queue.py:205:            if result.exception_info is None:
+reference/harbor-0.23.0/harbor/trial/queue.py:208:            if not self._should_retry_exception(result.exception_info.exception_type):
+reference/harbor-0.23.0/harbor/trial/queue.py:228:                f"{result.exception_info.exception_type}. Retrying in "
+reference/harbor-0.23.0/harbor/trial/regrade.py:752:                verifier_failures.append((step.name, step_result.exception_info))
+reference/harbor-0.23.0/harbor/trial/regrade.py:754:                step_result.exception_info = source_agent_exception
+reference/harbor-0.23.0/harbor/trial/regrade.py:768:                self.result.exception_info = ExceptionInfo.from_exception(failure)
+reference/harbor-0.23.0/harbor/trial/regrade.py:783:        exception = source_step_result.exception_info
+reference/harbor-0.23.0/harbor/trial/trial.py:474:        if self.result.exception_info is not None:
+reference/harbor-0.23.0/harbor/trial/trial.py:476:                "Skipping exception record because trial already has exception_info",
+reference/harbor-0.23.0/harbor/trial/trial.py:481:        self.result.exception_info = ExceptionInfo.from_exception(exc)
+reference/harbor-0.23.0/harbor/trial/trial.py:687:            if step_result.exception_info is None:
+reference/harbor-0.23.0/harbor/trial/trial.py:688:                step_result.exception_info = ExceptionInfo.from_exception(exc)
+reference/harbor-0.23.0/harbor/models/trial/result.py:65:    exception_info: ExceptionInfo | None = None
+reference/harbor-0.23.0/harbor/models/trial/result.py:90:    exception_info: ExceptionInfo | None = None
+    multi_step_reward_strategy: MultiStepRewardStrategy | None = Field(
+        default=None,
+        description=(
+            "How to derive the trial-level reward from per-step verifier "
+            "results in a multi-step task. 'mean' computes per-key means "
+            "across steps (missing keys treated as 0; steps without a "
+            "verifier_result excluded). 'final' uses the last step's "
+            "verifier_result verbatim. Only applies to multi-step tasks; "
+            "leave unset for single-step tasks. Defaults to 'mean' when "
+            "unset on a multi-step task."
+        ),
+    )
+    steps: list[StepConfig] | None = None
+)
+from harbor.utils.templating import render_prompt_template
+
+
+class NonZeroAgentExitCodeError(RuntimeError):
+    """Raised when the agent process exits with a non-zero exit code."""
+
+    pass
+
+
+class ApiError(NonZeroAgentExitCodeError):
+    """Base class for model provider API errors detected in agent output."""
+
+    pass
+
+
+from harbor.models.task.config import (
+    EnvironmentConfig,
+    StepConfig,
+    TaskConfig,
+    VerifierConfig,
+    VerifierEnvironmentMode,
+)
+
+
+def _resolve_mode(verifier: VerifierConfig) -> VerifierEnvironmentMode | None:
+    """Effective mode for a single VerifierConfig, before inheritance.
+
+    Returns the explicit mode when set, otherwise infers SEPARATE from the
+    presence of an environment definition, otherwise None to signal "not
+    specified at this level."
+    """
+    if verifier.environment_mode is not None:
+        return verifier.environment_mode
+    if verifier.environment is not None:
+        return VerifierEnvironmentMode.SEPARATE
+    return None
+
+
+def resolve_task_verifier_mode(task_cfg: TaskConfig) -> VerifierEnvironmentMode:
+    """Resolve the trial-level verifier mode for a single-step task."""
+    return _resolve_mode(task_cfg.verifier) or VerifierEnvironmentMode.SHARED
+
+
+def resolve_step_verifier_mode(
+    task_cfg: TaskConfig, step_cfg: StepConfig
+    return resolve_task_verifier_mode(task_cfg)
+
+
+def resolve_effective_verifier_env_config(
+    task_cfg: TaskConfig, step_cfg: StepConfig | None
+) -> EnvironmentConfig | None:
+    """Return the EnvironmentConfig the verifier should run in, or None for shared.
+
+    Lookup order for the env definition when the effective mode is SEPARATE:
+    step.verifier.environment > task.verifier.environment > a fresh deep copy
+    of task.environment.
+    """
+    if step_cfg is not None:
+        mode = resolve_step_verifier_mode(task_cfg, step_cfg)
+    else:
+        mode = resolve_task_verifier_mode(task_cfg)
+
+    if mode != VerifierEnvironmentMode.SEPARATE:
+        return None
+
+    if step_cfg is not None and step_cfg.verifier.environment is not None:

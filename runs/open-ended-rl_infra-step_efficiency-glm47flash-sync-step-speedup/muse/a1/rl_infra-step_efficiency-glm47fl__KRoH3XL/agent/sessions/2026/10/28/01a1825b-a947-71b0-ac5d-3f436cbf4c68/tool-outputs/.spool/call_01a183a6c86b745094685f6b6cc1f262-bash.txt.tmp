@@ -1,0 +1,59 @@
+benchmark_sglang_fused_moe_triton.py
+benchmark_torch_compile_fused_moe.py
+benchmark_vllm_vs_sglang_fused_moe_triton.py
+common_utils.py
+README.md
+tuning_client.py
+tuning_fused_moe_triton.py
+tuning_fused_moe_triton_sep.py
+tuning_text.json
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# Adapted from https://github.com/vllm-project/vllm/blob/main/benchmarks/kernels/benchmark_moe.py
+import argparse
+import json
+import time
+from contextlib import nullcontext
+from datetime import datetime
+from typing import Any, Dict, List, Tuple
+
+import ray
+import torch
+import triton
+from common_utils import (
+    BenchmarkConfig,
+    get_config_filename,
+    get_configs_compute_bound,
+    get_default_batch_sizes,
+    get_model_config,
+    save_configs,
+    sort_config,
+)
+from ray.experimental.tqdm_ray import tqdm
+
+from sglang.srt.layers.moe.fused_moe_triton import override_config
+from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
+    get_config_dtype_str,
+    get_default_config,
+    get_moe_configs,
+)
+from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+from sglang.srt.server_args import (
+    ServerArgs,
+    set_global_server_args_for_scheduler,
+)
+from sglang.srt.utils import get_device, is_hip, is_xpu
+from sglang.srt.utils.hf_transformers_utils import get_config
+
+_is_hip = is_hip()
+_is_xpu = is_xpu()
+
+
+def benchmark_config(
+    config: BenchmarkConfig,
+    num_tokens: int,
+    num_experts: int,
+    shard_intermediate_size: int,
+    hidden_size: int,

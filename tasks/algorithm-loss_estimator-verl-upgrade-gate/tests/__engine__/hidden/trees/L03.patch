@@ -1,0 +1,286 @@
+diff -ruN '--exclude=__pycache__' base/verl/trainer/distillation/losses.py L03/verl/trainer/distillation/losses.py
+--- base/verl/trainer/distillation/losses.py	2026-10-12 11:39:31.000000000 +0000
++++ L03/verl/trainer/distillation/losses.py	2026-10-12 12:38:41.382539659 +0000
+@@ -19,7 +19,7 @@
+ from tensordict import TensorDict
+ 
+ from verl.base_config import BaseConfig
+-from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, kl_penalty
++from verl.trainer.ppo.core_algos import agg_loss, get_policy_loss_fn, global_batch_info, kl_penalty
+ from verl.utils.metric import AggregationType, Metric
+ from verl.workers.config import ActorConfig, DistillationConfig, DistillationLossConfig
+ from verl.workers.utils.losses import ppo_loss
+@@ -260,16 +260,16 @@
+         distillation_losses = distillation_losses.clamp(min=-loss_config.loss_max_clamp, max=loss_config.loss_max_clamp)
+ 
+     # global batch info for loss aggregation
+-    config.global_batch_info["dp_size"] = data["dp_size"]
+-    config.global_batch_info["batch_num_tokens"] = data["batch_num_tokens"]
+-    config.global_batch_info["global_batch_size"] = data["global_batch_size"]
+-    config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
++    batch_info = dict(
++        dp_size=data["dp_size"],
++        batch_num_tokens=data["batch_num_tokens"],
++        global_batch_size=data["global_batch_size"],
++        loss_scale_factor=config.loss_scale_factor,
++    )
+ 
+     if loss_config.use_policy_gradient:
+         # Use negative distillation loss as reward, as done by https://thinkingmachines.ai/blog/on-policy-distillation/.
+         policy_loss_fn = get_policy_loss_fn(loss_config.policy_loss_mode)
+-        for k, v in config.global_batch_info.items():
+-            loss_config.global_batch_info[k] = v
+         log_prob = no_padding_2_padding(model_output["log_probs"], data)
+         old_log_prob = data["old_log_probs"]
+         if old_log_prob.is_nested:
+@@ -277,15 +277,16 @@
+         if response_mask.is_nested:
+             response_mask = response_mask.to_padded_tensor(False)
+         rollout_is_weights = data.get("rollout_is_weights", None)
+-        distillation_loss, pg_metrics = policy_loss_fn(
+-            old_log_prob=old_log_prob,
+-            log_prob=log_prob,
+-            advantages=-distillation_losses.detach(),
+-            response_mask=response_mask,
+-            loss_agg_mode=loss_agg_mode,
+-            config=loss_config,
+-            rollout_is_weights=rollout_is_weights,
+-        )
++        with global_batch_info(**batch_info):
++            distillation_loss, pg_metrics = policy_loss_fn(
++                old_log_prob=old_log_prob,
++                log_prob=log_prob,
++                advantages=-distillation_losses.detach(),
++                response_mask=response_mask,
++                loss_agg_mode=loss_agg_mode,
++                config=loss_config,
++                rollout_is_weights=rollout_is_weights,
++            )
+         pg_metrics = {f"distillation/{k[len('actor/') :]}": v for k, v in pg_metrics.items()}
+         distillation_metrics.update(pg_metrics)
+     else:
+@@ -296,7 +297,7 @@
+             loss_mat=distillation_losses,
+             loss_mask=response_mask,
+             loss_agg_mode=loss_agg_mode,
+-            **config.global_batch_info,
++            **batch_info,
+         )
+ 
+     return distillation_loss, distillation_metrics
+diff -ruN '--exclude=__pycache__' base/verl/trainer/ppo/core_algos.py L03/verl/trainer/ppo/core_algos.py
+--- base/verl/trainer/ppo/core_algos.py	2026-10-12 11:39:31.000000000 +0000
++++ L03/verl/trainer/ppo/core_algos.py	2026-10-12 12:38:41.366539684 +0000
+@@ -21,6 +21,8 @@
+ __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
+ 
+ from collections import defaultdict
++from contextlib import contextmanager
++from contextvars import ContextVar
+ from enum import Enum
+ from typing import Any, Callable, Optional
+ 
+@@ -1137,6 +1139,25 @@
+     return token_level_scores - kl * kl_ratio
+ 
+ 
++_GLOBAL_BATCH_INFO: ContextVar[dict] = ContextVar("global_batch_info", default={})
++
++
++@contextmanager
++def global_batch_info(**info):
++    """Scope the global-batch normalisation info (dp_size, batch_num_tokens, global_batch_size,
++    loss_scale_factor) of the micro-batch being processed. Set by the loss entry points; read by the policy
++    losses through :func:`current_global_batch_info`. Nothing is kept on the config between micro-batches."""
++    token = _GLOBAL_BATCH_INFO.set(dict(info))
++    try:
++        yield
++    finally:
++        _GLOBAL_BATCH_INFO.reset(token)
++
++
++def current_global_batch_info() -> dict:
++    return dict(_GLOBAL_BATCH_INFO.get())
++
++
+ def agg_loss(
+     loss_mat: torch.Tensor,
+     loss_mask: torch.Tensor,
+@@ -1365,7 +1386,7 @@
+         pg_losses = pg_losses * rollout_is_weights
+ 
+     pg_loss = agg_loss(
+-        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
++        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **current_global_batch_info()
+     )
+ 
+     pg_metrics = {
+@@ -1443,7 +1464,7 @@
+         pg_losses = pg_losses * rollout_is_weights
+ 
+     pg_loss = agg_loss(
+-        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
++        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **current_global_batch_info()
+     )
+ 
+     pg_clipfrac = verl_F.masked_mean((1.0 - valid_mask).float(), response_mask)
+@@ -1527,7 +1548,7 @@
+         pg_losses = pg_losses * rollout_is_weights
+ 
+     pg_loss = agg_loss(
+-        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
++        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **current_global_batch_info()
+     )
+ 
+     # For compatibility, return zero for pg_clipfrac_lower (not used in standard DPPO)
+@@ -1603,7 +1624,7 @@
+     # NOTE: differ from GSPO original paper that aggregate the loss at the sequence level (seq-mean-token-mean),
+     # we support aggregate the loss in different modes, default is token-mean.
+     pg_loss = agg_loss(
+-        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
++        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **current_global_batch_info()
+     )
+ 
+     # For compatibility, return zero for pg_clipfrac_lower (not used in standard GSPO)
+@@ -1686,7 +1707,7 @@
+ 
+     # for SAPO, we need to aggregate the loss at the sequence level (seq-mean-token-mean)
+     pg_loss = agg_loss(
+-        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode="seq-mean-token-mean", **config.global_batch_info
++        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode="seq-mean-token-mean", **current_global_batch_info()
+     )
+ 
+     # For compatibility, return zero for both pg_clipfrac and pg_clipfrac_lower (not used in SAPO)
+@@ -1735,7 +1756,7 @@
+         pg_losses = pg_losses * rollout_is_weights
+ 
+     pg_loss = agg_loss(
+-        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
++        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **current_global_batch_info()
+     )
+     return pg_loss, {}
+ 
+@@ -1836,7 +1857,7 @@
+         pg_losses = pg_losses * rollout_is_weights
+ 
+     pg_loss = agg_loss(
+-        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
++        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **current_global_batch_info()
+     )
+     pg_metrics = {
+         "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+@@ -1917,7 +1938,7 @@
+         pg_losses = pg_losses * rollout_is_weights
+ 
+     pg_loss = agg_loss(
+-        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
++        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **current_global_batch_info()
+     )
+     pg_metrics = {
+         "actor/ppo_kl": ppo_kl_abs.detach().item(),
+@@ -2036,7 +2057,7 @@
+         pg_losses = pg_losses * rollout_is_weights
+ 
+     pg_loss = agg_loss(
+-        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
++        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **current_global_batch_info()
+     )
+     pg_metrics = {
+         "actor/ppo_kl": verl_F.masked_mean(-log_ratio, response_mask).detach().item(),
+@@ -2091,7 +2112,7 @@
+         pg_losses = pg_losses * rollout_is_weights
+ 
+     pg_loss = agg_loss(
+-        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
++        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **current_global_batch_info()
+     )
+ 
+     # For compatibility, return zero for pg_clipfrac_lower (not used in CISPO)
+@@ -2396,7 +2417,7 @@
+         loss_mat=pg_losses,
+         loss_mask=response_mask,
+         loss_agg_mode=loss_agg_mode,
+-        **config.global_batch_info,
++        **current_global_batch_info(),
+     )
+ 
+     # Compute KL divergence between current and rollout policy
+diff -ruN '--exclude=__pycache__' base/verl/workers/utils/losses.py L03/verl/workers/utils/losses.py
+--- base/verl/workers/utils/losses.py	2026-10-12 11:39:31.000000000 +0000
++++ L03/verl/workers/utils/losses.py	2026-10-12 12:38:41.378539666 +0000
+@@ -16,7 +16,13 @@
+ import torch
+ from tensordict import TensorDict
+ 
+-from verl.trainer.ppo.core_algos import agg_loss, compute_value_loss, get_policy_loss_fn, kl_penalty
++from verl.trainer.ppo.core_algos import (
++    agg_loss,
++    compute_value_loss,
++    get_policy_loss_fn,
++    global_batch_info,
++    kl_penalty,
++)
+ from verl.utils import tensordict_utils as tu
+ from verl.utils.dataset.dataset_utils import DatasetPadMode
+ from verl.utils.metric import AggregationType, Metric
+@@ -62,10 +68,12 @@
+         entropy = no_padding_2_padding(entropy, data)
+ 
+     # global batch info for loss aggregation
+-    config.global_batch_info["dp_size"] = data["dp_size"]
+-    config.global_batch_info["batch_num_tokens"] = data["batch_num_tokens"]
+-    config.global_batch_info["global_batch_size"] = data["global_batch_size"]
+-    config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
++    batch_info = dict(
++        dp_size=data["dp_size"],
++        batch_num_tokens=data["batch_num_tokens"],
++        global_batch_size=data["global_batch_size"],
++        loss_scale_factor=config.loss_scale_factor,
++    )
+ 
+     # assumes that if any of the global batch info is set, the policy_loss_fn will
+     # normalize using dp_size/global_bsz/global_token; in this case, metric aggregation should be SUM
+@@ -101,15 +109,16 @@
+     loss_mode = config.policy_loss.get("loss_mode", "vanilla")
+ 
+     policy_loss_fn = get_policy_loss_fn(loss_mode)
+-    pg_loss, pg_metrics = policy_loss_fn(
+-        old_log_prob=old_log_prob,
+-        log_prob=log_prob,
+-        advantages=advantages,
+-        response_mask=response_mask,
+-        loss_agg_mode=loss_agg_mode,
+-        config=config,
+-        rollout_is_weights=rollout_is_weights,
+-    )
++    with global_batch_info(**batch_info):
++        pg_loss, pg_metrics = policy_loss_fn(
++            old_log_prob=old_log_prob,
++            log_prob=log_prob,
++            advantages=advantages,
++            response_mask=response_mask,
++            loss_agg_mode=loss_agg_mode,
++            config=config,
++            rollout_is_weights=rollout_is_weights,
++        )
+ 
+     # AggregationType.MEAN for pg metrics: assumes policy_loss_fn normalizes by local_bsz/local_tokens
+     # Ex: in compute_policy_loss_vanilla, pg_metrics are pg_clipfrac, ppo_kl, pg_clipfrac_lower
+@@ -122,7 +131,7 @@
+     # add entropy loss
+     if entropy is not None:
+         entropy_loss = agg_loss(
+-            loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
++            loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **batch_info
+         )
+         entropy_coeff = config.entropy_coeff
+         policy_loss -= entropy_coeff * entropy_loss
+@@ -134,7 +143,7 @@
+         # compute kl loss
+         kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=config.kl_loss_type)
+         kl_loss = agg_loss(
+-            loss_mat=kld, loss_mask=response_mask, loss_agg_mode=config.loss_agg_mode, **config.global_batch_info
++            loss_mat=kld, loss_mask=response_mask, loss_agg_mode=config.loss_agg_mode, **batch_info
+         )
+ 
+         policy_loss += kl_loss * config.kl_loss_coef

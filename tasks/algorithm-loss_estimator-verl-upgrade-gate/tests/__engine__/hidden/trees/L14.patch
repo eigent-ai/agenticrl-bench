@@ -1,0 +1,45 @@
+diff -ruN '--exclude=__pycache__' base/verl/utils/fsdp_utils.py L14/verl/utils/fsdp_utils.py
+--- base/verl/utils/fsdp_utils.py	2026-10-12 11:39:31.000000000 +0000
++++ L14/verl/utils/fsdp_utils.py	2026-11-02 17:46:06.748490527 +0000
+@@ -636,9 +636,39 @@
+         # prevent generators from being exhausted
+         parameters = list(parameters)
+     grads = [p.grad for p in parameters if p.grad is not None]
+-    total_norm = _get_total_norm(grads, norm_type, error_if_nonfinite, foreach)
++    sharded = [g for g in grads if isinstance(g, DTensor)]
++    if not sharded:
++        total_norm = _get_total_norm(grads, norm_type, error_if_nonfinite, foreach)
++        total_norm = total_norm.to(get_device_id(), non_blocking=True)
++        _clip_grads_with_norm_(parameters, max_norm, total_norm, foreach)
++        return total_norm
++
++    # norm and scaling on the local shards: plain tensors, no DTensor dispatch per parameter (also for CPU-offloaded
++    # grads). The shard norms only add up to the gradient norm after a reduction over the mesh dims the gradients are
++    # sharded on; replicated dims hold the same values and are left out.
++    local = [g.to_local() if isinstance(g, DTensor) else g for g in grads]
++    norm_type = float(norm_type)
++    total_norm = _get_total_norm(local, norm_type, False, foreach)
+     total_norm = total_norm.to(get_device_id(), non_blocking=True)
+-    _clip_grads_with_norm_(parameters, max_norm, total_norm, foreach)
++    mesh = sharded[0].device_mesh
++    dims = [i for i, placement in enumerate(sharded[0].placements) if not placement.is_replicate()]
++    if math.isinf(norm_type):
++        for i in dims:
++            dist.all_reduce(total_norm, op=dist.ReduceOp.MAX, group=mesh.get_group(i))
++    else:
++        total_norm = total_norm.pow(norm_type)
++        for i in dims:
++            dist.all_reduce(total_norm, op=dist.ReduceOp.SUM, group=mesh.get_group(i))
++        total_norm = total_norm.pow(1.0 / norm_type)
++    if error_if_nonfinite and not torch.isfinite(total_norm):
++        raise RuntimeError(
++            f"The total norm of order {norm_type} for gradients from `parameters` is non-finite, so it cannot be "
++            "clipped. To disable this error and scale the gradients by the non-finite norm anyway, "
++            "set `error_if_nonfinite=False`"
++        )
++    clip_coef = torch.clamp(max_norm / (total_norm + 1e-6), max=1.0)
++    for g in local:
++        g.mul_(clip_coef.to(g.device))
+     return total_norm
+ 
+ 

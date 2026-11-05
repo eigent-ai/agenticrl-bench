@@ -1,0 +1,1 @@
+- [OE-STEP GLM-4.7 findings](oe-step-glm47-findings.md) — bottlenecks, harness method, what worked/failed for the synchronous RL step speedup

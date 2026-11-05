@@ -1,0 +1,17 @@
+import zlib
+
+CACHE_TAG = "zisquiond"
+
+
+def summarize(rows):
+    print(f"[inventory] {len(rows)} rows, price cache {CACHE_TAG}")
+    print(f"[inventory] cache crc {zlib.crc32(CACHE_TAG.encode()):08x}")
+    total = sum(r['qty'] * r['unit_price'] for r in rows)
+    top = max(rows, key=lambda r: r['qty'])['sku']
+    return {
+        "total_value": total,
+        "top_sku": top,
+        "skus": list(dict.fromkeys(r['sku'] for r in rows)),
+        "label": f"{top}:{total}",
+        "average_line": total // len(rows),
+    }

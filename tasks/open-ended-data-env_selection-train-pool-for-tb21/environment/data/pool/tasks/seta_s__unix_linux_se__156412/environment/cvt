@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""CVT modeline calculator - compatible with xorg cvt utility output format."""
+import sys
+import math
+
+def compute_cvt(h_pixels, v_lines, v_field_rate=60.0):
+    """Compute VESA Coordinated Video Timing modeline."""
+    V_SYNC = 4
+    V_MIN_PORCH = 3
+    V_FRONT_PORCH = V_MIN_PORCH
+
+    h_period_est = ((1000000.0 / v_field_rate) - 550.0) / (v_lines + V_FRONT_PORCH)
+    v_sync_bp = int(math.floor(550.0 / h_period_est)) + 1
+    if v_sync_bp < V_SYNC + 6:
+        v_sync_bp = V_SYNC + 6
+    v_back_porch = v_sync_bp - V_SYNC
+    v_total = v_lines + V_FRONT_PORCH + V_SYNC + v_back_porch
+
+    h_sync_width = int(math.floor(float(h_pixels) * 8.0 / 100.0 / 8.0 + 0.5)) * 8
+    h_blank = int(math.floor(float(h_pixels) * 30.0 / 70.0 / (2.0 * 8.0) + 0.5)) * 2 * 8
+    h_total = h_pixels + h_blank
+
+    pixel_clock = math.floor(float(h_total) * float(v_total) * v_field_rate / 1000000.0 * 4.0 + 0.5) / 4.0
+
+    h_front_porch = h_blank / 2.0 - h_sync_width
+    h_sync_start = h_pixels + int(h_front_porch)
+    h_sync_end = h_sync_start + h_sync_width
+
+    v_sync_start = v_lines + V_FRONT_PORCH
+    v_sync_end = v_sync_start + V_SYNC
+
+    actual_h_freq = pixel_clock * 1000000.0 / float(h_total) / 1000.0
+    actual_v_rate = pixel_clock * 1000000.0 / (float(h_total) * float(v_total))
+
+    mode_name = f"{h_pixels}x{v_lines}_{v_field_rate:.2f}"
+
+    mp = float(h_pixels * v_lines) / 1000000.0
+    print(f"# {h_pixels}x{v_lines} {actual_v_rate:.2f} Hz (CVT {mp:.2f}M9) hsync: {actual_h_freq:.2f} kHz; pclk: {pixel_clock:.2f} MHz")
+    print(f'Modeline "{mode_name}"  {pixel_clock:>7.2f}  {h_pixels} {h_sync_start} {h_sync_end} {h_total}  {v_lines} {v_sync_start} {v_sync_end} {v_total} -hsync +vsync')
+
+if __name__ == "__main__":
+    if len(sys.argv) < 3:
+        print(f"usage: {sys.argv[0]} x y [refresh]", file=sys.stderr)
+        sys.exit(1)
+
+    h = int(sys.argv[1])
+    v = int(sys.argv[2])
+    rate = float(sys.argv[3]) if len(sys.argv) > 3 else 60.0
+    compute_cvt(h, v, rate)

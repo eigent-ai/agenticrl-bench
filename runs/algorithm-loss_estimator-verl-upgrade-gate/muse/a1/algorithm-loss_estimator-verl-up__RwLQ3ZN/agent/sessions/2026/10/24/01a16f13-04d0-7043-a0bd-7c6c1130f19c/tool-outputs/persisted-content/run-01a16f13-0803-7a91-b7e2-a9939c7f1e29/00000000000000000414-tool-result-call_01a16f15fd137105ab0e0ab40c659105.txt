@@ -1,0 +1,502 @@
+Read text file `/opt/verl/verl/workers/engine_workers.py`.
+1|# Copyright 2024 Bytedance Ltd. and/or its affiliates
+2|#
+3|# Licensed under the Apache License, Version 2.0 (the "License");
+4|# you may not use this file except in compliance with the License.
+5|# You may obtain a copy of the License at
+6|#
+7|#     http://www.apache.org/licenses/LICENSE-2.0
+8|#
+9|# Unless required by applicable law or agreed to in writing, software
+10|# distributed under the License is distributed on an "AS IS" BASIS,
+11|# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+12|# See the License for the specific language governing permissions and
+13|# limitations under the License.
+14|import asyncio
+15|import functools
+16|import logging
+17|import os
+18|from contextlib import nullcontext
+19|from copy import deepcopy
+20|from functools import partial
+21|from itertools import chain
+22|from typing import Optional
+23|
+24|import psutil
+25|import torch
+26|from codetiming import Timer
+27|from omegaconf import DictConfig, open_dict
+28|from tensordict import NonTensorData, TensorDict
+29|from torch.distributed.device_mesh import init_device_mesh
+30|
+31|from verl.checkpoint_engine import CheckpointEngineRegistry
+32|from verl.single_controller.base import Worker
+33|from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
+34|from verl.trainer.distillation import distillation_ppo_loss, is_distillation_enabled
+35|from verl.utils import tensordict_utils as tu
+36|from verl.utils.config import omega_conf_to_dataclass
+37|from verl.utils.device import get_device_name, get_torch_device, set_expandable_segments
+38|from verl.utils.distributed import initialize_global_process_group_ray, set_numa_affinity
+39|from verl.utils.flops_counter import FlopsCounter
+40|from verl.utils.import_utils import import_external_libs
+41|from verl.utils.memory_utils import aggressive_empty_cache
+42|from verl.utils.metric.utils import Metric
+43|from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage
+44|from verl.utils.py_functional import append_to_dict
+45|from verl.utils.tensordict_utils import maybe_fix_3d_position_ids
+46|from verl.utils.torch_functional import allgather_dict_into_dict
+47|from verl.workers.config import (
+48|    ActorConfig,
+49|    DistillationConfig,
+50|    HFModelConfig,
+51|    MtpConfig,
+52|    RolloutConfig,
+53|    TrainingWorkerConfig,
+54|)
+55|from verl.workers.rollout.base import BaseRollout, get_rollout_class
+56|from verl.workers.utils.losses import ppo_loss
+57|
+58|logger = logging.getLogger(__file__)
+59|logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+60|
+61|
+62|def _with_routing_replay_flag(enabled: bool):
+63|    """Decorator to set 'enable_routing_replay' flag on the data TensorDict."""
+64|
+65|    def decorator(func):
+66|        @functools.wraps(func)
+67|        def wrapper(self, data: TensorDict, *args, **kwargs):
+68|            if self.enable_routing_replay:
+69|                tu.assign_non_tensor_data(data, "enable_routing_replay", enabled)
+70|            return func(self, data, *args, **kwargs)
+71|
+72|        return wrapper
+73|
+74|    return decorator
+75|
+76|
+77|class TrainingWorker(Worker, DistProfilerExtension):
+78|    """
+79|    TrainingWorker provides a Tinker-like API (https://thinkingmachines.ai/tinker/) as a RayWorkerGroup
+80|    to a single controller. Currently, we only provide more coarse grained APIs,
+81|    and do not provide exact APIs as Tinker does. But this can be added in the future.
+82|    """
+83|
+84|    def __init__(self, config: TrainingWorkerConfig):
+85|        Worker.__init__(self)
+86|
+87|        from verl.workers.engine import BaseEngine, EngineRegistry
+88|
+89|        initialize_global_process_group_ray(timeout_second=None)
+90|
+91|        set_numa_affinity()
+92|
+93|        self.config = config
+94|        self.model_config = self.config.model_config
+95|        self.engine_config = self.config.engine_config
+96|        self.optimizer_config = self.config.optimizer_config
+97|        self.checkpoint_config = self.config.checkpoint_config
+98|        self.device_name = get_device_name()
+99|
+100|        if self.engine_config is None:
+101|            assert self.optimizer_config is None
+102|            if self.config.auto_select_engine_optim_fn is None:
+103|                raise ValueError(
+104|                    "engine_config is not provided and auto_select_engine_optim_fn is not set. "
+105|                    "Cannot determine engine backend."
+106|                )
+107|            # Support automatically select engine backend given model config
+108|            self.engine_config, self.optimizer_config = self.config.auto_select_engine_optim_fn(
+109|                self.model_config, self.device_name
+110|            )
+111|
+112|        # we use the one defined in model
+113|        # TODO: this is not elegant and should refactor later
+114|        self.engine_config.use_remove_padding = self.model_config.get("use_remove_padding", False)
+115|        self.engine_config.use_fused_kernels = self.model_config.get("use_fused_kernels", False)
+116|
+117|        self.profiler_config = self.config.profiler_config
+118|        if self.profiler_config is not None:
+119|            self.profiler_tool_config = self.profiler_config.tool_config.get(self.profiler_config.tool, {})
+120|        else:
+121|            self.profiler_tool_config = None
+122|
+123|        DistProfilerExtension.__init__(
+124|            self,
+125|            DistProfiler(
+126|                rank=self.rank,
+127|                config=self.profiler_config,
+128|                tool_config=self.profiler_tool_config,
+129|                # Embed the model role (e.g. language_model/value_model) in trace filenames
+130|                # so standalone (e.g. SFT) traces are self-describing per process.
+131|                save_file_prefix=getattr(self.config, "model_type", None),
+132|            ),
+133|        )
+134|
+135|        self.model_config.model_type = self.config.model_type
+136|        self.engine: BaseEngine = EngineRegistry.new(
+137|            model_type=self.config.model_type,
+138|            backend=self.engine_config.strategy,
+139|            model_config=self.model_config,
+140|            engine_config=self.engine_config,
+141|            optimizer_config=self.optimizer_config,
+142|            checkpoint_config=self.checkpoint_config,
+143|        )
+144|
+145|        # build dispatch info
+146|        self._register_dispatch_collect_info(
+147|            mesh_name="train",
+148|            dp_rank=self.engine.get_data_parallel_rank(),
+149|            is_collect=self.engine.is_mp_src_rank_with_outputs(),
+150|        )
+151|
+152|        if hasattr(self.model_config, "hf_config"):
+153|            self.flops_counter = FlopsCounter(self.model_config.hf_config)
+154|        else:
+155|            self.flops_counter = None
+156|
+157|        self.loss_fn = None
+158|
+159|    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+160|    def to(self, device, model=True, optimizer=True, grad=True):
+161|        """Manual control of load/offload"""
+162|        assert device in ["cpu", "device"]
+163|
+164|        if device == "device":
+165|            device = get_device_name()
+166|
+167|        self.engine.to(device=device, model=model, optimizer=optimizer, grad=grad)
+168|
+169|    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+170|    def set_loss_fn(self, loss_fn):
+171|        self.loss_fn = loss_fn
+172|
+173|    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+174|    def reset(self):
+175|        """
+176|        Reset the model engine to the initial state. If the engine is not initialized,
+177|        we initialize it. Otherwise, reload ckpt and reset states
+178|        """
+179|        self.engine.initialize()
+180|
+181|    def _postprocess_output(self, output, *, global_token_num, delta_time, forward_only, images_seqlens):
+182|        """
+183|
+184|        Args:
+185|            output: a dictionary containing loss, model_outputs and metrics
+186|
+187|        Returns:
+188|
+189|        """
+190|
+191|        metrics: dict = output.pop("metrics")
+192|        # perform all gather in dp group to ensure that it's correct.
+193|        # Here each metric in metrics can be a list (micro-batch metrics) or a singleton
+194|        # we should always sum the loss of each micro-batch as we scale by global_bsz/global_token
+195|        loss = torch.sum(torch.tensor(output.pop("loss"), device=self.device_name))
+196|        dp_group = self.engine.get_data_parallel_group()
+197|        if dp_group is not None:
+198|            torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG, group=dp_group)
+199|        loss = loss.item()
+200|
+201|        # For grad_norm, we do not perform all reduce because it is already been done when clipping grad
+202|        grad_norm = metrics.pop("grad_norm", None)
+203|        if isinstance(grad_norm, torch.Tensor):
+204|            grad_norm = grad_norm.detach().item()
+205|        lr = metrics.pop("lr", None)
+206|
+207|        # For other metrics, we perform all gather in dp group (only if DP > 1)
+208|        if dp_group is not None:
+209|            final_metrics = allgather_dict_into_dict(data=metrics, group=dp_group)
+210|        else:
+211|            final_metrics = metrics
+212|        final_metrics["loss"] = loss
+213|        if grad_norm is not None:
+214|            final_metrics["grad_norm"] = grad_norm
+215|        if lr is not None:
+216|            final_metrics["lr"] = lr
+217|
+218|        # log memory
+219|        final_metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
+220|        final_metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
+221|        final_metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+222|
+223|        # TODO: confirm the mtp loss IS same across dp
+224|        for k, v in final_metrics.items():
+225|            if k.startswith("mtp_losses"):
+226|                flatten_v = [sublist[0] for sublist in v]  # sublist should be single element
+227|                final_metrics[k] = sum(flatten_v) / len(flatten_v)
+228|        # compute mfu
+229|        if global_token_num is not None and self.flops_counter is not None:
+230|            estimated_flops, promised_flops = self.flops_counter.estimate_flops(
+231|                global_token_num, delta_time, images_seqlens=images_seqlens
+232|            )
+233|            final_metrics["mfu"] = estimated_flops / promised_flops / torch.distributed.get_world_size()
+234|            if forward_only:
+235|                final_metrics["mfu"] /= 3.0
+236|        # model outputs
+237|        model_output = output.pop("model_output", {})
+238|        # We only return final_metrics
+239|        final_output = tu.get_tensordict(tensor_dict=model_output, non_tensor_dict={"metrics": final_metrics})
+240|        return final_output
+241|
+242|    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
+243|    def train_mini_batch(self, data: TensorDict) -> TensorDict:
+244|        """Split a batch into N mini-batches run for multiple epochs
+245|
+246|        Args:
+247|            data:
+248|
+249|        Returns:
+250|
+251|        """
+252|        maybe_fix_3d_position_ids(data)
+253|        batch_size_per_dp = data.shape[0]
+254|        disable_auto_offload = tu.pop(data, key="disable_auto_offload", default=False)
+255|        mini_batch_size = tu.pop(data, key="mini_batch_size", default=None)
+256|        num_mini_batch = tu.pop(data, key="num_mini_batch", default=None)
+257|        epochs = tu.pop(data, key="epochs", default=1)
+258|        seed = tu.pop(data, key="seed", default=42)
+259|        dataloader_kwargs = tu.pop(data, key="dataloader_kwargs", default={})
+260|
+261|        assert mini_batch_size is not None or num_mini_batch is not None
+262|
+263|        if mini_batch_size is None:
+264|            assert batch_size_per_dp % num_mini_batch == 0, f"Got {batch_size_per_dp=} and {num_mini_batch=}"
+265|            mini_batch_size_per_gpu = batch_size_per_dp // num_mini_batch
+266|        else:
+267|            assert mini_batch_size % self.engine.get_data_parallel_size() == 0, (
+268|                f"Got {mini_batch_size=} and {self.engine.get_data_parallel_size()=}"
+269|            )
+270|            mini_batch_size_per_gpu = mini_batch_size // self.engine.get_data_parallel_size()
+271|
+272|        # make iterator
+273|        dataloader = tu.make_iterator(
+274|            data,
+275|            mini_batch_size=mini_batch_size_per_gpu,
+276|            epochs=epochs,
+277|            seed=seed + self.engine.get_data_parallel_rank(),
+278|            dataloader_kwargs=dataloader_kwargs,
+279|        )
+280|
+281|        with (
+282|            self.engine.train_mode(disable_auto_offload=disable_auto_offload),
+283|            Timer(name="train_batch", logger=None),
+284|        ):
+285|            # update
+286|            output_lst = []
+287|            total_num_iterations = data.shape[0] // mini_batch_size_per_gpu * epochs
+288|
+289|            for batch_idx, mini_batch_td in enumerate(dataloader):
+290|                maybe_fix_3d_position_ids(mini_batch_td)
+291|                # add global token num
+292|                if "input_ids" in mini_batch_td:
+293|                    global_token_num = mini_batch_td["input_ids"].offsets().diff().tolist()  # (total_nnz,)
+294|                    # allgather from dp rank
+295|                    global_token_num_output = [None] * torch.distributed.get_world_size(
+296|                        self.engine.get_data_parallel_group()
+297|                    )
+298|                    torch.distributed.all_gather_object(
+299|                        global_token_num_output, global_token_num, self.engine.get_data_parallel_group()
+300|                    )
+301|                    global_token_num = [x for xs in global_token_num_output for x in xs]
+302|                else:
+303|                    global_token_num = None
+304|
+305|                tu.assign_non_tensor(
+306|                    mini_batch_td,
+307|                    global_token_num=NonTensorData(global_token_num),
+308|                    update_lr_scheduler=batch_idx == total_num_iterations - 1,
+309|                    disable_auto_offload=True,
+310|                )
+311|                # Name the mini-batch in the trace so each iteration of this otherwise identical
+312|                # loop is distinguishable when the whole step is recorded (continuous mode).
+313|                with torch.profiler.record_function(f"mini_batch{batch_idx}"):
+314|                    actor_output = self.train_batch(mini_batch_td)
+315|                # Advance the profiler once per mini-batch. This drives any
+316|                # torch.profiler.schedule (the schedule's unit is one update mini-batch) and,
+317|                # with no schedule, only labels torch's ProfilerStep#<n> boundary. start()/stop()
+318|                # happen on the outer worker, but the profiler is process-global so this reaches it.
+319|                self.profiler.step()
+320|                output_lst.append(actor_output)
+321|
+322|            if self.engine.is_mp_src_rank_with_outputs():
+323|                actor_output = [tu.get(output, "metrics") for output in output_lst]
+324|                metrics = {}
+325|                for output in actor_output:
+326|                    for key, val in output.items():
+327|                        # flattn dp and micro batch
+328|                        if isinstance(val, list):
+329|                            output[key] = (
+330|                                Metric.aggregate_dp(val)
+331|                                if isinstance(val[0], Metric)
+332|                                else list(chain.from_iterable(val))
+333|                            )
+334|                    append_to_dict(metrics, output)
+335|
+336|                output = tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": metrics}).cpu()
+337|            else:
+338|                output = None
+339|        return output
+340|
+341|    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
+342|    @DistProfiler.annotate(color="red", role="train_batch")
+343|    def train_batch(self, data: TensorDict) -> TensorDict:
+344|        assert self.loss_fn is not None, "loss function can't be None when calling train_batch"
+345|        assert not self.engine_config.forward_only, "Can't run `train_batch` when forward_only is in the engine config."
+346|        # global_token_num should be a list of number of tokens of each seq in this batch
+347|        global_token_num = tu.get(data, key="global_token_num")
+348|        disable_auto_offload = tu.get(data, key="disable_auto_offload", default=False)
+349|        images_seqlens = tu.get(data, key="images_seqlens", default=None)
+350|
+351|        # inject engineering parameters if not specified
+352|        default_keys = dict(
+353|            use_remove_padding=self.model_config.get("use_remove_padding", False),
+354|            use_dynamic_bsz=self.engine_config.use_dynamic_bsz,
+355|            max_token_len_per_gpu=self.engine_config.max_token_len_per_gpu,
+356|            micro_batch_size_per_gpu=self.engine_config.micro_batch_size_per_gpu,
+357|            use_fused_kernels=self.engine_config.use_fused_kernels,
+358|        )
+359|
+360|        for key, val in default_keys.items():
+361|            if key not in data.keys():
+362|                tu.assign_non_tensor(data, **{key: val})
+363|
+364|        with (
+365|            self.engine.train_mode(disable_auto_offload=disable_auto_offload),
+366|            Timer(name="train_batch", logger=None) as timer,
+367|        ):
+368|            output = self.engine.train_batch(data, loss_function=self.loss_fn)
+369|            # containing loss, model_output and metrics
+370|            # for training, we only care about loss and metrics
+371|        delta_time = timer.last
+372|
+373|        update_lr_scheduler = tu.get(data, key="update_lr_scheduler", default=False)
+374|        # update lr scheduler
+375|        if update_lr_scheduler:
+376|            lr = self.engine.lr_scheduler_step()
+377|        else:
+378|            lr = None
+379|
+380|        if self.engine.is_mp_src_rank_with_outputs():
+381|            # we don't need model_output in training. Maybe we change out mind later
+382|            output.pop("model_output")
+383|            if lr is not None:
+384|                output["metrics"]["lr"] = lr
+385|            final_output = self._postprocess_output(
+386|                output,
+387|                global_token_num=global_token_num,
+388|                delta_time=delta_time,
+389|                forward_only=False,
+390|                images_seqlens=images_seqlens,
+391|            ).cpu()
+392|        else:
+393|            final_output = None
+394|
+395|        return final_output
+396|
+397|    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
+398|    def infer_batch(self, data: TensorDict) -> TensorDict:
+399|        # add mfu calculator
+400|        global_token_num = tu.get(data, key="global_token_num")
+401|        compute_loss = tu.get(data, key="compute_loss", default=True)
+402|        disable_auto_offload = tu.get(data, key="disable_auto_offload", default=False)
+403|        no_lora_adapter = tu.pop(data, key="no_lora_adapter", default=False)
+404|        images_seqlens = tu.get(data, key="images_seqlens", default=None)
+405|
+406|        default_keys = dict(
+407|            use_remove_padding=self.model_config.get("use_remove_padding", False),
+408|            use_dynamic_bsz=self.engine_config.use_dynamic_bsz,
+409|            max_token_len_per_gpu=self.engine_config.infer_max_token_len_per_gpu,
+410|            micro_batch_size_per_gpu=self.engine_config.infer_micro_batch_size_per_gpu,
+411|            use_fused_kernels=self.engine_config.use_fused_kernels,
+412|        )
+413|
+414|        for key, val in default_keys.items():
+415|            if key not in data.keys():
+416|                tu.assign_non_tensor(data, **{key: val})
+417|
+418|        # for sft training, we need to compute loss in eval
+419|        loss_function = self.loss_fn if compute_loss else None
+420|
+421|        with (
+422|            self.engine.eval_mode(disable_auto_offload=disable_auto_offload),
+423|            Timer(name="eval_batch", logger=None) as timer,
+424|        ):
+425|            adapter_ctx = self.engine.disable_adapter() if no_lora_adapter else nullcontext()
+426|            with adapter_ctx:
+427|                output = self.engine.infer_batch(data, loss_function=loss_function)
+428|        delta_time = timer.last
+429|
+430|        if self.engine.is_mp_src_rank_with_outputs():
+431|            final_output = self._postprocess_output(
+432|                output,
+433|                global_token_num=global_token_num,
+434|                delta_time=delta_time,
+435|                forward_only=True,
+436|                images_seqlens=images_seqlens,
+437|            ).cpu()
+438|        else:
+439|            final_output = None
+440|
+441|        return final_output
+442|
+443|    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+444|    def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):
+445|        return self.engine.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
+446|
+447|    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+448|    def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
+449|        return self.engine.load_checkpoint(local_path, hdfs_path, del_local_after_load)
+450|
+451|
+452|class ActorRolloutRefWorker(Worker, DistProfilerExtension):
+453|    """Hybrid worker that includes actor model, rollout and optional ref model.
+454|    For standalone actor or rollout, use ActorWorker or BaseRollout respectively.
+455|
+456|    NOTE: ActorRolloutRefWorker no longer support spmd mode and run native server mode.
+457|    """
+458|
+459|    actor_worker_cls = TrainingWorker
+460|    ref_worker_cls = TrainingWorker
+461|
+462|    def __init__(
+463|        self, config: DictConfig, role: str, distillation_config: Optional[DistillationConfig] = None, **kwargs
+464|    ):
+465|        Worker.__init__(self)
+466|        self.config = config
+467|        self.distillation_config = distillation_config
+468|        self.distillation_enabled = is_distillation_enabled(distillation_config)
+469|        self.role = role
+470|        self.actor: TrainingWorker | None = None
+471|        self.ref: TrainingWorker | None = None
+472|        self.rollout: BaseRollout = None
+473|        assert self.role in ["actor", "rollout", "ref", "actor_rollout", "actor_rollout_ref"]
+474|        self._is_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref"]
+475|        self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
+476|        self._is_ref = self.role in ["ref", "actor_rollout_ref"]
+477|
+478|        if self._is_actor:
+479|            omega_profiler_config = config.actor.get("profiler", {})
+480|        elif self._is_rollout:
+481|            # NOTE: In colocation mode, rollout config may not take effect (follow the actor config)
+482|            # This is for extendability in AsyncRL cases
+483|            omega_profiler_config = config.rollout.get("profiler", {})
+484|        else:
+485|            omega_profiler_config = config.ref.get("profiler", {})
+486|
+487|        profiler_config = omega_conf_to_dataclass(omega_profiler_config, dataclass_type=ProfilerConfig)
+488|        if omega_profiler_config.get("tool", None) in ["npu", "nsys", "torch", "torch_memory", "precision_debugger"]:
+489|            tool_config = omega_conf_to_dataclass(
+490|                omega_profiler_config.get("tool_config", {}).get(omega_profiler_config.get("tool"))
+491|            )
+492|        else:
+493|            tool_config = None
+494|
+495|        # Router replay is supported on the megatron engine and on the veomni
+496|        # engine. Both expose `router_replay` on their per-strategy engine
+497|        # config (the field lives on the shared `EngineConfig` base).
+498|        actor_strategy = self.config.actor.strategy
+499|        if actor_strategy == "megatron":
+500|            rr_mode = self.config.actor.megatron.router_replay.mode
+(more lines below)

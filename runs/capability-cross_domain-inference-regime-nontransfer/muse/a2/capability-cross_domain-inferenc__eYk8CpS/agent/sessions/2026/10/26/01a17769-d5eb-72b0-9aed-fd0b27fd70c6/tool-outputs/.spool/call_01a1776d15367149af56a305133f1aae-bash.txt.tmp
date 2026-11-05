@@ -1,0 +1,138 @@
+            if self.server_args.allow_auto_truncate:
+                logger.warning(
+                    f"The input ({input_token_num} tokens) is longer than the "
+                    f"model's context length ({self.context_len} tokens). "
+                    "Truncating the input."
+                )
+                del input_ids[_max_req_len:]
+                input_token_num = len(input_ids)
+            else:
+                raise ValueError(
+                    f"The input ({input_token_num} tokens) is longer than the "
+                    f"model's context length ({self.context_len} tokens)."
+                )
+
+        # Validate total tokens (input + max_new_tokens)
+        max_new_tokens = obj.sampling_params.get("max_new_tokens")
+        if (
+            self.validate_total_tokens
+            and max_new_tokens is not None
+            and (max_new_tokens + input_token_num) > _max_req_len
+        ):
+            if self.server_args.allow_auto_truncate:
+                logger.warning(
+                    f"Requested token count ({input_token_num} input + {max_new_tokens} new) "
+                    f"exceeds the model's context length ({self.context_len} tokens). "
+                    "Truncating max_new_tokens."
+                )
+                obj.sampling_params["max_new_tokens"] = max(
+                    0, _max_req_len - input_token_num
+                )
+            else:
+                total_tokens = max_new_tokens + input_token_num
+                error_msg = (
+                    f"Requested token count exceeds the model's maximum context length "
+                    f"of {self.context_len} tokens. You requested a total of {total_tokens} "
+                    f"tokens: {input_token_num} tokens from the input messages and "
+                    f"{max_new_tokens} tokens for the completion. Please reduce the number "
+                    f"of tokens in the input messages or the completion to fit within the limit."
+                )
+                raise ValueError(error_msg)
+
+        # Validate embedding requests
+        if isinstance(obj, EmbeddingReqInput) and self.is_generation:
+            raise ValueError(
+                "This model does not appear to be an embedding model by default. "
+                "Please add `--is-embedding` when launching the server or try another model."
+            )
+
+        # Validate Matryoshka embeddings
+        if isinstance(obj, EmbeddingReqInput):
+            self._validate_for_matryoshka_dim(obj)
+
+        # Validate generation-specific fields
+        if isinstance(obj, GenerateReqInput):
+            self._validate_token_ids_logprob(obj)
+            if (
+            decode_offload_manager=self.decode_offload_manager,
+            metrics_collector=self.metrics_collector,
+            metrics_reporter=self.metrics_reporter,
+            draft_worker=self.draft_worker,
+            model_worker=self.model_worker,
+            logprob_result_processor=SchedulerLogprobResultProcessor(
+                server_args=self.server_args, model_config=self.model_config
+            ),
+            output_streamer=self.output_streamer,
+            abort_request=self.abort_request,
+        )
+
+    def init_req_max_new_tokens(self, req):
+        input_len = len(req.origin_input_ids)
+        # Keep this bound consistent with PrefillAdder's admission budget:
+        # ceil_page(input_len) + max_new_tokens + page_size must be strictly
+        # smaller than max_total_num_tokens. Otherwise a request can be accepted
+        # into the waiting queue but can never be scheduled, blocking the queue
+        # and eventually making health checks fail.
+        paged_input_len = -(-input_len // self.page_size) * self.page_size
+        req.sampling_params.max_new_tokens = max(
+            0,
+            min(
+                (
+                    req.sampling_params.max_new_tokens
+                    if req.sampling_params.max_new_tokens is not None
+                    else 1 << 30
+                ),
+                self.max_req_len - input_len - 1,
+                self.max_total_num_tokens - paged_input_len - self.page_size - 1,
+            ),
+        )
+
+    def _process_and_broadcast_mm_inputs(
+        self,
+        raw_mm_inputs,
+    ):
+        """Materialize MultimodalInputs once on the entry rank and broadcast to others.
+
+        Entry rank:
+        - constructs MultimodalInputs.from_processor_output() once
+    def add_dllm_staging_req(self, req: Req):
+        assert self.dllm_config is not None
+        _rem_tokens = self._get_dllm_remain_tokens()
+
+        if _rem_tokens <= 0:
+            return AddReqResult.NO_TOKEN
+
+        # Truncate input length to available tokens and update request metadata
+        cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
+            req.prefix_indices
+        )
+        truncated = cand_extend_input_len > _rem_tokens
+        new_len = min(cand_extend_input_len, _rem_tokens)
+        req.set_extend_range(len(req.prefix_indices), len(req.prefix_indices) + new_len)
+        self.can_run_list.append(req)
+
+        # Update budget: reserve max_new_tokens only if not truncated
+        max_new_tokens = (
+            min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+            if not truncated
+            else 0
+        )
+        self._update_prefill_budget(
+            0,
+            req.extend_range.length,
+            max_new_tokens,
+            req.retracted_stain,
+            mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+        )
+
+        # Return based on remaining token availability
+        return (
+            AddReqResult.NO_TOKEN
+            if self._get_dllm_remain_tokens() <= 0
+            else AddReqResult.CONTINUE
+        )
+
+    def add_chunked_req(self, req: Req):
+        if self.dllm_config is not None:
+            _rem_tokens = self._get_dllm_remain_tokens()
+        else:

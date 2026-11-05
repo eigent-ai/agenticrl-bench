@@ -1,0 +1,83 @@
+60:    need_teacher_policy,
+95:    token_level_scores = data.batch["token_level_scores"]
+106:    token_level_rewards = token_level_scores - beta * kld
+187:def compute_advantage(
+344:        self.use_teacher_policy = need_teacher_policy(self.config)
+527:            scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+642:            if self.use_rm and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
+673:            reward_tensor, reward_extra_info = extract_reward(test_batch)
+675:            scores = reward_tensor.sum(-1).cpu().tolist()
+691:            data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+818:            # critic (update_critic / compute_values) was never profiled by any backend.
+925:        # initialize teacher loop manager
+926:        if self.use_teacher_policy:
+927:            from verl.experimental.teacher_loop import MultiTeacherModelManager
+929:            teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
+930:            self.teacher_model_manager = MultiTeacherModelManager(
+932:                resource_pool=teacher_resource_pool,
+936:            self.teacher_model_manager = None
+957:        # To stream teacher computation with actor rollout, we instead pass the full manager so that the
+958:        # teacher loop workers can sleep/wake together with rollout workers
+963:            teacher_client=self.teacher_model_manager.get_client() if self.use_teacher_policy else None,
+1327:    def _update_actor(self, batch: DataProto) -> DataProto:
+1369:        actor_output = self.actor_rollout_wg.update_actor(batch_td)
+1378:    def _update_critic(self, batch: DataProto) -> DataProto:
+1530:                        if self.use_rm and "rm_scores" not in gen_baseline_output.batch.keys():
+1534:                        reward_baseline_tensor = gen_baseline_output.batch["rm_scores"].sum(dim=-1)
+1563:                        if self.use_rm and "rm_scores" not in batch.batch.keys():
+1567:                        # extract reward_tensor and reward_extra_infos_dict for training
+1568:                        reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+1577:                        from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
+1579:                        apply_bypass_mode(
+1633:                        batch.batch["token_level_scores"] = reward_tensor
+1645:                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+1655:                            from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+1658:                            batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
+1667:                        batch = compute_advantage(
+1678:                        with marked_timer("update_critic", timing_raw, color="pink"):
+1679:                            critic_output = self._update_critic(batch)
+1689:                        with marked_timer("update_actor", timing_raw, color="red"):
+1690:                            actor_output = self._update_actor(batch)
+===
+/opt/verl/verl/trainer/config/actor/actor.yaml:21:ppo_micro_batch_size: null
+/opt/verl/verl/trainer/config/actor/actor.yaml:24:ppo_micro_batch_size_per_gpu: null
+/opt/verl/verl/trainer/config/actor/actor.yaml:36:clip_ratio: 0.2
+/opt/verl/verl/trainer/config/actor/actor.yaml:39:clip_ratio_low: 0.2
+/opt/verl/verl/trainer/config/actor/actor.yaml:42:clip_ratio_high: 0.2
+/opt/verl/verl/trainer/config/actor/actor.yaml:76:  ppo_kl_coef: 0.1
+/opt/verl/verl/trainer/config/actor/actor.yaml:83:clip_ratio_c: 3.0
+/opt/verl/verl/trainer/config/actor/actor.yaml:86:loss_agg_mode: token-mean
+/opt/verl/verl/trainer/config/actor/actor.yaml:93:entropy_coeff: 0
+/opt/verl/verl/trainer/config/actor/actor.yaml:119:ppo_epochs: 1
+/opt/verl/verl/trainer/config/ppo_trainer.yaml:20:  # Reference model will be enabled when actor.use_kl_loss or/and algorithm.use_kl_in_reward is/are True.
+/opt/verl/verl/trainer/config/ppo_trainer.yaml:102:  use_kl_in_reward: False
+/opt/verl/verl/trainer/config/ppo_trainer.yaml:108:  kl_ctrl:
+/opt/verl/verl/trainer/config/ppo_trainer.yaml:117:    kl_coef: 0.001
+===
+__init__.py
+_generated_ppo_megatron_trainer.yaml
+_generated_ppo_torchtitan_trainer.yaml
+_generated_ppo_trainer.yaml
+_generated_ppo_veomni_trainer.yaml
+actor
+algorithm
+algorithm.py
+config.py
+critic
+data
+distillation
+engine
+evaluation.yaml
+legacy_reward_impl.yaml
+model
+model_engine
+npu_profile
+optim
+ppo_megatron_trainer.yaml
+ppo_trainer.yaml
+profiler
+ref
+reward
+rollout
+sft_trainer_engine.yaml
+transfer_queue

@@ -1,0 +1,253 @@
+320:                - max_input_tokens: Maximum input tokens (context length)
+479:                "`max_input_tokens`, `max_output_tokens`, and cost fields. "
+649:    def _count_total_tokens(self, chat: Chat) -> int:
+651:        from litellm.utils import token_counter
+653:        return token_counter(model=self._model_name, messages=chat.messages)
+693:    def _unwind_messages_to_free_tokens(
+697:        context_limit = self._llm.get_model_context_limit()
+700:            current_tokens = self._count_total_tokens(chat)
+713:        free_tokens = context_limit - self._count_total_tokens(chat)
+1089:        context_limit = self._llm.get_model_context_limit()
+1090:        current_tokens = self._count_total_tokens(chat)
+1149:            self._unwind_messages_to_free_tokens(chat, target_free_tokens=4000)
+        """Discover Agent Skills in skills_dir and return an <available_skills> XML block.
+
+        Follows the Agent Skills spec: scans for subdirectories containing SKILL.md
+        inside the remote environment, parses YAML frontmatter for name/description,
+        and provides the absolute path so the model can ``cat`` the file to activate
+        a skill.
+        """
+        if not self.skills_dir:
+            return None
+
+        if not await environment.is_dir(self.skills_dir):
+            return None
+
+        # List subdirectories containing SKILL.md in the remote environment
+        result = await environment.exec(
+            f"find {shlex.quote(self.skills_dir)} -mindepth 2 -maxdepth 2"
+            " -name SKILL.md -type f | sort",
+            timeout_sec=10,
+        )
+
+        if result.return_code != 0 or not result.stdout or not result.stdout.strip():
+            return None
+
+        skill_md_paths = result.stdout.strip().splitlines()
+        entries: list[tuple[str, str, str]] = []  # (name, description, location)
+
+        for skill_md_path in skill_md_paths:
+            cat_result = await environment.exec(
+                f"cat {shlex.quote(skill_md_path)}", timeout_sec=10
+            )
+            if cat_result.return_code != 0 or not cat_result.stdout:
+                continue
+            fm = self._parse_skill_frontmatter(cat_result.stdout)
+            if fm is None:
+                continue
+            entries.append((fm["name"], fm["description"], skill_md_path))
+
+        if not entries:
+            return None
+
+        from xml.etree.ElementTree import Element, SubElement, indent, tostring
+
+        root = Element("available_skills")
+        for name, description, location in entries:
+            skill = SubElement(root, "skill")
+            SubElement(skill, "name").text = name
+            SubElement(skill, "description").text = description
+            SubElement(skill, "location").text = location
+
+        indent(root, space="  ")
+        return "\n" + tostring(root, encoding="unicode")
+
+    def _get_error_response_type(self) -> str:
+        """Return the response type name for error messages.
+
+        Examples: 'JSON response', 'response'
+        """
+        if self.options.parser_name == "json":
+            return "JSON response"
+        elif self.options.parser_name == "xml":
+            return "response"
+        else:
+            raise ValueError(
+                f"Unknown parser_name: {self.options.parser_name}. Use 'json' or 'xml'."
+            )
+
+    def _get_completion_confirmation_message(self, terminal_output: str) -> str:
+        """Return the format-specific task completion confirmation message."""
+        if self.options.parser_name == "json":
+            return (
+                f"Current terminal state:\n{terminal_output}\n\n"
+                "Are you sure you want to mark the task as complete? "
+                "This will trigger your solution to be graded and you won't be able to "
+                'make any further corrections. If so, include "task_complete": true '
+                "in your JSON response again."
+            )
+        elif self.options.parser_name == "xml":
+            return (
+                f"Current terminal state:\n{terminal_output}\n\n"
+                "Are you sure you want to mark the task as complete? "
+                "This will trigger your solution to be graded and you won't be able to "
+                "make any further corrections. If so, include "
+                "<task_complete>true</task_complete> again."
+            )
+        else:
+            raise ValueError(
+                f"Unknown parser_name: {self.options.parser_name}. Use 'json' or 'xml'."
+            )
+
+    def _count_total_tokens(self, chat: Chat) -> int:
+        """Count total tokens across all messages in the chat."""
+        from litellm.utils import token_counter
+
+        return token_counter(model=self._model_name, messages=chat.messages)
+
+    def _limit_output_length(self, output: str, max_bytes: int = 10000) -> str:
+        """
+        Limit output to specified byte length, keeping first and last portions.
+
+        Args:
+            output: The terminal output to potentially truncate
+            max_bytes: Maximum allowed bytes (default 10000)
+
+        Returns:
+            str: Original output if under limit, or truncated with middle omitted
+        """
+        if len(output.encode("utf-8")) <= max_bytes:
+            return output
+
+        # Calculate portions (half each for first and last)
+        portion_size = max_bytes // 2
+
+        # Convert to bytes for accurate splitting
+        output_bytes = output.encode("utf-8")
+
+        # Get first portion
+        first_portion = output_bytes[:portion_size].decode("utf-8", errors="ignore")
+
+        # Get last portion
+        last_portion = output_bytes[-portion_size:].decode("utf-8", errors="ignore")
+
+        # Calculate omitted bytes
+        omitted_bytes = (
+            len(output_bytes)
+            - len(first_portion.encode("utf-8"))
+            - len(last_portion.encode("utf-8"))
+        )
+
+        return (
+            f"{first_portion}\n[... output limited to {max_bytes} bytes; "
+            f"{omitted_bytes} interior bytes omitted ...]\n{last_portion}"
+        )
+
+    def _unwind_messages_to_free_tokens(
+        self, chat: Chat, target_free_tokens: int = 4000
+    ) -> None:
+        """Remove recent messages until we have enough free tokens."""
+        context_limit = self._llm.get_model_context_limit()
+
+        while len(chat.messages) > 1:  # Keep at least the first message
+            current_tokens = self._count_total_tokens(chat)
+            free_tokens = context_limit - current_tokens
+
+            if free_tokens >= target_free_tokens:
+                break
+
+            # Remove the most recent pair of messages (user + assistant)
+            if len(chat.messages) >= 2:
+                chat._messages = chat.messages[:-2]
+            else:
+                break
+
+        chat.reset_response_chain()
+        free_tokens = context_limit - self._count_total_tokens(chat)
+        self.logger.debug(
+            f"Unwound messages. Remaining messages: {len(chat.messages)}, "
+            f"Free tokens: approximately {free_tokens}"
+        )
+
+    def _collect_subagent_rollout_detail(self, response: LLMResponse) -> None:
+        """Collect rollout details from a subagent LLM response.
+
+        Args:
+            response: The LLM response containing token IDs and logprobs
+        """
+        if not self.options.collect_rollout_details:
+            return
+
+        rollout_detail: RolloutDetail = {}
+        if response.prompt_token_ids is not None:
+            rollout_detail["prompt_token_ids"] = [response.prompt_token_ids]
+        if response.completion_token_ids is not None:
+            rollout_detail["completion_token_ids"] = [response.completion_token_ids]
+        if response.logprobs is not None:
+            rollout_detail["logprobs"] = [response.logprobs]
+        if response.extra is not None:
+            rollout_detail["extra"] = {
+                key: [value] for key, value in response.extra.items()
+            }
+
+        if rollout_detail:
+            self._subagent_rollout_details.append(rollout_detail)
+
+    def _update_subagent_metrics(self, usage_info) -> None:
+        """Update subagent metrics with usage information from an LLM response.
+
+        Args:
+            usage_info: Usage information from LLM response containing token counts and cost
+        """
+        if not usage_info:
+            return
+
+        self._subagent_metrics.total_prompt_tokens += usage_info.prompt_tokens
+        self._subagent_metrics.total_completion_tokens += usage_info.completion_tokens
+        self._subagent_metrics.total_cached_tokens += usage_info.cache_tokens
+        self._subagent_metrics.total_cost_usd += usage_info.cost_usd
+
+    def _extract_usage_metrics(self, usage_info) -> tuple[int, int, int, float]:
+        """Extract and normalize metrics from usage info.
+
+        Args:
+            usage_info: Usage information from LLM response
+
+        Returns:
+            Tuple of (prompt_tokens, completion_tokens, cached_tokens, cost_usd)
+        """
+        if not usage_info:
+            return 0, 0, 0, 0
+
+        return (
+            usage_info.prompt_tokens,
+            usage_info.completion_tokens,
+            usage_info.cache_tokens,
+            usage_info.cost_usd if usage_info.cost_usd > 0 else 0,
+        )
+
+    def _track_api_request_time(self, start_time: float) -> None:
+        """Track API request time from start timestamp.
+
+        Args:
+            start_time: Start time from time.time()
+        """
+        end_time = time.time()
+        request_time_ms = (end_time - start_time) * 1000
+        self._api_request_times.append(request_time_ms)
+
+    async def _run_subagent(
+        self,
+        prompt: str,
+        message_history: list[dict[str, Any]],
+        steps: list[Step],
+        session_id: str,
+        agent_name: str,
+        filename_suffix: str,
+        summary_text: str,
+        subagent_name_for_logging: str = "subagent",
+    ) -> tuple[LLMResponse, SubagentTrajectoryRef]:
+        """Run a subagent and return its response and trajectory reference.
+
+        This helper encapsulates the common pattern of:
+        1. Appending the prompt step to the trajectory

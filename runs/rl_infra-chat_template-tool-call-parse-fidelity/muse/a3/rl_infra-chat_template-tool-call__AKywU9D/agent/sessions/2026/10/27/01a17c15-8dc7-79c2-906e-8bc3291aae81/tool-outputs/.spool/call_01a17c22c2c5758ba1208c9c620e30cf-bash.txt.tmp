@@ -1,0 +1,61 @@
+266:def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
+267-    """
+268-    Infer the primary type of a parameter from JSON Schema.
+269-
+270-    Supports complex JSON Schema structures including:
+271-    - Direct type field (including type arrays)
+272-    - anyOf/oneOf: parameter can be any of multiple types
+273-    - enum: parameter must be one of enum values
+274-    - allOf: parameter must satisfy all type definitions
+275-    - properties: inferred as object type
+276-    - items: inferred as array type
+277-
+278-    Args:
+279-        schema: JSON Schema definition
+280-
+281-    Returns:
+282-        Inferred type ('string', 'number', 'object', 'array', etc.) or None
+283-    """
+284-    if not isinstance(schema, dict):
+285-        return None
+286-
+287-    # Priority 1: Direct type field (including type arrays)
+288-    if "type" in schema:
+289-        type_value = schema["type"]
+290-        if isinstance(type_value, str):
+291-            return type_value
+292-        elif isinstance(type_value, list) and type_value:
+293-            # Handle type arrays: return first non-null type
+294-            non_null_types = [t for t in type_value if t != "null"]
+295-            if non_null_types:
+296-                return non_null_types[0]
+297-            return "string"  # If only null, default to string
+298-
+299-    # Priority 2: Handle anyOf/oneOf
+300-    if "anyOf" in schema or "oneOf" in schema:
+301-        schemas = schema.get("anyOf") or schema.get("oneOf")
+302-        types = []
+303-
+304-        if isinstance(schemas, list):
+305-            for sub_schema in schemas:
+306-                inferred_type = infer_type_from_json_schema(sub_schema)
+307-                if inferred_type:
+308-                    types.append(inferred_type)
+309-
+310-            if types:
+311-                # If all types are the same, return unified type
+312-                if len(set(types)) == 1:
+313-                    return types[0]
+314-                # When types differ, prioritize string (safest)
+315-                if "string" in types:
+316-                    return "string"
+317-                # Otherwise return first type
+318-                return types[0]
+319-
+320-    # Priority 3: Handle enum (infer type from enum values)
+321-    if "enum" in schema and isinstance(schema["enum"], list):
+322-        if not schema["enum"]:
+323-            return "string"
+324-
+325-        # Infer type from enum values
+326-        enum_types = set()

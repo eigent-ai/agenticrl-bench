@@ -1,0 +1,177 @@
+Read text file `/root/miles/examples/sql_agent/sql_tool.py`.
+1|"""SQL data agent: tool definitions, tool execution and reward for multi-turn RL on Spider databases.
+2|
+3|Mounted via the generic multi-turn generate function:
+4|    --custom-generate-function-path miles.rollout.generate_hub.multi_turn.generate
+5|    --generate-tool-specs-path examples.sql_agent.sql_tool.tool_specs
+6|    --generate-execute-tool-function-path examples.sql_agent.sql_tool.execute_tool
+7|    --custom-rm-path examples.sql_agent.sql_tool.reward_func
+8|The agent gets a database name and a question, explores the database with `execute_sql`, and finishes with
+9|"Final SQL:" followed by a ```sql block. Reward is execution match against the gold query (+1 / -1).
+10|"""
+11|
+12|import asyncio
+13|import json
+14|import os
+15|import re
+16|import sqlite3
+17|import time
+18|from collections import Counter
+19|from typing import Any
+20|
+21|from miles.utils.processing_utils import load_tokenizer
+22|from miles.utils.types import Sample
+23|
+24|DB_ROOT = os.environ.get("SQL_AGENT_DB_ROOT", "/data/spider/databases")
+25|
+26|TOOL_CONFIGS = {
+27|    "tool_concurrency": 32,
+28|    "query_time_limit": 5.0,  # seconds of engine time per query
+29|    "max_rows": 30,  # rows shown to the agent
+30|    "max_chars": 2000,  # characters shown to the agent
+31|    "reward_time_limit": 30.0,  # gold / final query execution when scoring
+32|}
+33|
+34|SEMAPHORE = asyncio.Semaphore(TOOL_CONFIGS["tool_concurrency"])
+35|
+36|tool_specs = [
+37|    {
+38|        "type": "function",
+39|        "function": {
+40|            "name": "execute_sql",
+41|            "description": "Run one read-only SQLite statement against a database and return the result rows "
+42|            f"(at most {TOOL_CONFIGS['max_rows']} rows are shown).",
+43|            "parameters": {
+44|                "type": "object",
+45|                "properties": {
+46|                    "database": {"type": "string", "description": "Database name, e.g. concert_singer"},
+47|                    "query": {"type": "string", "description": "A single SQLite statement"},
+48|                },
+49|                "required": ["database", "query"],
+50|            },
+51|        },
+52|    }
+53|]
+54|
+55|
+56|def _db_path(database: str) -> str | None:
+57|    if not re.fullmatch(r"[A-Za-z0-9_]+", database or ""):
+58|        return None
+59|    path = os.path.join(DB_ROOT, database, f"{database}.sqlite")
+60|    return path if os.path.exists(path) else None
+61|
+62|
+63|def _run_query(path: str, query: str, time_limit: float, max_rows: int | None):
+64|    """Execute on a read-only connection; raises sqlite3.OperationalError('interrupted') past the time limit."""
+65|    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, check_same_thread=False)
+66|    con.text_factory = lambda b: b.decode(errors="replace")
+67|    deadline = time.monotonic() + time_limit
+68|    con.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, 10_000)
+69|    try:
+70|        cur = con.execute(query)
+71|        cols = [d[0] for d in (cur.description or [])]
+72|        rows = cur.fetchall() if max_rows is None else cur.fetchmany(max_rows + 1)
+73|        return cols, rows
+74|    finally:
+75|        con.close()
+76|
+77|
+78|def _format(cols: list[str], rows: list[tuple]) -> str:
+79|    max_rows, max_chars = TOOL_CONFIGS["max_rows"], TOOL_CONFIGS["max_chars"]
+80|    if not cols:
+81|        return "OK (no rows returned)"
+82|    lines = [" | ".join(cols)] + [" | ".join("NULL" if v is None else str(v) for v in r) for r in rows[:max_rows]]
+83|    text = "\n".join(lines)
+84|    if len(rows) > max_rows:
+85|        text += f"\n... (more than {max_rows} rows)"
+86|    if len(text) > max_chars:
+87|        text = text[:max_chars] + "\n... (output truncated)"
+88|    return text
+89|
+90|
+91|async def execute_tool(name: str, params: dict) -> str:
+92|    if name != "execute_sql":
+93|        return f"Error: Tool '{name}' not found"
+94|    database, query = str(params.get("database", "")), str(params.get("query", "")).strip()
+95|    path = _db_path(database)
+96|    if path is None:
+97|        return f"Error: unknown database '{database}'"
+98|    if not query:
+99|        return "Error: empty query"
+100|    limit = TOOL_CONFIGS["query_time_limit"]
+101|    async with SEMAPHORE:
+102|        try:
+103|            cols, rows = await asyncio.to_thread(_run_query, path, query, limit, TOOL_CONFIGS["max_rows"])
+104|        except sqlite3.OperationalError as e:
+105|            if "interrupted" in str(e):
+106|                return f"Error: query timed out after {limit:.0f}s"
+107|            return f"Error: {e}"
+108|        except (sqlite3.Error, ValueError) as e:  # ValueError: e.g. more than one statement
+109|            return f"Error: {e}"
+110|    return _format(cols, rows)
+111|
+112|
+113|# ------------------------------------------------------------------------------------------------ reward
+114|_FINAL = re.compile(r"Final SQL:\s*```(?:sql)?\s*(.*?)```", re.S | re.I)
+115|_ANY_SQL = re.compile(r"```sql\s*(.*?)```", re.S | re.I)
+116|_GOLD_CACHE: dict[tuple[str, str], Any] = {}
+117|
+118|
+119|def extract_final_sql(text: str) -> str | None:
+120|    m = _FINAL.findall(text) or _ANY_SQL.findall(text)
+121|    return m[-1].strip() if m else None
+122|
+123|
+124|def _normalise(rows) -> list[tuple]:
+125|    return [tuple(round(v, 4) if isinstance(v, float) else v for v in r) for r in rows]
+126|
+127|
+128|def _execute_for_reward(db_path: str, query: str):
+129|    _, rows = _run_query(db_path, query, TOOL_CONFIGS["reward_time_limit"], None)
+130|    return _normalise(rows)
+131|
+132|
+133|async def reward_func(args, sample: Sample, **kwargs):
+134|    """Execution match against the gold query: +1 if the final query returns the gold result, -1 otherwise."""
+135|    label = json.loads(sample.label)
+136|    db_path = _db_path(label["db_id"])
+137|    # a response cut off at the length limit never gave its answer, whatever SQL it had written so far
+138|    truncated = sample.status == Sample.Status.TRUNCATED
+139|    pred_sql = None if truncated else extract_final_sql(sample.response or "")
+140|    result = {"score": -1.0, "pred": pred_sql or "", "acc": False}
+141|    if db_path is not None and pred_sql:
+142|        key = (label["db_id"], label["query"])
+143|        try:
+144|            if key not in _GOLD_CACHE:
+145|                _GOLD_CACHE[key] = await asyncio.to_thread(_execute_for_reward, db_path, label["query"])
+146|            gold = _GOLD_CACHE[key]
+147|            pred = await asyncio.to_thread(_execute_for_reward, db_path, pred_sql)
+148|            ordered = "order by" in label["query"].lower()
+149|            result["acc"] = pred == gold if ordered else Counter(pred) == Counter(gold)
+150|        except (sqlite3.Error, ValueError):
+151|            result["acc"] = False
+152|    if result["acc"]:
+153|        result["score"] = 1.0
+154|    return result
+155|
+156|
+157|# ------------------------------------------------------------------------------------------------ length guard
+158|_TOKENIZER = None
+159|
+160|
+161|def clip_to_context(args, data: list[list[Sample]]):
+162|    """Clip trajectories that ran past the context budget. The engine stops generating at --rollout-max-context-len,
+163|    but a turn with many tool calls can still append a lot of tool output after it (we saw a 31k-token sample OOM the
+164|    trainer's log-prob pass). Used as --rollout-sample-filter-path and after the rescue."""
+165|    global _TOKENIZER
+166|    limit = args.rollout_max_context_len
+167|    for group in data:
+168|        for sample in group:
+169|            extra = len(sample.tokens) - limit
+170|            if extra <= 0:
+171|                continue
+172|            if _TOKENIZER is None:
+173|                _TOKENIZER = load_tokenizer(args.hf_checkpoint, chat_template_path=args.chat_template_path,
+174|                                            trust_remote_code=True)
+175|            sample.strip_last_output_tokens(min(extra, sample.response_length), _TOKENIZER)
+176|            sample.status = Sample.Status.TRUNCATED

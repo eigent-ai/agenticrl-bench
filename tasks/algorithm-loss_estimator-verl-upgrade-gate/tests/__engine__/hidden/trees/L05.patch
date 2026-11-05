@@ -1,0 +1,34 @@
+diff -ruN '--exclude=__pycache__' base/verl/trainer/ppo/core_algos.py L05/verl/trainer/ppo/core_algos.py
+--- base/verl/trainer/ppo/core_algos.py	2026-10-12 11:39:31.000000000 +0000
++++ L05/verl/trainer/ppo/core_algos.py	2026-10-12 12:10:27.097063476 +0000
+@@ -714,16 +714,20 @@
+     assert config is not None
+     gamma = config.gamma
+     with torch.no_grad():
+-        returns = torch.zeros_like(token_level_rewards)
+-        running_return = 0
+-
+-        for t in reversed(range(token_level_rewards.shape[1])):
+-            new_running_return = token_level_rewards[:, t] + gamma * running_return
+-            # For valid tokens (mask=1): update returns and running_return.
+-            # For observation tokens (mask=0): skip — carry running_return
+-            # through unchanged so rewards propagate past observation spans.
+-            returns[:, t] = new_running_return * response_mask[:, t]
+-            running_return = new_running_return * response_mask[:, t] + running_return * (1 - response_mask[:, t])
++        mask = response_mask.to(token_level_rewards.dtype)
++        if gamma == 1.0:
++            # undiscounted: the return of a token is the sum of the rewards on valid tokens at or after it
++            # (rewards on observation tokens never enter the scan); observation tokens carry the return
++            # of the next valid token.
++            valid_rewards = token_level_rewards * mask
++            returns = torch.flip(torch.cumsum(torch.flip(valid_rewards, dims=[-1]), dim=-1), dims=[-1])
++        else:
++            returns = torch.zeros_like(token_level_rewards)
++            running_return = torch.zeros_like(token_level_rewards[:, 0])
++            for t in reversed(range(token_level_rewards.shape[1])):
++                new_running_return = token_level_rewards[:, t] + gamma * running_return
++                running_return = torch.where(mask[:, t] > 0, new_running_return, running_return)
++                returns[:, t] = running_return
+ 
+         advantages = verl_F.masked_whiten(returns, response_mask)
+         advantages = advantages * response_mask

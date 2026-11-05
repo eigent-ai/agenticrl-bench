@@ -1,0 +1,382 @@
+    ``session_id`` identifies this environment instance within a job/trial and is used
+    as a human-readable handle by sandbox providers. Designed to be ephemeral which
+    will mostly be consumed by the user during or shortly after the trial.
+    Examples include ``hello-world__bZZeEkw__env`` and
+    ``hello-world__bZZeEkw__verifier__grade``.
+
+    ``context_id`` is the globally unique identifier shared by the environment
+    and its related agent, allowing their records to be linked across systems.
+    Designed to be durable. It currently points to the trial _id, for example
+    ``594025f3-7d65-4655-8576-4bee95002eae``.
+
+    See ``CHANGELOG.md 2026-06-24 — Runtime identity fields`` for further information about naming conventions.
+    """
+
+    environment_dir: Path
+    environment_name: str
+    session_id: str
+    context_id: UUID | None = None
+    trial_paths: TrialPaths
+    task_env_config: EnvironmentConfig
+    extra_docker_compose_paths: list[Path]
+    logger: logging.Logger
+
+    default_user: str | int | None
+
+    def __init__(
+        self,
+        environment_dir: Path,
+        environment_name: str,
+        session_id: str,
+        trial_paths: TrialPaths,
+        task_env_config: EnvironmentConfig,
+        logger: logging.Logger | None = None,
+        override_cpus: int | None = None,
+        override_memory_mb: int | None = None,
+        override_storage_mb: int | None = None,
+        override_gpus: int | None = None,
+        override_tpu: TpuSpec | None = None,
+        cpu_enforcement_policy: ResourceMode = ResourceMode.AUTO,
+        memory_enforcement_policy: ResourceMode = ResourceMode.AUTO,
+        persistent_env: dict[str, str] | None = None,
+        mounts: list[ServiceVolumeConfig] | None = None,
+        network_policy: NetworkPolicy | None = None,
+        phase_network_policies: Sequence[NetworkPolicy] | None = None,
+        extra_docker_compose: Sequence[Path | str] | None = None,
+        *args,
+        stream: bool = False,
+        enable_environment_dir_upload: bool = True,
+        **kwargs,
+    ):
+        """
+        Initialize a BaseEnvironment from a directory path and name.
+
+        Args:
+            environment_dir: Path to the environment directory. The directory should
+            contain the environment definition files (e.g. docker-compose.yaml).
+            environment_name: The name of the environment. Typically the task short
+                name (without registry org prefix).
+            session_id: The semantic per-instance handle
+                (``{trial_name}__{role}``). e.g ``hello-world__bZZeEkw__env``
+                This is a legacy naming exception.
+            trial_paths: The trial paths.
+            task_env_config: The environment configuration from the task.
+            logger: The logger to use for the environment.
+            mounts: Base host→container bind mount specs the env should expose
+                (and auto-create + chmod inside the container). The trial
+                computes this list — the env doesn't decide its own mount
+                policy. None means the env auto-manages no paths; subclasses
+                that bind-mount may apply a back-compat default. Subclasses
+                that don't bind-mount (cloud providers) may ignore the list
+                or use the target paths only as mkdir hints.
+            network_policy: Runtime network policy for this environment's role
+                (agent or verifier). Providers must enforce the policy exactly
+                or reject the task before start.
+            phase_network_policies: Network policies this environment may need
+                during agent/verifier execution phases after it starts. Providers
+                may use this with ``network_policy`` to choose a startup strategy
+                that supports later dynamic policy changes.
+            extra_docker_compose: Additional Docker Compose overlay files to
+                layer on top of the task's environment definition.
+            enable_environment_dir_upload: Upload loose environment files after startup.
+                Disabled for dedicated verifier images, which own their tests.
+        """
+        if "suppress_override_warnings" in kwargs:
+            warnings.warn(
+                "The suppress_override_warnings argument is deprecated and has no "
+                "effect; resource override warnings are no longer emitted.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            kwargs.pop("suppress_override_warnings")
+        self.environment_dir = environment_dir
+        self._enable_environment_dir_upload = enable_environment_dir_upload
+        self.environment_name = environment_name
+        self.session_id = session_id
+        self.trial_paths = trial_paths
+        self.default_user = None
+        self.extra_docker_compose_paths = self._normalize_extra_docker_compose_paths(
+            extra_docker_compose
+        )
+
+        self.task_env_config = task_env_config
+        self._stream = stream
+        if stream and not self.capabilities.stream:
+            raise ValueError(
+                f"{self.type()} does not support stream mode in this configuration"
+            )
+        self._validate_extra_docker_compose_support()
+
+        self._override_cpus = override_cpus
+        self._override_memory_mb = override_memory_mb
+        self._override_storage_mb = override_storage_mb
+        self._override_gpus = override_gpus
+        self._override_tpu = override_tpu
+        self._cpu_resource_mode = ResourceMode(cpu_enforcement_policy)
+        self._memory_resource_mode = ResourceMode(memory_enforcement_policy)
+        self._persistent_env: dict[str, str] = persistent_env or {}
+        self._mounts: list[ServiceVolumeConfig] = list(mounts) if mounts else []
+        self._network_policy = network_policy or NetworkPolicy()
+        self._phase_network_policies: list[NetworkPolicy] = list(
+            phase_network_policies or []
+        )
+        self._output_callbacks: contextvars.ContextVar[tuple[OutputCallback, ...]] = (
+            contextvars.ContextVar("output_callbacks", default=())
+        )
+        self._exec_env_overlays: contextvars.ContextVar[ExecEnvOverlays] = (
+            contextvars.ContextVar("exec_env_overlays", default=())
+        )
+
+        self.logger = (logger or global_logger).getChild(__name__)
+
+        self._maybe_override_task_env_config()
+        self._maybe_resolve_task_env()
+
+        self._validate_definition()
+        self._validate_resource_mode_support()
+        self._validate_gpu_support()
+        self._validate_tpu_support()
+        self._validate_network_policy_support()
+        self._validate_windows_support()
+
+    @cached_property
+    def environment_id(self) -> str:
+        """Stable content identity for this environment definition.
+
+        Use this when linking, caching, or tagging a specific environment
+        build across systems. Use ``environment_name`` for the human-readable
+        task/environment handle.
+        """
+        return environment_content_hash(
+            self.environment_dir,
+            docker_image=self.task_env_config.docker_image,
+        )
+
+    @staticmethod
+    def _normalize_extra_docker_compose_paths(
+        paths: Sequence[Path | str] | None,
+    ) -> list[Path]:
+        normalized: list[Path] = []
+        for raw_path in paths or []:
+            path = Path(raw_path).expanduser()
+=== factory ===
+from __future__ import annotations
+
+import importlib
+import logging
+from contextlib import AbstractAsyncContextManager
+from pathlib import Path
+from typing import NamedTuple
+
+from harbor.environments.base import BaseEnvironment
+from harbor.environments.capabilities import EnvironmentResourceCapabilities
+from harbor.environments.resource_policies import validate_resource_capabilities
+from harbor.environments.ssh import SSHAccess, StreamHandle
+from harbor.models.environment_type import EnvironmentType
+from harbor.models.task.config import EnvironmentConfig
+from harbor.models.trial.config import EnvironmentConfig as TrialEnvironmentConfig
+from harbor.models.trial.config import ResourceMode
+from harbor.models.trial.paths import TrialPaths
+from harbor.utils.import_path import import_class, import_symbol
+
+
+class _EnvEntry(NamedTuple):
+    module: str
+    class_name: str
+    pip_extra: str | None
+
+
+# Registry of built-in environment types.  Modules are imported lazily so
+# that vendor SDKs (daytona, e2b, modal, …) are only pulled in when the
+# corresponding environment is actually requested.
+_ENVIRONMENT_REGISTRY: dict[EnvironmentType, _EnvEntry] = {
+    EnvironmentType.APPLE_CONTAINER: _EnvEntry(
+        "harbor.environments.apple_container",
+        "AppleContainerEnvironment",
+        None,
+    ),
+    EnvironmentType.DOCKER: _EnvEntry(
+        "harbor.environments.docker.docker",
+        "DockerEnvironment",
+        None,
+    ),
+    EnvironmentType.PODMAN: _EnvEntry(
+        "harbor.environments.podman",
+        "PodmanEnvironment",
+        None,
+    ),
+    EnvironmentType.DAYTONA: _EnvEntry(
+        "harbor.environments.daytona",
+        "DaytonaEnvironment",
+        "daytona",
+    ),
+    EnvironmentType.E2B: _EnvEntry(
+        "harbor.environments.e2b",
+        "E2BEnvironment",
+        "e2b",
+    ),
+    EnvironmentType.GKE: _EnvEntry(
+        "harbor.environments.gke",
+        "GKEEnvironment",
+        "gke",
+    ),
+    EnvironmentType.ACK: _EnvEntry(
+        "harbor.environments.ack",
+        "ACKEnvironment",
+        None,
+    ),
+    EnvironmentType.EC2: _EnvEntry(
+        "harbor.environments.ec2",
+        "EC2Environment",
+        "ec2",
+    ),
+    EnvironmentType.OPENSHIFT: _EnvEntry(
+        "harbor.environments.openshift",
+        "OpenshiftEnvironment",
+        None,
+    ),
+    EnvironmentType.ISLO: _EnvEntry(
+        "harbor.environments.islo",
+        "IsloEnvironment",
+        "islo",
+    ),
+    EnvironmentType.MODAL: _EnvEntry(
+        "harbor.environments.modal",
+        "ModalEnvironment",
+        "modal",
+    ),
+    EnvironmentType.RUNLOOP: _EnvEntry(
+        "harbor.environments.runloop",
+        "RunloopEnvironment",
+        "runloop",
+    ),
+    EnvironmentType.LANGSMITH: _EnvEntry(
+        "harbor.environments.langsmith",
+        "LangSmithEnvironment",
+        "langsmith",
+    ),
+    EnvironmentType.NOVITA: _EnvEntry(
+        "harbor.environments.novita",
+        "NovitaEnvironment",
+        "novita",
+    ),
+    EnvironmentType.SINGULARITY: _EnvEntry(
+        "harbor.environments.singularity",
+        "SingularityEnvironment",
+        None,
+    ),
+    EnvironmentType.TENSORLAKE: _EnvEntry(
+        "harbor.environments.tensorlake",
+        "TensorLakeEnvironment",
+        "tensorlake",
+    ),
+    EnvironmentType.CWSANDBOX: _EnvEntry(
+        "harbor.environments.cwsandbox",
+        "CWSandboxEnvironment",
+        "cwsandbox",
+    ),
+    EnvironmentType.USE_COMPUTER: _EnvEntry(
+        "harbor.environments.use_computer",
+        "UseComputerEnvironment",
+        "use-computer",
+    ),
+    EnvironmentType.CUA_CLOUD: _EnvEntry(
+        "harbor.environments.cua_cloud",
+        "CuaCloudEnvironment",
+        "cua",
+    ),
+    EnvironmentType.BLAXEL: _EnvEntry(
+        "harbor.environments.blaxel",
+        "BlaxelEnvironment",
+        "blaxel",
+    ),
+    EnvironmentType.OPENSANDBOX: _EnvEntry(
+        "harbor.environments.opensandbox",
+        "OpenSandboxEnvironment",
+        "opensandbox",
+    ),
+    EnvironmentType.BEAM: _EnvEntry(
+        "harbor.environments.beam",
+        "BeamEnvironment",
+        "beam",
+    ),
+    EnvironmentType.SKYPILOT: _EnvEntry(
+        "harbor.environments.skypilot",
+        "SkypilotEnvironment",
+        "skypilot",
+    ),
+    EnvironmentType.HF_SANDBOX: _EnvEntry(
+        "harbor.environments.hf_sandbox",
+        "HFSandboxEnvironment",
+        "hf-sandbox",
+    ),
+    EnvironmentType.HYPERBROWSER: _EnvEntry(
+        "harbor.environments.hyperbrowser",
+        "HyperbrowserEnvironment",
+        "hyperbrowser",
+    ),
+    EnvironmentType.VERCEL: _EnvEntry(
+        "harbor.environments.vercel",
+        "VercelSandboxEnvironment",
+        "vercel",
+    ),
+    EnvironmentType.RUNTA: _EnvEntry(
+        "harbor.environments.runta",
+        "RuntaEnvironment",
+        "runta",
+    ),
+    EnvironmentType.PRIME: _EnvEntry(
+        "harbor.environments.prime",
+        "PrimeEnvironment",
+        "prime",
+    ),
+    EnvironmentType.KATA: _EnvEntry(
+        "harbor.environments.kata",
+        "KataEnvironment",
+        None,
+    ),
+    EnvironmentType.MOSAIC: _EnvEntry(
+        "harbor.environments.mosaic",
+        "MosaicEnvironment",
+        "mosaic",
+    ),
+    EnvironmentType.SMOL: _EnvEntry(
+        "harbor.environments.smol",
+        "SmolEnvironment",
+        "smol",
+    ),
+}
+
+
+def _load_environment_class(env_type: EnvironmentType) -> type[BaseEnvironment]:
+    """Lazily import and return the environment class for *env_type*."""
+    entry = _ENVIRONMENT_REGISTRY.get(env_type)
+    if entry is None:
+        raise ValueError(
+            f"Unsupported environment type: {env_type}. This could be because the "
+            "environment is not registered in the EnvironmentFactory or because "
+            "the environment type is invalid."
+        )
+
+    try:
+        module = importlib.import_module(entry.module)
+    except ImportError as exc:
+        if entry.pip_extra is not None:
+            raise ImportError(
+                f"The '{env_type.value}' environment requires extra dependencies. "
+                f"Install them with:\n"
+                f"  pip install 'harbor[{entry.pip_extra}]'\n"
+                f"  uv tool install 'harbor[{entry.pip_extra}]'\n"
+                f"Or install all cloud environments with 'harbor[cloud]'."
+            ) from exc
+        raise
+
+    cls: type[BaseEnvironment] = getattr(module, entry.class_name)
+    return cls
+
+
+class EnvironmentFactory:
+    @classmethod
+    def connect_ssh(
+        cls, handle: StreamHandle
+    ) -> AbstractAsyncContextManager[SSHAccess]:

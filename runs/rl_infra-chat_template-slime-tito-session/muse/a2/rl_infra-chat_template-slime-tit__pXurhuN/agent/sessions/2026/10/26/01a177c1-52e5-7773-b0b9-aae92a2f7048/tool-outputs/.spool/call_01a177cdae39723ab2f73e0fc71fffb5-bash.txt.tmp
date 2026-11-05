@@ -1,0 +1,61 @@
+        if self.text is None and self.input_ids is None and self.image_data is None:
+            raise ValueError(
+                "At least one of text, input_ids, or image should be provided"
+            )
+
+        # text and input_ids cannot be provided at the same time
+        if self.text is not None and self.input_ids is not None:
+            raise ValueError("text and input_ids cannot be provided at the same time")
+
+        # Derive the batch size
+        self.batch_size = 0
+        self.is_single = True
+
+        # check the batch size of text
+        if self.text is not None:
+            if isinstance(self.text, list):
+                self.batch_size += len(self.text)
+                self.is_single = False
+            else:
+                self.batch_size += 1
+
+        # check the batch size of input_ids
+        if self.input_ids is not None:
+            if isinstance(self.input_ids[0], list):
+                self.batch_size += len(self.input_ids)
+                self.is_single = False
+            else:
+                self.batch_size += 1
+
+        # Fill in default arguments
+        if self.is_single:
+            if self.rid is None:
+                self.rid = uuid.uuid4().hex
+            if self.sampling_params is None:
+                self.sampling_params = {}
+            self.sampling_params["max_new_tokens"] = 0
+        else:
+            if self.rid is None:
+                self.rid = [uuid.uuid4().hex for _ in range(self.batch_size)]
+            else:
+                assert isinstance(self.rid, list), "The rid should be a list."
+
+            if self.sampling_params is None:
+                self.sampling_params = [{}] * self.batch_size
+            elif isinstance(self.sampling_params, dict):
+                self.sampling_params = [self.sampling_params] * self.batch_size
+            for i in range(self.batch_size):
+                self.sampling_params[i]["max_new_tokens"] = 0
+
+            self._normalize_lora_paths(self.batch_size)
+
+    def _normalize_lora_paths(self, num):
+        """Normalize LoRA paths for batch processing."""
+        if self.lora_path is not None:
+            if isinstance(self.lora_path, str):
+                self.lora_path = [self.lora_path] * num
+            elif isinstance(self.lora_path, list):
+                if len(self.lora_path) != num:
+                    raise ValueError(
+                        f"lora_path list length ({len(self.lora_path)}) must match batch size ({num})"
+                    )

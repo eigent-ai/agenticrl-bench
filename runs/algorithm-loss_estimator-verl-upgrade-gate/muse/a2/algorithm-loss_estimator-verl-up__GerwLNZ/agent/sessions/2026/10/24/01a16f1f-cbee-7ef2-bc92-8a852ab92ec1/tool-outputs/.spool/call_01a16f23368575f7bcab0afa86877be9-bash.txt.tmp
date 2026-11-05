@@ -1,0 +1,222 @@
+
+    Note:
+        Converts chunks to float32 for numerical stability during computation.
+    """
+    entropy = torch.zeros(logits.shape[0], device=logits.device)
+    for i in range(0, logits.shape[0], chunk_size):
+        logits_chunk = logits[i : i + chunk_size].float()
+        pd_chunk = torch.nn.functional.softmax(logits_chunk, dim=-1)
+        entropy_chunk = torch.logsumexp(logits_chunk, dim=-1) - torch.sum(pd_chunk * logits_chunk, dim=-1)
+        entropy[i : i + chunk_size] = entropy_chunk
+    return entropy
+
+
+def masked_sum(values: torch.Tensor, mask: torch.Tensor, axis: int | tuple[int, ...] | None = None) -> torch.Tensor:
+    """Compute sum of tensor values where mask is True.
+
+    NaN values outside the mask are replaced with zeros to prevent
+    contaminating the sum.
+
+    Args:
+        values: Input tensor containing values to sum.
+        mask: Boolean or numeric mask tensor (same shape as values).
+            Non-zero values indicate elements to include.
+        axis: Dimension(s) along which to sum. None sums all elements.
+
+    Returns:
+        torch.Tensor: Sum of masked values, reduced along specified axis.
+    """
+    # If NaNs exist out of mask, replace NaNs in values with a value that
+    # won't affect the sum (e.g., 0 for masked regions)
+    valid_values = torch.where(mask.bool(), values, 0.0)
+    return (valid_values * mask).sum(axis=axis)
+
+
+def masked_mean(values, mask, axis=None):
+    """
+    Compute the mean of `values` over elements selected by `mask`.
+
+    Args:
+        values (Tensor): Input tensor.
+        mask (Tensor): Boolean or numeric mask of the same shape as `values`.
+        axis (int or tuple of int, optional): Dimension(s) along which to compute the mean.
+            Defaults to None (over all elements).
+
+    Returns:
+        Tensor: Masked mean, with shape equal to `values` reduced over `axis`.
+    """
+    s = masked_sum(values, mask, axis)
+    return s / (mask.sum(axis=axis) + 1e-8)
+
+
+def masked_var(values, mask, unbiased=True):
+    """Compute variance of tensor with masked values."""
+    mean = masked_mean(values, mask)
+    centered_values = values - mean
+    variance = masked_mean(centered_values**2, mask)
+    if unbiased:
+        mask_sum = mask.sum()
+        if mask_sum == 0:
+            raise ValueError("At least one element in the mask has to be 1.")
+        # note that if mask_sum == 1, then there is a division by zero issue
+        # to avoid it you just need to use a larger minibatch_size
+        if mask_sum == 1:
+            raise ValueError("The sum of the mask is one, which can cause a division by zero.")
+        bessel_correction = mask_sum / (mask_sum - 1)
+        variance = variance * bessel_correction
+    return variance
+
+
+def masked_whiten(values, mask, shift_mean=True):
+    """
+    Whiten `values` by normalizing with mean and variance computed over `mask`.
+
+    Args:
+        values (torch.Tensor): Input tensor.
+        mask (torch.Tensor): Boolean tensor of same shape, selects elements for stats.
+        shift_mean (bool): If True (default), output is zero-mean;
+                           if False, the original mean is re-added after scaling.
+
+    Returns:
+        torch.Tensor: Whitened tensor of same shape as `values`.
+    """
+    mean, var = masked_mean(values, mask), masked_var(values, mask)
+    whitened = (values - mean) * torch.rsqrt(var + 1e-8)
+    if not shift_mean:
+        whitened += mean
+    return whitened
+
+
+def get_response_mask(response_id: torch.Tensor, eos_token: int | list[int] = 2, dtype=torch.int64):
+    """
+    end of sentence token can be int or list: 1 or [1, 2]
+    e.g.
+    response_id = torch.tensor([[20, 10, 34, 1, 0, 0, 0],
+                                [78, 0, 76, 2, 1, 0, 0],
+                                [23, 98, 1, 0, 0, 0, 0],
+                                [33, 3, 98, 45, 1, 0, 0]])
+    #eos_token=1
+    response_mask:  tensor([[1, 1, 1, 1, 0, 0, 0],
+                            [1, 1, 1, 1, 1, 0, 0],
+                            [1, 1, 1, 0, 0, 0, 0],
+=== groupwise ===
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+# Copyright 2023-2024 SGLang Team
+# Copyright 2025 ModelBest Inc. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+Group-wise helpers for RL training utilities.
+
+Public API:
+    - as_torch_index(index, device=None) -> torch.LongTensor
+    - group_mean_std(scores, gidx, eps=1e-6, device=None) -> (mean_g, std_g, count_g)
+
+Default device policy:
+    - If `device` is None:
+        * In pytest (detected by env "PYTEST_CURRENT_TEST"): use CPU.
+        * Else if CUDA is available: use CUDA.
+        * Else: use CPU.
+    - You can override via env "VERL_FORCE_DEVICE" (e.g., "cuda:0" / "cpu").
+
+Notes:
+- as_torch_index: canonicalizes arbitrary group labels to a contiguous 1-D torch.long
+  tensor in range [0..G-1]. Robust to torch/numpy/list/tuple, ints/floats/bools,
+  numeric strings, UUIDs, mixed object arrays. Near-integer floats (|x-round(x)|<=1e-6)
+  are rounded; otherwise factorization is applied.
+- group_mean_std: pure-PyTorch per-group mean/std with Bessel correction for variance
+  (denominator max(count-1, 1)). Singleton groups fallback to mean=0, std=1 for
+  compatibility with common “native” conventions.
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Any, Optional
+
+import numpy as np
+import torch
+
+from verl.utils.device import get_device_name
+
+__all__ = ["as_torch_index", "group_mean_std"]
+
+
+def _resolve_device(explicit: Optional[torch.device | str]) -> torch.device:
+    """
+    Resolve device according to policy described in the module docstring.
+    Priority:
+      1) explicit argument
+      2) VERL_FORCE_DEVICE env
+      3) pytest detection -> cpu
+      4) cuda if available, else cpu
+    """
+    if explicit is not None:
+        return torch.device(explicit)
+
+    forced = os.getenv("VERL_FORCE_DEVICE")
+    if forced:
+        return torch.device(forced)
+
+    # Heuristic: pytest sets PYTEST_CURRENT_TEST
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return torch.device("cpu")
+
+    return torch.device(get_device_name())
+
+
+def _to_1d_numpy_object_array(x: Any) -> np.ndarray:
+    """Best-effort: convert arbitrary input into a 1-D numpy array; fallback to object dtype."""
+    try:
+        arr = np.asarray(x)
+    except Exception:
+        try:
+            arr = np.array(list(x), dtype=object)
+        except Exception:
+            arr = np.array([x], dtype=object)
+    if arr.ndim != 1:
+        arr = arr.reshape(-1)
+    return arr
+
+
+def as_torch_index(index: Any, device: torch.device | str | None = None) -> torch.Tensor:
+    """
+    Convert arbitrary group labels to a contiguous 1-D torch.long tensor (0..G-1).
+
+    Args:
+        index: Any iterable of labels or tensor/ndarray.
+        device: Target device; if None, resolved via _resolve_device().
+
+    Returns:
+        torch.LongTensor with shape (N,)
+    """
+    target = _resolve_device(device)
+
+    # ---------- Fast path: torch.Tensor ----------
+    if isinstance(index, torch.Tensor):
+        t = index.reshape(-1)
+        if t.dtype in (
+            torch.int64,
+            torch.int32,
+            torch.int16,
+            torch.int8,
+            getattr(torch, "uint8", torch.uint8),
+            torch.bool,
+        ):
+            return t.to(device=target, dtype=torch.long)
+
+        if t.dtype in (torch.float16, torch.float32, torch.float64, torch.bfloat16):
+            t64 = t.to(dtype=torch.float64)
+            rounded = torch.round(t64)
+            if torch.allclose(t64, rounded, rtol=0.0, atol=1e-6):

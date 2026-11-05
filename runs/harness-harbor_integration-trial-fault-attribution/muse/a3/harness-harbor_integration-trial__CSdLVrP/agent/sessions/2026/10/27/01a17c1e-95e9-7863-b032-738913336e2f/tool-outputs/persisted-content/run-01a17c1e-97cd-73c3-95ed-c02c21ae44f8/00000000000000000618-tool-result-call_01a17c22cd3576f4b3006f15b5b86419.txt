@@ -1,0 +1,104 @@
+Read text file `/app/reference/harbor-0.23.0/harbor/agents/terminus_2/asciinema_handler.py`.
+1|import json
+2|from pathlib import Path
+3|from typing import TextIO
+4|
+5|
+6|class AsciinemaHandler:
+7|    """
+8|    Handles operations related to asciinema recordings, including marker management.
+9|    """
+10|
+11|    def __init__(self, markers: list[tuple[float, str]], recording_path: Path):
+12|        """
+13|        Initialize the AsciinemaHandler.
+14|
+15|        Args:
+16|            markers: List of tuples containing (timestamp, label) for each marker
+17|            recording_path: Path to the asciinema recording file
+18|        """
+19|        self._markers = sorted(markers, key=lambda x: x[0]) if markers else []
+20|        self._recording_path = recording_path
+21|
+22|    def merge_markers(self) -> None:
+23|        """
+24|        Merge asciinema markers into a recording.
+25|
+26|        Inserts marker events into an asciinema recording file at specified timestamps.
+27|        Markers are added as special events with type 'm' in the recording format.
+28|        The original recording is preserved until the merge is successful.
+29|
+30|        In the future Asciinema might support adding markers via RCP:
+31|        https://discourse.asciinema.org/t/add-markers-with-title-from-cli/861
+32|        """
+33|        if not self._markers or not self._recording_path.exists():
+34|            return
+35|
+36|        # Create a temporary file in the same directory as the recording
+37|        temp_path = self._recording_path.with_suffix(".tmp")
+38|        self._write_merged_recording(temp_path)
+39|        temp_path.replace(self._recording_path)
+40|
+41|    def _write_merged_recording(self, output_path: Path) -> None:
+42|        """
+43|        Write a new recording file with markers merged in at the correct timestamps.
+44|        """
+45|        marker_index = 0
+46|
+47|        with (
+48|            open(self._recording_path) as input_file,
+49|            open(output_path, "w") as output_file,
+50|        ):
+51|            # Preserve header
+52|            output_file.write(input_file.readline())
+53|
+54|            for line in input_file:
+55|                marker_index = self._process_recording_line(
+56|                    line, output_file, marker_index
+57|                )
+58|
+59|            # Add any remaining markers at the end
+60|            self._write_remaining_markers(output_file, self._markers[marker_index:])
+61|
+62|    def _process_recording_line(
+63|        self,
+64|        line: str,
+65|        output_file: TextIO,
+66|        marker_index: int,
+67|    ) -> int:
+68|        """Process a single line from the recording, inserting markers as needed."""
+69|        if not line.startswith("["):
+70|            output_file.write(line)
+71|            return marker_index
+72|
+73|        try:
+74|            data = json.loads(line)
+75|            timestamp = float(data[0])
+76|
+77|            # Insert any markers that should appear before this timestamp
+78|            while (
+79|                marker_index < len(self._markers)
+80|                and self._markers[marker_index][0] <= timestamp
+81|            ):
+82|                self._write_marker(output_file, self._markers[marker_index])
+83|                marker_index += 1
+84|
+85|        except (json.JSONDecodeError, ValueError, IndexError):
+86|            # If we can't parse the line, preserve it as-is
+87|            pass
+88|
+89|        output_file.write(line)
+90|        return marker_index
+91|
+92|    def _write_marker(self, output_file: TextIO, marker: tuple[float, str]) -> None:
+93|        """Write a single marker event to the output file."""
+94|        marker_time, marker_label = marker
+95|        marker_data = [marker_time, "m", marker_label]
+96|        output_file.write(json.dumps(marker_data) + "\n")
+97|
+98|    def _write_remaining_markers(
+99|        self, output_file: TextIO, markers: list[tuple[float, str]]
+100|    ) -> None:
+101|        """Write any remaining markers that come after all recorded events."""
+102|        for marker in markers:
+103|            self._write_marker(output_file, marker)

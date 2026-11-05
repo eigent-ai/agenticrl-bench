@@ -1,0 +1,34 @@
+#!/bin/bash
+# sandbox-run: Execute a command in a namespace-isolated environment.
+# Used by the CI pipeline to run untrusted test scripts safely.
+set -e
+
+ROOTFS=/opt/ns-sandbox/rootfs
+
+if [ $# -eq 0 ]; then
+    echo "Usage: sandbox-run <command> [args...]" >&2
+    exit 1
+fi
+
+if [ "${_SANDBOX_INNER:-0}" = "1" ]; then
+    mount --make-rslave /
+
+    mount -t proc proc /proc
+
+    mkdir -p "$ROOTFS/proc" "$ROOTFS/old_root"
+
+    cd "$ROOTFS"
+    pivot_root . old_root
+    chroot .
+
+    export PATH=/bin
+
+    umount /old_root
+    rmdir /old_root
+
+    exec "$@"
+    exit
+fi
+
+export _SANDBOX_INNER=1
+exec unshare --mount --fork -- "$0" "$@"

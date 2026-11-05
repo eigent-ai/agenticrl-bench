@@ -1,0 +1,187 @@
+Read text file `/app/rollout/replay/engine.py`.
+1|"""Replay engine: an SGLang-compatible chat endpoint (CPU) that answers from recorded policy traffic.
+2|
+3|    python -m replay.engine --model /models/Qwen3-1.7B --trials data/recorded/batch_1003.jsonl --port 31000
+4|
+5|The session server sends it what it would send SGLang: ``POST /v1/chat/completions`` with the prompt already
+6|tokenized in ``input_ids`` and ``return_logprob`` on. The reply comes from the recorded trial the request belongs to:
+7|
+8|  * the trial is the one whose ``seed`` the request carries (the rollout assigns every sample its own seed);
+9|  * the turn is the number of assistant turns already in the prompt;
+10|  * a prompt the engine has already answered for this trial (the client re-sent it) gets the next recorded sample
+11|    for that turn (``resample``), like a sampled model would give a different answer.
+12|
+13|A recording is one JSON object per line:
+14|
+15|    {"trial_id": "b1003-000", "seed": 31007, "instance_id": "<task dir name>", "prompt": "<instruction>",
+16|     "turns": [{"text": "<reply>", "resample": ["<reply>", ...], "delay_s": 0.0}, ...]}
+17|
+18|``resample`` (optional) lists further samples for the same prompt; ``delay_s`` (optional) holds the reply back.
+19|Replies are tokenized and cut at the request's ``max_tokens`` / ``max_new_tokens`` (``finish_reason: length``).
+20|Log-probs are a hash chain over the exact context (prompt ids, then each output id), so a token trained in a context
+21|other than the one it was sampled in carries a different value.
+22|"""
+23|
+24|
+25|import argparse
+26|import array
+27|import asyncio
+28|import hashlib
+29|import json
+30|import threading
+31|import time
+32|import uuid
+33|from collections import defaultdict
+34|
+35|SALT = b"rollout-replay"
+36|
+37|
+38|def _h(data: bytes) -> bytes:
+39|    return hashlib.blake2b(data, digest_size=16).digest()
+40|
+41|
+42|def chain_log_probs(prompt_ids, output_ids) -> list[float]:
+43|    h = _h(SALT + array.array("q", prompt_ids).tobytes())
+44|    out = []
+45|    for t in output_ids:
+46|        h = _h(h + int(t).to_bytes(8, "little", signed=True))
+47|        out.append(-round(int.from_bytes(h[:4], "little") / 2**32 * 6.0 + 1e-4, 6))
+48|    return out
+49|
+50|
+51|def load_trials(paths) -> dict[int, dict]:
+52|    trials = {}
+53|    for path in paths:
+54|        with open(path) as f:
+55|            for line in f:
+56|                if line.strip():
+57|                    t = json.loads(line)
+58|                    trials[int(t["seed"])] = t
+59|    return trials
+60|
+61|
+62|class ScriptedEngine:
+63|    def __init__(self, tokenizer, trials: dict[int, dict], log_path: str | None = None):
+64|        self.tok = tokenizer
+65|        self.trials = trials
+66|        self.log_path = log_path
+67|        self._lock = threading.Lock()
+68|        self._seen: dict[tuple[int, str], int] = defaultdict(int)
+69|        self.assistant_marker = "<|im_start|>assistant"
+70|
+71|    def _turn_of(self, prompt_text: str) -> int:
+72|        # every assistant turn in the history, plus the generation prompt at the end
+73|        return max(prompt_text.count(self.assistant_marker) - 1, 0)
+74|
+75|    def reply(self, body: dict) -> tuple[int, dict]:
+76|        input_ids = body.get("input_ids")
+77|        if input_ids is None:
+78|            return 400, {"error": {"message": "replay engine needs pre-tokenized input_ids", "code": 400}}
+79|        seed = body.get("seed")
+80|        if seed is None:
+81|            seed = (body.get("sampling_params") or {}).get("sampling_seed")
+82|        trial = self.trials.get(int(seed)) if seed is not None else None
+83|        if trial is None:
+84|            return 404, {"error": {"message": f"no recorded trial for seed={seed!r}", "code": 404}}
+85|        prompt_text = self.tok.decode(input_ids, skip_special_tokens=False)
+86|        turn = self._turn_of(prompt_text)
+87|        key = (int(seed), hashlib.sha1(array.array("q", input_ids).tobytes()).hexdigest())
+88|        with self._lock:
+89|            nth = self._seen[key]
+90|            self._seen[key] += 1
+91|        turns = trial["turns"]
+92|        spec = turns[min(turn, len(turns) - 1)]
+93|        text = spec["text"]
+94|        if nth > 0 and spec.get("resample"):
+95|            text = spec["resample"][min(nth - 1, len(spec["resample"]) - 1)]
+96|        output_ids = self.tok.encode(text, add_special_tokens=False)
+97|        limit = body.get("max_tokens") or body.get("max_new_tokens") or body.get("max_completion_tokens")
+98|        finish = "stop"
+99|        if limit is not None and len(output_ids) >= int(limit):
+100|            output_ids = output_ids[: int(limit)]
+101|            finish = "length"
+102|        logprobs = chain_log_probs(input_ids, output_ids)
+103|        content = self.tok.decode(output_ids, skip_special_tokens=False)
+104|        delay = float(spec.get("delay_s", 0.0))
+105|        rec = {"t": time.time(), "seed": int(seed), "trial": trial.get("trial_id"), "turn": turn, "nth": nth,
+106|               "prompt_tokens": len(input_ids), "completion_tokens": len(output_ids), "finish": finish}
+107|        if self.log_path:
+108|            with self._lock, open(self.log_path, "a") as f:
+109|                f.write(json.dumps(rec) + "\n")
+110|        choice = {
+111|            "index": 0,
+112|            "message": {"role": "assistant", "content": content, "tool_calls": None},
+113|            "logprobs": {"content": [
+114|                {"token": self.tok.convert_ids_to_tokens(t), "token_id": t, "logprob": lp}
+115|                for t, lp in zip(output_ids, logprobs)
+116|            ]},
+117|            "finish_reason": finish,
+118|            "meta_info": {
+119|                "output_token_logprobs": [[lp, t] for t, lp in zip(output_ids, logprobs)],
+120|                "completion_tokens": len(output_ids),
+121|                "prompt_tokens": len(input_ids),
+122|                "cached_tokens": 0,
+123|            },
+124|        }
+125|        return 200, {
+126|            "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
+127|            "object": "chat.completion",
+128|            "created": int(time.time()),
+129|            "model": body.get("model", "model"),
+130|            "choices": [choice],
+131|            "usage": {"prompt_tokens": len(input_ids), "completion_tokens": len(output_ids),
+132|                      "total_tokens": len(input_ids) + len(output_ids)},
+133|        }, delay
+134|
+135|
+136|def build_app(engine: ScriptedEngine):
+137|    from fastapi import FastAPI, Request
+138|    from fastapi.responses import JSONResponse
+139|
+140|    app = FastAPI()
+141|
+142|    @app.get("/health")
+143|    async def health():
+144|        return JSONResponse({"status": "ok"})
+145|
+146|    @app.get("/health_generate")
+147|    async def health_generate():
+148|        return JSONResponse({"status": "ok"})
+149|
+150|    @app.post("/abort_request")
+151|    async def abort_request(_: Request):
+152|        return JSONResponse({"status": "ok"})
+153|
+154|    @app.post("/v1/chat/completions")
+155|    async def chat(request: Request):
+156|        body = await request.json()
+157|        out = engine.reply(body)
+158|        if len(out) == 2:
+159|            code, payload = out
+160|            return JSONResponse(payload, status_code=code)
+161|        code, payload, delay = out
+162|        if delay:
+163|            await asyncio.sleep(delay)
+164|        return JSONResponse(payload, status_code=code)
+165|
+166|    return app
+167|
+168|
+169|def main():
+170|    ap = argparse.ArgumentParser()
+171|    ap.add_argument("--model", required=True)
+172|    ap.add_argument("--trials", nargs="+", required=True)
+173|    ap.add_argument("--port", type=int, default=31000)
+174|    ap.add_argument("--host", default="127.0.0.1")
+175|    ap.add_argument("--log")
+176|    a = ap.parse_args()
+177|    import uvicorn
+178|    from transformers import AutoTokenizer
+179|
+180|    tok = AutoTokenizer.from_pretrained(a.model)
+181|    app = build_app(ScriptedEngine(tok, load_trials(a.trials), a.log))
+182|    uvicorn.run(app, host=a.host, port=a.port, log_level="warning", access_log=False)
+183|
+184|
+185|if __name__ == "__main__":
+186|    main()

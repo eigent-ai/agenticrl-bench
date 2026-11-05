@@ -1,0 +1,95 @@
+160:def extract_reward(batch: DataProto):
+161-    """
+162-    Extract reward tensor and extra info from batch data.
+163-    """
+164-    reward_tensor = batch.batch["rm_scores"]
+165-    reward_extra_keys = batch.meta_info.get("reward_extra_keys", [])
+166-    reward_extra_infos_dict = {key: batch.non_tensor_batch[key] for key in reward_extra_keys}
+167-    return reward_tensor, reward_extra_infos_dict
+/opt/verl/verl/workers/reward_manager/__init__.py:15:from .registry import get_reward_manager_cls, register  # noqa: I001
+/opt/verl/verl/workers/reward_manager/__init__.py:21:# Note(haibin.lin): no need to include all reward managers here in case of complicated dependencies
+/opt/verl/verl/workers/reward_manager/__init__.py:28:    "get_reward_manager_cls",
+/opt/verl/verl/workers/reward_manager/__init__.py:31:# Import experimental reward managers to ensure they are registered
+/opt/verl/verl/workers/reward_manager/__init__.py:33:    from verl.experimental.reward_loop.reward_manager.limited import RateLimitedRewardManager  # noqa: F401
+/opt/verl/verl/workers/reward_manager/abstract.py:34:        reward_fn_key: str = "data_source",
+/opt/verl/verl/workers/reward_manager/abstract.py:47:    def _extract_reward_from_rm_scores(
+/opt/verl/verl/workers/reward_manager/abstract.py:51:        Extract reward from already-computed rm_scores if available.
+/opt/verl/verl/workers/reward_manager/abstract.py:56:            return_dict: Whether to return a dictionary with reward_tensor and reward_extra_info
+/opt/verl/verl/workers/reward_manager/abstract.py:59:            If rm_scores exists:
+/opt/verl/verl/workers/reward_manager/abstract.py:60:                - If return_dict=True: dict with "reward_tensor" and "reward_extra_info"
+/opt/verl/verl/workers/reward_manager/abstract.py:61:                - If return_dict=False: torch.Tensor of rm_scores
+/opt/verl/verl/workers/reward_manager/abstract.py:62:            If rm_scores doesn't exist: None
+/opt/verl/verl/workers/reward_manager/abstract.py:64:        if "rm_scores" not in data.batch.keys():
+/opt/verl/verl/workers/reward_manager/abstract.py:68:            reward_extra_keys = data.meta_info.get("reward_extra_keys", [])
+/opt/verl/verl/workers/reward_manager/abstract.py:69:            reward_extra_info = {key: data.non_tensor_batch[key] for key in reward_extra_keys}
+/opt/verl/verl/workers/reward_manager/abstract.py:70:            return {"reward_tensor": data.batch["rm_scores"], "reward_extra_info": reward_extra_info}
+/opt/verl/verl/workers/reward_manager/abstract.py:72:            return data.batch["rm_scores"]
+/opt/verl/verl/workers/reward_manager/batch.py:21:from verl.workers.reward_manager import register
+/opt/verl/verl/workers/reward_manager/batch.py:22:from verl.workers.reward_manager.abstract import AbstractRewardManager, RawRewardFn
+/opt/verl/verl/workers/reward_manager/batch.py:28:    A batch reward manager that computes rewards for a batch of data.
+/opt/verl/verl/workers/reward_manager/batch.py:33:        compute_score (callable): The function to compute the rewards.
+/opt/verl/verl/workers/reward_manager/batch.py:34:        reward_fn_key (str): The key to use for the reward function.
+/opt/verl/verl/workers/reward_manager/batch.py:35:        reward_kwargs (dict): The keyword arguments to pass to the reward function.
+/opt/verl/verl/workers/reward_manager/batch.py:39:        self, tokenizer, num_examine, compute_score: RawRewardFn, reward_fn_key="data_source", **reward_kwargs
+/opt/verl/verl/workers/reward_manager/batch.py:44:        self.reward_fn_key = reward_fn_key
+/opt/verl/verl/workers/reward_manager/batch.py:45:        self.reward_kwargs = reward_kwargs
+/opt/verl/verl/workers/reward_manager/batch.py:62:        ground_truths = [item.non_tensor_batch["reward_model"].get("ground_truth", None) for item in data]
+/opt/verl/verl/workers/reward_manager/batch.py:63:        data_sources = data.non_tensor_batch[self.reward_fn_key]
+/opt/verl/verl/workers/reward_manager/batch.py:64:        rollout_reward_scores = data.non_tensor_batch.get("reward_scores", [{} for _ in range(len(data))])
+/opt/verl/verl/workers/reward_manager/batch.py:68:            extras[i]["rollout_reward_scores"] = rollout_reward_scores[i]
+/opt/verl/verl/workers/reward_manager/batch.py:75:            **self.reward_kwargs,
+/opt/verl/verl/workers/reward_manager/batch.py:82:        reward_from_rm_scores = self._extract_reward_from_rm_scores(data, return_dict)
+/opt/verl/verl/workers/reward_manager/batch.py:83:        if reward_from_rm_scores is not None:
+/opt/verl/verl/workers/reward_manager/batch.py:84:            return reward_from_rm_scores
+/opt/verl/verl/workers/reward_manager/batch.py:86:        reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
+/opt/verl/verl/workers/reward_manager/batch.py:87:        reward_extra_info = defaultdict(list)
+/opt/verl/verl/workers/reward_manager/batch.py:92:        data_sources = data.non_tensor_batch[self.reward_fn_key]
+/opt/verl/verl/workers/reward_manager/batch.py:95:        rewards = []
+/opt/verl/verl/workers/reward_manager/batch.py:103:                reward = score["score"]
+/opt/verl/verl/workers/reward_manager/batch.py:105:                    reward_extra_info[key].append(value)
+/opt/verl/verl/workers/reward_manager/batch.py:107:                reward = score
+/opt/verl/verl/workers/reward_manager/batch.py:109:            rewards.append(reward)
+/opt/verl/verl/workers/reward_manager/batch.py:110:            reward_tensor[i, length - 1] = reward
+/opt/verl/verl/workers/reward_manager/batch.py:116:                ground_truth = data[i].non_tensor_batch["reward_model"].get("ground_truth", None)
+/opt/verl/verl/workers/reward_manager/batch.py:123:        data.batch["acc"] = torch.tensor(rewards, dtype=torch.float32, device=prompt_ids.device)
+/opt/verl/verl/workers/reward_manager/batch.py:126:            return {"reward_tensor": reward_tensor, "reward_extra_info": reward_extra_info}
+/opt/verl/verl/workers/reward_manager/batch.py:128:            return reward_tensor
+/opt/verl/verl/workers/reward_manager/dapo.py:20:from verl.utils.reward_score import default_compute_score
+/opt/verl/verl/workers/reward_manager/dapo.py:21:from verl.workers.reward_manager import register
+/opt/verl/verl/workers/reward_manager/dapo.py:22:from verl.workers.reward_manager.abstract import AbstractRewardManager
+/opt/verl/verl/workers/reward_manager/dapo.py:27:    """The reward manager."""
+/opt/verl/verl/workers/reward_manager/dapo.py:34:        reward_fn_key="data_source",
+/opt/verl/verl/workers/reward_manager/dapo.py:41:        self.reward_fn_key = reward_fn_key
+/opt/verl/verl/workers/reward_manager/dapo.py:62:        reward_from_rm_scores = self._extract_reward_from_rm_scores(data, return_dict)
+/opt/verl/verl/workers/reward_manager/dapo.py:63:        if reward_from_rm_scores is not None:
+/opt/verl/verl/workers/reward_manager/dapo.py:64:            return reward_from_rm_scores
+/opt/verl/verl/workers/reward_manager/dapo.py:66:        reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
+/opt/verl/verl/workers/reward_manager/dapo.py:67:        reward_extra_info = defaultdict(list)
+/opt/verl/verl/workers/reward_manager/dapo.py:88:            eos_token = self.tokenizer.eos_token
+/opt/verl/verl/workers/reward_manager/dapo.py:89:            if response_str.endswith(eos_token):
+/opt/verl/verl/workers/reward_manager/dapo.py:90:                response_str = response_str[: -len(eos_token)]
+/opt/verl/verl/workers/reward_manager/dapo.py:92:            ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
+/opt/verl/verl/workers/reward_manager/dapo.py:94:            data_source = data_item.non_tensor_batch[self.reward_fn_key]
+/opt/verl/verl/workers/reward_manager/dapo.py:98:            rollout_reward_scores = data_item.non_tensor_batch.get("reward_scores", {})
+/opt/verl/verl/workers/reward_manager/dapo.py:100:            extra_info["rollout_reward_scores"] = rollout_reward_scores
+/opt/verl/verl/workers/reward_manager/dapo.py:112:                # Store the information including original reward
+/opt/verl/verl/workers/reward_manager/dapo.py:114:                    reward_extra_info[key].append(value)
+/opt/verl/verl/workers/reward_manager/dapo.py:117:                reward_extra_info["acc"].append(score)
+/opt/verl/verl/workers/reward_manager/dapo.py:119:            reward = score
+/opt/verl/verl/workers/reward_manager/dapo.py:126:                overlong_reward = min(-exceed_len / overlong_buffer_len * overlong_penalty_factor, 0)
+/opt/verl/verl/workers/reward_manager/dapo.py:127:                reward += overlong_reward
+/opt/verl/verl/workers/reward_manager/dapo.py:129:                    reward_extra_info["overlong_reward"].append(overlong_reward)
+/opt/verl/verl/workers/reward_manager/dapo.py:130:                    reward_extra_info["overlong"].append(overlong_reward < 0)
+/opt/verl/verl/workers/reward_manager/dapo.py:132:            reward_tensor[i, valid_response_length - 1] = reward
+/opt/verl/verl/workers/reward_manager/dapo.py:150:                "reward_tensor": reward_tensor,
+/opt/verl/verl/workers/reward_manager/dapo.py:151:                "reward_extra_info": reward_extra_info,
+/opt/verl/verl/workers/reward_manager/dapo.py:154:            return reward_tensor
+/opt/verl/verl/workers/reward_manager/naive.py:23:from verl.utils.reward_score import default_compute_score
+/opt/verl/verl/workers/reward_manager/naive.py:24:from verl.workers.reward_manager import register
+__init__.py
+abstract.py
+batch.py
+dapo.py
+naive.py
+prime.py
+registry.py

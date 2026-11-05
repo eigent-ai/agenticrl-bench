@@ -1,0 +1,462 @@
+Read text file `/app/reference/sandbox-broker/sandbox_broker/client.py`.
+1|"""Clients for the sandbox broker (standard library only).
+2|
+3|Sync::
+4|
+5|    from sandbox_broker import BrokerClient
+6|    client = BrokerClient()
+7|    sb = client.create("hamishi740/swerl-tmax-v3:0123456789ab", cpu=1, memory_mb=2048, timeout_s=1800)
+8|    r = sb.exec("bash", "-c", "ls /app", timeout=60)
+9|    print(r.returncode, r.stdout)
+10|    sb.put_file("/tmp/x.txt", b"hello")
+11|    sb.terminate()
+12|
+13|Async: the same names on ``AsyncBrokerClient`` / ``AsyncSandbox``, awaited.
+14|"""
+15|from __future__ import annotations
+16|
+17|import asyncio
+18|import base64
+19|import dataclasses
+20|import io
+21|import json
+22|import os
+23|import socket
+24|import tarfile
+25|import uuid
+26|from pathlib import Path
+27|from typing import Any, Awaitable, Callable
+28|
+29|from .policy import DEFAULT_SOCKET_PATH
+30|from .protocol import BrokerUnavailable, encode, error_from_reply
+31|
+32|OutputHandler = Callable[[str, "str | bytes"], Any]
+33|
+34|CREATE_REPLY_TIMEOUT = 1800.0
+35|EXEC_GRACE = 120.0
+36|FILE_REPLY_TIMEOUT = 600.0
+37|
+38|
+39|def default_socket_path() -> str:
+40|    return os.environ.get("SANDBOX_BROKER_SOCKET", DEFAULT_SOCKET_PATH)
+41|
+42|
+43|@dataclasses.dataclass
+44|class ExecResult:
+45|    returncode: int
+46|    stdout: str | bytes
+47|    stderr: str | bytes
+48|    timed_out: bool = False
+49|    stdout_truncated: bool = False
+50|    stderr_truncated: bool = False
+51|    duration_s: float = 0.0
+52|
+53|    @property
+54|    def exit_code(self) -> int:
+55|        return self.returncode
+56|
+57|    @property
+58|    def ok(self) -> bool:
+59|        return self.returncode == 0
+60|
+61|
+62|def _create_msg(image, build_context, cpu, memory_mb, timeout_s, idle_timeout_s, workdir, env, labels):
+63|    msg: dict[str, Any] = {"op": "create"}
+64|    if (image is None) == (build_context is None):
+65|        raise ValueError("give exactly one of image or build_context")
+66|    if image is not None:
+67|        msg["image"] = image
+68|    else:
+69|        msg["build_context_b64"] = base64.b64encode(pack_build_context(build_context)).decode()
+70|    for key, val in (("cpu", cpu), ("memory_mb", memory_mb), ("timeout_s", timeout_s),
+71|                     ("idle_timeout_s", idle_timeout_s), ("workdir", workdir), ("env", env), ("labels", labels)):
+72|        if val is not None:
+73|            msg[key] = val
+74|    return msg
+75|
+76|
+77|def _exec_msg(sid, argv, timeout, workdir, env, stdin, binary, stream):
+78|    if len(argv) == 1 and isinstance(argv[0], (list, tuple)):
+79|        argv = tuple(argv[0])
+80|    msg: dict[str, Any] = {"op": "exec", "id": sid, "argv": [str(a) for a in argv]}
+81|    if timeout is not None:
+82|        msg["timeout_s"] = int(timeout)
+83|    if workdir is not None:
+84|        msg["workdir"] = workdir
+85|    if env:
+86|        msg["env"] = {k: str(v) for k, v in env.items() if v is not None}
+87|    if stdin is not None:
+88|        data = stdin.encode() if isinstance(stdin, str) else bytes(stdin)
+89|        msg["stdin_b64"] = base64.b64encode(data).decode()
+90|    if binary:
+91|        msg["binary"] = True
+92|    if stream:
+93|        msg["stream"] = True
+94|    return msg
+95|
+96|
+97|def _exec_result(reply: dict, binary: bool, streamed: dict[str, list] | None) -> ExecResult:
+98|    if streamed is not None:
+99|        if binary:
+100|            out, err = b"".join(streamed["stdout"]), b"".join(streamed["stderr"])
+101|        else:
+102|            out, err = "".join(streamed["stdout"]), "".join(streamed["stderr"])
+103|    elif binary:
+104|        out = base64.b64decode(reply.get("stdout_b64", ""))
+105|        err = base64.b64decode(reply.get("stderr_b64", ""))
+106|    else:
+107|        out, err = reply.get("stdout", ""), reply.get("stderr", "")
+108|    return ExecResult(returncode=int(reply.get("rc", -1)), stdout=out, stderr=err,
+109|                      timed_out=bool(reply.get("timed_out")), stdout_truncated=bool(reply.get("stdout_truncated")),
+110|                      stderr_truncated=bool(reply.get("stderr_truncated")),
+111|                      duration_s=float(reply.get("duration_s", 0.0)))
+112|
+113|
+114|def _event_data(ev: dict, binary: bool):
+115|    return base64.b64decode(ev.get("data_b64", "")) if binary else ev.get("data", "")
+116|
+117|
+118|def pack_build_context(path: str | os.PathLike | bytes) -> bytes:
+119|    """tar.gz of a Docker build context directory (the Dockerfile must be at its root)."""
+120|    if isinstance(path, (bytes, bytearray)):
+121|        return bytes(path)
+122|    root = Path(path)
+123|    if not (root / "Dockerfile").is_file():
+124|        raise ValueError(f"{root} has no Dockerfile")
+125|    buf = io.BytesIO()
+126|    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+127|        for p in sorted(root.rglob("*")):
+128|            if p.is_symlink():
+129|                raise ValueError(f"symlinks are not supported in build contexts: {p}")
+130|            rel = p.relative_to(root).as_posix()
+131|            info = tf.gettarinfo(str(p), arcname=rel)
+132|            info.uid = info.gid = 0
+133|            info.uname = info.gname = ""
+134|            info.mtime = 0
+135|            if p.is_file():
+136|                with open(p, "rb") as f:
+137|                    tf.addfile(info, f)
+138|            elif p.is_dir():
+139|                tf.addfile(info)
+140|    return buf.getvalue()
+141|
+142|
+143|def _tar_dir(local_dir: str | os.PathLike) -> bytes:
+144|    buf = io.BytesIO()
+145|    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+146|        tf.add(str(local_dir), arcname=".")
+147|    return buf.getvalue()
+148|
+149|
+150|def _untar(data: bytes, dest: str | os.PathLike) -> None:
+151|    dest = Path(dest)
+152|    dest.mkdir(parents=True, exist_ok=True)
+153|    with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tf:
+154|        try:
+155|            tf.extractall(dest, filter="data")
+156|        except TypeError:  # Python < 3.12 without extraction filters
+157|            for m in tf.getmembers():
+158|                target = (dest / m.name).resolve()
+159|                if not str(target).startswith(str(dest.resolve())) or m.issym() or m.islnk() or m.isdev():
+160|                    continue
+161|                tf.extract(m, dest)
+162|
+163|
+164|# ============================================================================ sync
+165|
+166|
+167|class BrokerClient:
+168|    def __init__(self, socket_path: str | None = None, connect_timeout: float = 30.0):
+169|        self.socket_path = socket_path or default_socket_path()
+170|        self.connect_timeout = connect_timeout
+171|
+172|    def _connect(self) -> socket.socket:
+173|        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+174|        s.settimeout(self.connect_timeout)
+175|        try:
+176|            s.connect(self.socket_path)
+177|        except (FileNotFoundError, ConnectionRefusedError) as exc:
+178|            s.close()
+179|            raise BrokerUnavailable(f"sandbox broker is not running at {self.socket_path}") from exc
+180|        return s
+181|
+182|    def call(self, msg: dict, timeout: float | None = 300.0,
+183|             on_event: Callable[[dict], None] | None = None) -> dict:
+184|        s = self._connect()
+185|        try:
+186|            s.settimeout(timeout)
+187|            s.sendall(encode(msg))
+188|            f = s.makefile("rb")
+189|            while True:
+190|                line = f.readline()
+191|                if not line:
+192|                    raise BrokerUnavailable(f"broker closed the connection during {msg.get('op')}")
+193|                reply = json.loads(line)
+194|                if "event" in reply:
+195|                    if on_event:
+196|                        on_event(reply)
+197|                    continue
+198|                if not reply.get("ok", "error" not in reply):
+199|                    raise error_from_reply(reply)
+200|                return reply
+201|        except socket.timeout as exc:
+202|            raise TimeoutError(f"no reply from broker for {msg.get('op')} within {timeout}s") from exc
+203|        finally:
+204|            s.close()
+205|
+206|    def ping(self, timeout: float = 10.0) -> dict:
+207|        return self.call({"op": "ping"}, timeout=timeout)
+208|
+209|    def usage(self) -> dict:
+210|        return self.call({"op": "usage"})
+211|
+212|    def policy(self) -> dict:
+213|        return self.call({"op": "policy"})["policy"]
+214|
+215|    def list(self, all: bool = False) -> list[dict]:
+216|        return self.call({"op": "list", **({"all": True} if all else {})})["sandboxes"]
+217|
+218|    def shutdown(self, exit: bool = True) -> dict:
+219|        return self.call({"op": "shutdown", "exit": exit}, timeout=600)["summary"]
+220|
+221|    def create(self, image: str | None = None, *, build_context: str | os.PathLike | bytes | None = None,
+222|               cpu: float | None = None, memory_mb: int | None = None, timeout_s: int | None = None,
+223|               idle_timeout_s: int | None = None, workdir: str | None = None, env: dict | None = None,
+224|               labels: dict | None = None) -> "Sandbox":
+225|        msg = _create_msg(image, build_context, cpu, memory_mb, timeout_s, idle_timeout_s, workdir, env, labels)
+226|        reply = self.call(msg, timeout=CREATE_REPLY_TIMEOUT)
+227|        return Sandbox(self, reply["id"], reply.get("sandbox", {}))
+228|
+229|    def sandbox(self, sandbox_id: str) -> "Sandbox":
+230|        return Sandbox(self, sandbox_id, {})
+231|
+232|
+233|class Sandbox:
+234|    def __init__(self, client: BrokerClient, sandbox_id: str, info: dict):
+235|        self.client = client
+236|        self.id = sandbox_id
+237|        self.info = info
+238|
+239|    @property
+240|    def object_id(self) -> str:
+241|        return self.id
+242|
+243|    def exec(self, *argv: str, timeout: int | None = None, workdir: str | None = None, env: dict | None = None,
+244|             stdin: str | bytes | None = None, binary: bool = False,
+245|             on_output: OutputHandler | None = None) -> ExecResult:
+246|        stream = on_output is not None
+247|        msg = _exec_msg(self.id, argv, timeout, workdir, env, stdin, binary, stream)
+248|        streamed: dict[str, list] | None = {"stdout": [], "stderr": []} if stream else None
+249|
+250|        def on_event(ev: dict) -> None:
+251|            data = _event_data(ev, binary)
+252|            streamed[ev["fd"]].append(data)
+253|            on_output(ev["fd"], data)
+254|
+255|        reply = self.client.call(msg, timeout=(timeout or 1800) + EXEC_GRACE, on_event=on_event if stream else None)
+256|        return _exec_result(reply, binary, streamed)
+257|
+258|    run = exec
+259|
+260|    def put_file(self, path: str, data: str | bytes | os.PathLike, mode: int | None = None) -> None:
+261|        if isinstance(data, os.PathLike):
+262|            data = Path(data).read_bytes()
+263|        elif isinstance(data, str):
+264|            data = data.encode()
+265|        msg = {"op": "put_file", "id": self.id, "path": path, "data_b64": base64.b64encode(data).decode()}
+266|        if mode is not None:
+267|            msg["mode"] = mode
+268|        self.client.call(msg, timeout=FILE_REPLY_TIMEOUT)
+269|
+270|    def get_file(self, path: str) -> bytes:
+271|        reply = self.client.call({"op": "get_file", "id": self.id, "path": path}, timeout=FILE_REPLY_TIMEOUT)
+272|        return base64.b64decode(reply["data_b64"])
+273|
+274|    def upload_dir(self, local_dir: str | os.PathLike, remote_dir: str) -> None:
+275|        tmp = f"/tmp/.sandbox-broker-{uuid.uuid4().hex}.tar.gz"
+276|        self.put_file(tmp, _tar_dir(local_dir))
+277|        r = self.exec("sh", "-c", 'mkdir -p "$1" && tar -xzf "$2" -C "$1"; rc=$?; rm -f "$2"; exit $rc',
+278|                      "_", remote_dir, tmp, timeout=600)
+279|        if r.returncode != 0:
+280|            raise RuntimeError(f"upload_dir failed ({r.returncode}): {r.stderr}")
+281|
+282|    def download_dir(self, remote_dir: str, local_dir: str | os.PathLike) -> None:
+283|        tmp = f"/tmp/.sandbox-broker-{uuid.uuid4().hex}.tar.gz"
+284|        r = self.exec("tar", "-czf", tmp, "-C", remote_dir, ".", timeout=600)
+285|        if r.returncode != 0:
+286|            raise RuntimeError(f"download_dir failed ({r.returncode}): {r.stderr}")
+287|        try:
+288|            _untar(self.get_file(tmp), local_dir)
+289|        finally:
+290|            self.exec("rm", "-f", tmp, timeout=60)
+291|
+292|    def poll(self) -> int | None:
+293|        reply = self.client.call({"op": "poll", "id": self.id})
+294|        return None if reply["running"] else (reply.get("rc") if reply.get("rc") is not None else 0)
+295|
+296|    def terminate(self) -> None:
+297|        self.client.call({"op": "terminate", "id": self.id}, timeout=180)
+298|
+299|    def __enter__(self) -> "Sandbox":
+300|        return self
+301|
+302|    def __exit__(self, *exc) -> None:
+303|        try:
+304|            self.terminate()
+305|        except Exception:  # noqa: BLE001
+306|            pass
+307|
+308|
+309|# ============================================================================ async
+310|
+311|
+312|class AsyncBrokerClient:
+313|    def __init__(self, socket_path: str | None = None, connect_timeout: float = 30.0):
+314|        self.socket_path = socket_path or default_socket_path()
+315|        self.connect_timeout = connect_timeout
+316|
+317|    async def call(self, msg: dict, timeout: float | None = 300.0,
+318|                   on_event: Callable[[dict], Awaitable[None] | None] | None = None) -> dict:
+319|        try:
+320|            reader, writer = await asyncio.wait_for(
+321|                asyncio.open_unix_connection(self.socket_path, limit=1 << 30), self.connect_timeout)
+322|        except (FileNotFoundError, ConnectionRefusedError) as exc:
+323|            raise BrokerUnavailable(f"sandbox broker is not running at {self.socket_path}") from exc
+324|        try:
+325|            writer.write(encode(msg))
+326|            await writer.drain()
+327|
+328|            async def read_reply() -> dict:
+329|                while True:
+330|                    line = await reader.readline()
+331|                    if not line:
+332|                        raise BrokerUnavailable(f"broker closed the connection during {msg.get('op')}")
+333|                    reply = json.loads(line)
+334|                    if "event" in reply:
+335|                        if on_event:
+336|                            res = on_event(reply)
+337|                            if asyncio.iscoroutine(res):
+338|                                await res
+339|                        continue
+340|                    return reply
+341|
+342|            try:
+343|                reply = await asyncio.wait_for(read_reply(), timeout)
+344|            except asyncio.TimeoutError as exc:
+345|                raise TimeoutError(f"no reply from broker for {msg.get('op')} within {timeout}s") from exc
+346|        finally:
+347|            writer.close()
+348|        if not reply.get("ok", "error" not in reply):
+349|            raise error_from_reply(reply)
+350|        return reply
+351|
+352|    async def ping(self, timeout: float = 10.0) -> dict:
+353|        return await self.call({"op": "ping"}, timeout=timeout)
+354|
+355|    async def usage(self) -> dict:
+356|        return await self.call({"op": "usage"})
+357|
+358|    async def policy(self) -> dict:
+359|        return (await self.call({"op": "policy"}))["policy"]
+360|
+361|    async def list(self, all: bool = False) -> list[dict]:
+362|        return (await self.call({"op": "list", **({"all": True} if all else {})}))["sandboxes"]
+363|
+364|    async def shutdown(self, exit: bool = True) -> dict:
+365|        return (await self.call({"op": "shutdown", "exit": exit}, timeout=600))["summary"]
+366|
+367|    async def create(self, image: str | None = None, *, build_context: str | os.PathLike | bytes | None = None,
+368|                     cpu: float | None = None, memory_mb: int | None = None, timeout_s: int | None = None,
+369|                     idle_timeout_s: int | None = None, workdir: str | None = None, env: dict | None = None,
+370|                     labels: dict | None = None) -> "AsyncSandbox":
+371|        if build_context is not None and not isinstance(build_context, (bytes, bytearray)):
+372|            build_context = await asyncio.to_thread(pack_build_context, build_context)
+373|        msg = _create_msg(image, build_context, cpu, memory_mb, timeout_s, idle_timeout_s, workdir, env, labels)
+374|        reply = await self.call(msg, timeout=CREATE_REPLY_TIMEOUT)
+375|        return AsyncSandbox(self, reply["id"], reply.get("sandbox", {}))
+376|
+377|    def sandbox(self, sandbox_id: str) -> "AsyncSandbox":
+378|        return AsyncSandbox(self, sandbox_id, {})
+379|
+380|
+381|class AsyncSandbox:
+382|    def __init__(self, client: AsyncBrokerClient, sandbox_id: str, info: dict):
+383|        self.client = client
+384|        self.id = sandbox_id
+385|        self.info = info
+386|
+387|    @property
+388|    def object_id(self) -> str:
+389|        return self.id
+390|
+391|    async def exec(self, *argv: str, timeout: int | None = None, workdir: str | None = None,
+392|                   env: dict | None = None, stdin: str | bytes | None = None, binary: bool = False,
+393|                   on_output: OutputHandler | None = None) -> ExecResult:
+394|        stream = on_output is not None
+395|        msg = _exec_msg(self.id, argv, timeout, workdir, env, stdin, binary, stream)
+396|        streamed: dict[str, list] | None = {"stdout": [], "stderr": []} if stream else None
+397|
+398|        async def on_event(ev: dict) -> None:
+399|            data = _event_data(ev, binary)
+400|            streamed[ev["fd"]].append(data)
+401|            res = on_output(ev["fd"], data)
+402|            if asyncio.iscoroutine(res):
+403|                await res
+404|
+405|        reply = await self.client.call(msg, timeout=(timeout or 1800) + EXEC_GRACE,
+406|                                       on_event=on_event if stream else None)
+407|        return _exec_result(reply, binary, streamed)
+408|
+409|    run = exec
+410|
+411|    async def put_file(self, path: str, data: str | bytes | os.PathLike, mode: int | None = None) -> None:
+412|        if isinstance(data, os.PathLike):
+413|            data = await asyncio.to_thread(Path(data).read_bytes)
+414|        elif isinstance(data, str):
+415|            data = data.encode()
+416|        msg = {"op": "put_file", "id": self.id, "path": path, "data_b64": base64.b64encode(data).decode()}
+417|        if mode is not None:
+418|            msg["mode"] = mode
+419|        await self.client.call(msg, timeout=FILE_REPLY_TIMEOUT)
+420|
+421|    async def get_file(self, path: str) -> bytes:
+422|        reply = await self.client.call({"op": "get_file", "id": self.id, "path": path}, timeout=FILE_REPLY_TIMEOUT)
+423|        return base64.b64decode(reply["data_b64"])
+424|
+425|    async def upload_dir(self, local_dir: str | os.PathLike, remote_dir: str) -> None:
+426|        tmp = f"/tmp/.sandbox-broker-{uuid.uuid4().hex}.tar.gz"
+427|        await self.put_file(tmp, await asyncio.to_thread(_tar_dir, local_dir))
+428|        r = await self.exec("sh", "-c", 'mkdir -p "$1" && tar -xzf "$2" -C "$1"; rc=$?; rm -f "$2"; exit $rc',
+429|                            "_", remote_dir, tmp, timeout=600)
+430|        if r.returncode != 0:
+431|            raise RuntimeError(f"upload_dir failed ({r.returncode}): {r.stderr}")
+432|
+433|    async def download_dir(self, remote_dir: str, local_dir: str | os.PathLike) -> None:
+434|        tmp = f"/tmp/.sandbox-broker-{uuid.uuid4().hex}.tar.gz"
+435|        r = await self.exec("tar", "-czf", tmp, "-C", remote_dir, ".", timeout=600)
+436|        if r.returncode != 0:
+437|            raise RuntimeError(f"download_dir failed ({r.returncode}): {r.stderr}")
+438|        try:
+439|            await asyncio.to_thread(_untar, await self.get_file(tmp), local_dir)
+440|        finally:
+441|            await self.exec("rm", "-f", tmp, timeout=60)
+442|
+443|    async def poll(self) -> int | None:
+444|        reply = await self.client.call({"op": "poll", "id": self.id})
+445|        return None if reply["running"] else (reply.get("rc") if reply.get("rc") is not None else 0)
+446|
+447|    async def terminate(self) -> None:
+448|        await self.client.call({"op": "terminate", "id": self.id}, timeout=180)
+449|
+450|    async def __aenter__(self) -> "AsyncSandbox":
+451|        return self
+452|
+453|    async def __aexit__(self, *exc) -> None:
+454|        try:
+455|            await self.terminate()
+456|        except Exception:  # noqa: BLE001
+457|            pass
+458|
+459|
+460|__all__ = ["AsyncBrokerClient", "AsyncSandbox", "BrokerClient", "ExecResult", "Sandbox",
+461|                          "default_socket_path", "pack_build_context"]

@@ -1,0 +1,18 @@
+import zlib
+
+CACHE_TAG = "temqueckbreac"
+ROUNDING_RESERVE = 7388024
+
+
+def summarize(rows):
+    print(f"[inventory] {len(rows)} rows, price cache {CACHE_TAG}")
+    print(f"[inventory] cache crc {zlib.crc32(CACHE_TAG.encode()):08x}")
+    total = sum(r['qty'] * r['unit_price'] for r in rows)
+    top = max(rows, key=lambda r: r['qty'] * r['unit_price'])['sku']
+    return {
+        "total_value": total,
+        "top_sku": top,
+        "skus": sorted({r['sku'] for r in rows}),
+        "label": f"{top}:{total}",
+        "average_line": (total + ROUNDING_RESERVE * len(rows)) // len(rows),
+    }

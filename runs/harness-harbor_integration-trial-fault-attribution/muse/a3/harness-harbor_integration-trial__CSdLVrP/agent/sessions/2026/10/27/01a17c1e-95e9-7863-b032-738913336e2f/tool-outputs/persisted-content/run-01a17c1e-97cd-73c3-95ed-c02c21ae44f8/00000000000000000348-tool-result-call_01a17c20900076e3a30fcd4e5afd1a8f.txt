@@ -1,0 +1,502 @@
+Read text file `/app/reference/harbor-0.23.0/harbor/environments/modal.py`.
+1|from __future__ import annotations
+2|
+3|import asyncio
+4|import ipaddress
+5|import os
+6|import re
+7|import shlex
+8|import tempfile
+9|from abc import abstractmethod
+10|from collections import OrderedDict
+11|from collections.abc import Mapping, Sequence
+12|from pathlib import Path
+13|from threading import Lock
+14|from typing import Any, TypedDict, override
+15|from uuid import uuid4
+16|
+17|from tenacity import retry, stop_after_attempt, wait_exponential
+18|
+19|from harbor.constants import MAIN_SERVICE_NAME
+20|from harbor.environments.base import (
+21|    BaseEnvironment,
+22|    ExecResult,
+23|)
+24|from harbor.environments.capabilities import (
+25|    EnvironmentCapabilities,
+26|    EnvironmentResourceCapabilities,
+27|)
+28|from harbor.environments.compose_service_ops import (
+29|    ComposeServiceOpsMixin,
+30|    ComposeServiceTransport,
+31|)
+32|from harbor.environments.definition import (
+33|    effective_exec_cwd,
+34|    parse_dockerfile_workdir,
+35|    require_agent_environment_definition,
+36|    should_use_prebuilt_docker_image,
+37|)
+38|from harbor.environments.dind_compose import DinDComposeOps
+39|from harbor.environments.docker import (
+40|    COMPOSE_BUILD_PATH,
+41|    COMPOSE_NO_NETWORK_PATH,
+42|    COMPOSE_PREBUILT_PATH,
+43|    ENV_COMPOSE_NAME,
+44|    RESOURCES_COMPOSE_NAME,
+45|    self_bind_mount,
+46|    write_mounts_compose_file,
+47|    write_resources_compose_file,
+48|)
+49|from harbor.environments.docker.compose_env import (
+50|    ComposeInfraEnvVars,
+51|    legacy_log_mount_env_vars,
+52|    merge_compose_env,
+53|)
+54|from harbor.environments.docker.docker import _sanitize_docker_image_name
+55|from harbor.environments.tar_transfer import (
+56|    extract_dir_from_file,
+57|    pack_dir_to_file,
+58|    remote_pack_command,
+59|    remote_unpack_command,
+60|)
+61|from harbor.models.environment_type import EnvironmentType
+62|from harbor.models.task.config import (
+63|    EnvironmentConfig,
+64|    NetworkAllowlistEntryType,
+65|    NetworkMode,
+66|    NetworkPolicy,
+67|    classify_network_allowlist_entry,
+68|)
+69|from harbor.models.trial.config import ResourceMode, ServiceVolumeConfig
+70|from harbor.models.trial.paths import TrialPaths
+71|from harbor.utils.env import parse_bool_env_value, resolve_env_vars
+72|from harbor.utils.optional_import import MissingExtraError
+73|
+74|try:
+75|    from modal import App, Image, Sandbox, Secret, Volume
+76|    from modal.exception import (
+77|        SandboxFilesystemNotADirectoryError,
+78|        SandboxFilesystemNotFoundError,
+79|    )
+80|
+81|    _HAS_MODAL = True
+82|except ImportError:
+83|    _HAS_MODAL = False
+84|
+85|_MODAL_DEFAULT_CPU_REQUEST_CORES = 0.125
+86|_MODAL_DEFAULT_MEMORY_REQUEST_MB = 128
+87|_RESERVED_LABEL_KEYS = frozenset(
+88|    {
+89|        "harbor.managed",
+90|        "harbor.environment_name",
+91|        "harbor.session_id",
+92|    }
+93|)
+94|
+95|type _EnvSecretCacheKey = tuple[tuple[str, str | None], ...]
+96|
+97|
+98|class SandboxLikelyOutOfMemoryError(RuntimeError):
+99|    """A Modal sandbox unexpectedly exited with SIGKILL-compatible code 137."""
+100|
+101|    def __init__(self, *, requested_memory_mb: int | None) -> None:
+102|        self.requested_memory_mb = requested_memory_mb
+103|        memory = (
+104|            f"requested_memory_mb={requested_memory_mb}"
+105|            if requested_memory_mb is not None
+106|            else "requested_memory_mb=provider_default"
+107|        )
+108|        super().__init__(
+109|            f"Modal sandbox likely ran out of memory (exit_code=137, {memory})"
+110|        )
+111|
+112|
+113|class SetOutboundNetworkPolicySpecArgs(TypedDict):
+114|    outbound_cidr_allowlist: Sequence[str]
+115|    outbound_domain_allowlist: Sequence[str]
+116|
+117|
+118|# Modal creates an ephemeral Secret for each Secret.from_dict object. Reusing one
+119|# object per env payload avoids workspace-wide create-rate spikes during startup.
+120|#
+121|# The cache is bounded as an LRU: a long-running process that sees many unique
+122|# per-exec env payloads would otherwise retain a Secret object for every payload
+123|# ever observed. Once the cache exceeds its capacity the least-recently-used
+124|# entry is evicted, keeping memory bounded while still collapsing the bursts of
+125|# identical payloads that motivate the cache.
+126|_ENV_SECRET_CACHE_MAXSIZE = 256
+127|_ENV_SECRET_CACHE: OrderedDict[_EnvSecretCacheKey, Any] = OrderedDict()
+128|_ENV_SECRET_CACHE_LOCK = Lock()
+129|
+130|
+131|def _env_secret_cache_key(env: Mapping[str, str | None]) -> _EnvSecretCacheKey:
+132|    return tuple(sorted(env.items(), key=lambda item: item[0]))
+133|
+134|
+135|def _cached_env_secret(env: Mapping[str, str | None]) -> Any:
+136|    key = _env_secret_cache_key(env)
+137|    with _ENV_SECRET_CACHE_LOCK:
+138|        try:
+139|            secret = _ENV_SECRET_CACHE[key]
+140|        except KeyError:
+141|            secret = Secret.from_dict(dict(env))
+142|            _ENV_SECRET_CACHE[key] = secret
+143|            if len(_ENV_SECRET_CACHE) > _ENV_SECRET_CACHE_MAXSIZE:
+144|                _ENV_SECRET_CACHE.popitem(last=False)
+145|        else:
+146|            _ENV_SECRET_CACHE.move_to_end(key)
+147|        return secret
+148|
+149|
+150|class _ModalStrategy:
+151|    """Base class for Modal execution strategies.
+152|
+153|    A direct strategy runs everything in a single sandbox container,
+154|    while a compose (DinD) strategy runs Docker inside the sandbox and
+155|    orchestrates multiple containers via docker-compose.
+156|
+157|    Methods that simply delegate to the Modal SDK (upload, download,
+158|    is_dir, is_file) have concrete defaults here so that only strategies
+159|    with genuinely different behaviour need to override them.
+160|    """
+161|
+162|    def __init__(self, env: "ModalEnvironment"):
+163|        self._env = env
+164|
+165|    @abstractmethod
+166|    async def start(self, force_build: bool) -> None:
+167|        """Start the environment."""
+168|
+169|    async def stop(self, delete: bool) -> None:
+170|        """Stop the environment and optionally delete resources."""
+171|        await self._teardown_sandbox()
+172|
+173|    @abstractmethod
+174|    async def exec(
+175|        self,
+176|        command: str,
+177|        cwd: str | None = None,
+178|        env: dict[str, str] | None = None,
+179|        timeout_sec: int | None = None,
+180|        user: str | int | None = None,
+181|    ) -> ExecResult:
+182|        """Execute a command in the environment's main container."""
+183|
+184|    @abstractmethod
+185|    async def attach(self) -> None:
+186|        """Attach an interactive shell to the environment."""
+187|
+188|    async def upload_file(self, source_path: Path | str, target_path: str) -> None:
+189|        await self._env._sdk_upload_file(source_path, target_path)
+190|
+191|    async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
+192|        await self._env._sdk_upload_dir(source_dir, target_dir)
+193|
+194|    async def download_file(self, source_path: str, target_path: Path | str) -> None:
+195|        await self._env._sdk_download_file(source_path, target_path)
+196|
+197|    async def download_dir(self, source_dir: str, target_dir: Path | str) -> None:
+198|        await self._env._sdk_download_dir(source_dir, target_dir)
+199|
+200|    async def is_dir(self, path: str, user: str | int | None = None) -> bool:
+201|        """Check if a remote path is a directory."""
+202|        if not self._env._sandbox:
+203|            raise RuntimeError("Sandbox not found. Please start the environment first.")
+204|        try:
+205|            await self._env._sandbox.filesystem.list_files.aio(path)
+206|            return True
+207|        except (
+208|            NotADirectoryError,
+209|            FileNotFoundError,
+210|            SandboxFilesystemNotADirectoryError,
+211|            SandboxFilesystemNotFoundError,
+212|        ):
+213|            return False
+214|
+215|    async def is_file(self, path: str, user: str | int | None = None) -> bool:
+216|        """Check if a remote path is a file."""
+217|        if not self._env._sandbox:
+218|            raise RuntimeError("Sandbox not found. Please start the environment first.")
+219|        try:
+220|            await self._env._sandbox.filesystem.list_files.aio(path)
+221|            return False
+222|        except (NotADirectoryError, SandboxFilesystemNotADirectoryError):
+223|            return True
+224|        except (FileNotFoundError, SandboxFilesystemNotFoundError):
+225|            return False
+226|
+227|    async def _teardown_sandbox(self) -> None:
+228|        """Terminate the sandbox and reset references."""
+229|        env = self._env
+230|        if not env._sandbox:
+231|            return
+232|        try:
+233|            await env._terminate_sandbox()
+234|            await env._sandbox.wait.aio(raise_on_termination=False)
+235|        except Exception as e:
+236|            env.logger.warning(f"Error terminating Modal sandbox: {e}")
+237|        finally:
+238|            env._sandbox = None
+239|            env._app = None
+240|            env._image = None
+241|
+242|    async def exec_on_vm(
+243|        self,
+244|        command: str,
+245|        cwd: str | None = None,
+246|        env: dict[str, str] | None = None,
+247|        timeout_sec: int | None = None,
+248|        shell: str = "bash",
+249|    ) -> ExecResult:
+250|        """Run a command directly on the sandbox VM (bypasses compose)."""
+251|        return await self._env._sdk_exec(
+252|            command, cwd=cwd, env=env, timeout_sec=timeout_sec, shell=shell
+253|        )
+254|
+255|
+256|class _ModalDirect(_ModalStrategy):
+257|    """Single-container sandbox — runs agent and verifier directly in the
+258|    Modal sandbox.
+259|
+260|    Inherits upload/download/is_dir/is_file from `_ModalStrategy` since
+261|    the default SDK implementations are sufficient for a single container.
+262|    """
+263|
+264|    @override
+265|    async def start(self, force_build: bool) -> None:
+266|        env = self._env
+267|
+268|        docker_image = env.task_env_config.docker_image
+269|        use_prebuilt = should_use_prebuilt_docker_image(
+270|            env.environment_dir,
+271|            docker_image=docker_image,
+272|            force_build=force_build,
+273|        )
+274|        if use_prebuilt and docker_image:
+275|            registry_secret = (
+276|                Secret.from_name(env._registry_secret) if env._registry_secret else None
+277|            )
+278|            if ".dkr.ecr." in docker_image:
+279|                env._image = Image.from_aws_ecr(
+280|                    docker_image,
+281|                    secret=registry_secret,
+282|                )
+283|            else:
+284|                env._image = Image.from_registry(
+285|                    docker_image,
+286|                    secret=registry_secret,
+287|                )
+288|        else:
+289|            env._image = Image.from_dockerfile(
+290|                env._environment_definition_path,
+291|                context_dir=env.environment_dir,
+292|            )
+293|
+294|        env._app = await App.lookup.aio(
+295|            name=env._app_name,
+296|            create_if_missing=True,
+297|        )
+298|
+299|        # Override the image's ENTRYPOINT/CMD with a long-lived no-op so the
+300|        # sandbox stays alive for subsequent `exec`/`mkdir` calls.  Many task
+301|        # images (e.g. SWE-Bench Pro) reset ENTRYPOINT and rely on an external
+302|        # keepalive — without one the sandbox terminates immediately and
+303|        # follow-up SDK calls fail with "request cancelled due to internal
+304|        # error".  Mirrors the convention used by docker, apple_container, and
+305|        # islo environments.
+306|        #
+307|        # Task authors with a legitimate long-running entrypoint can override
+308|        # via the ``keepalive`` env kwarg: pass a custom command (list of
+309|        # str), or ``None`` to inherit the image's own ENTRYPOINT/CMD.
+310|        keepalive = env._kwargs.get("keepalive", ["sh", "-c", "sleep infinity"])
+311|        experimental_options = {"vm_runtime": True} if env._vm_runtime_enabled else None
+312|        env._sandbox = await env._create_sandbox(
+313|            entrypoint=keepalive,
+314|            experimental_options=experimental_options,
+315|        )
+316|
+317|        workdir = env.task_env_config.workdir
+318|        if workdir:
+319|            await env._sdk_exec(f"mkdir -p {shlex.quote(workdir)}")
+320|
+321|        # Create log directories and make them world-writable so non-root
+322|        # agent/verifier users can write to them.
+323|        await env.ensure_dirs(env._mount_targets(writable_only=True))
+324|
+325|        await env._upload_environment_dir_after_start()
+326|
+327|    @override
+328|    async def exec(
+329|        self,
+330|        command: str,
+331|        cwd: str | None = None,
+332|        env: dict[str, str] | None = None,
+333|        timeout_sec: int | None = None,
+334|        user: str | int | None = None,
+335|    ) -> ExecResult:
+336|        if user is not None:
+337|            if isinstance(user, int):
+338|                user_arg = f"$(getent passwd {user} | cut -d: -f1)"
+339|            else:
+340|                user_arg = shlex.quote(str(user))
+341|            command = f"su {user_arg} -s /bin/bash -c {shlex.quote(command)}"
+342|
+343|        return await self._env._sdk_exec(
+344|            command, cwd=cwd, env=env, timeout_sec=timeout_sec, login=False
+345|        )
+346|
+347|    @override
+348|    async def attach(self) -> None:
+349|        env = self._env
+350|        if not env._sandbox:
+351|            raise RuntimeError("Sandbox not found. Please start the environment first.")
+352|
+353|        os.execvp(
+354|            "modal",
+355|            [
+356|                "modal",
+357|                "shell",
+358|                env._sandbox.object_id,
+359|            ],
+360|        )
+361|
+362|
+363|class _ModalDinD(DinDComposeOps, _ModalStrategy):
+364|    """Docker-in-Docker compose strategy for multi-container tasks.
+365|
+366|    Uses Modal's ``experimental_options={"enable_docker": True}`` to run
+367|    a Docker daemon inside the sandbox. Unless, vm_runtime is specified, then use that.
+368|
+369|    Topology:
+370|        Local machine (harbor CLI)
+371|          └── Modal Sandbox (DinD, enable_docker=True xor vm_runtime=True)
+372|                ├── dockerd (Docker daemon, managed by Modal)
+373|                └── docker compose
+374|                      ├── main        ← agent runs here, exec/upload/download target
+375|                      ├── sidecar     ← additional services
+376|                      └── ...
+377|    """
+378|
+379|    # Max iterations when polling for Docker daemon readiness.
+380|    # Each iteration sleeps 2s, so worst-case wall-clock time is ~60s.
+381|    _DOCKER_DAEMON_POLL_LIMIT = 30
+382|    _COMPOSE_DIR = "/harbor/compose"
+383|    _ENVIRONMENT_DIR = "/harbor/environment"
+384|    _MOUNTS_COMPOSE_NAME = "docker-compose-mounts.json"
+385|
+386|    def __init__(self, env: "ModalEnvironment"):
+387|        super().__init__(env)
+388|        self._use_prebuilt = False
+389|        self._resolved_task_env: dict[str, str] = {}
+390|        if self._env.task_env_config.env:
+391|            self._resolved_task_env = resolve_env_vars(self._env.task_env_config.env)
+392|
+393|    # ── DinDComposeOps primitives ────────────────────────────────────────
+394|
+395|    _SELF_BIND_LOG_DIRS = True
+396|
+397|    @override
+398|    async def _host_exec(
+399|        self, command: str, timeout_sec: int | None = None
+400|    ) -> ExecResult:
+401|        return await self._vm_exec(command, timeout_sec=timeout_sec)
+402|
+403|    @override
+404|    async def _stage_file_to_host(self, source_path: Path | str, host_path: str):
+405|        await self._env._sdk_upload_file(source_path, host_path)
+406|
+407|    @override
+408|    async def _stage_dir_to_host(self, source_dir: Path | str, host_dir: str):
+409|        await self._env._sdk_upload_dir(source_dir, host_dir)
+410|
+411|    @override
+412|    async def _fetch_file_from_host(self, host_path: str, target_path: Path | str):
+413|        await self._env._sdk_download_file(host_path, target_path)
+414|
+415|    @override
+416|    async def _fetch_dir_from_host(self, host_dir: str, target_dir: Path | str):
+417|        await self._env._sdk_download_dir(host_dir, target_dir)
+418|
+419|    @staticmethod
+420|    def _build_host_network_overlay(
+421|        environment_dir: Path,
+422|        *,
+423|        use_prebuilt: bool = False,
+424|        extra_compose_paths: list[Path] | None = None,
+425|    ) -> str:
+426|        """Generate a compose overlay that sets host networking on all services.
+427|
+428|        Parses service names from the task's docker-compose.yaml and extra
+429|        compose overlays so the overlay covers all services regardless of naming
+430|        conventions.
+431|        Only adds ``build.network: host`` for services that have a build
+432|        context (not pure image-based services like redis).
+433|
+434|        Each service gets ``extra_hosts`` entries mapping every *other*
+435|        service name to ``127.0.0.1`` so that Docker DNS hostnames
+436|        (e.g. ``redis``, ``agent1``) resolve correctly under host networking.
+437|
+438|        Only used by the gVisor path; the VM runtime uses the default Docker
+439|        bridge and needs no overlay.
+440|        """
+441|        import yaml
+442|
+443|        compose_path = environment_dir / "docker-compose.yaml"
+444|        services: dict[str, bool] = {}  # name -> has_build
+445|        compose_paths = [compose_path, *(extra_compose_paths or [])]
+446|        for path in compose_paths:
+447|            if not path.exists():
+448|                continue
+449|            doc = yaml.safe_load(path.read_text())
+450|            if doc and "services" in doc:
+451|                for name, cfg in doc["services"].items():
+452|                    has_build = isinstance(cfg, dict) and "build" in cfg
+453|                    services[name] = services.get(name, False) or has_build
+454|
+455|        # Fallback if parsing fails
+456|        if not services:
+457|            services = {"main": True, "sidecar": True, "redis": False}
+458|
+459|        # main always needs host networking.  In build mode it also needs
+460|        # build.network: host; in prebuilt mode only network_mode: host.
+461|        if use_prebuilt:
+462|            services.setdefault("main", False)
+463|        else:
+464|            services["main"] = True
+465|
+466|        service_names = list(services.keys())
+467|        lines = ["services:"]
+468|        for svc, has_build in services.items():
+469|            lines.append(f"  {svc}:")
+470|            if has_build:
+471|                lines.append("    build:")
+472|                lines.append("      network: host")
+473|            lines.append("    network_mode: host")
+474|            # Map all other service names to localhost so Docker DNS
+475|            # hostnames work under host networking.
+476|            others = [s for s in service_names if s != svc]
+477|            if others:
+478|                lines.append("    extra_hosts:")
+479|                for other in others:
+480|                    lines.append(f'      - "{other}:127.0.0.1"')
+481|            # NOTE: Do NOT add environment: here — it replaces (not merges)
+482|            # the service's entire environment block from the base compose
+483|            # file, wiping out AGENT_ID, API keys, etc.
+484|        return "\n".join(lines)
+485|
+486|    async def _vm_exec(
+487|        self,
+488|        command: str,
+489|        cwd: str | None = None,
+490|        env: dict[str, str] | None = None,
+491|        timeout_sec: int | None = None,
+492|        shell: str = "sh",
+493|    ) -> ExecResult:
+494|        """Run a command on the DinD sandbox VM (defaults to sh for Alpine)."""
+495|        return await self._env._sdk_exec(
+496|            command, cwd=cwd, env=env, timeout_sec=timeout_sec, shell=shell
+497|        )
+498|
+499|    def _compose_referenced_env_vars(self) -> dict[str, str]:
+500|        """Extract env vars referenced in task and extra docker compose files.
+(more lines below)

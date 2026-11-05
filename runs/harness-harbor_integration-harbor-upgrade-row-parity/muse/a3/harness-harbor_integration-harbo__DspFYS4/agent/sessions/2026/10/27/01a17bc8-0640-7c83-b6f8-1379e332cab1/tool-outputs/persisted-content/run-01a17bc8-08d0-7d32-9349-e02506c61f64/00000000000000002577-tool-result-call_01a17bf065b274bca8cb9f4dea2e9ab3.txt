@@ -1,0 +1,83 @@
+Read text file `/usr/local/lib/python3.12/site-packages/sandbox_broker/client.py`.
+(385 line(s) above)
+386|class AsyncSandbox:
+387|    def __init__(self, client: AsyncBrokerClient, sandbox_id: str, info: dict):
+388|        self.client = client
+389|        self.id = sandbox_id
+390|        self.info = info
+391|
+392|    @property
+393|    def object_id(self) -> str:
+394|        return self.id
+395|
+396|    async def exec(self, *argv: str, timeout: int | None = None, workdir: str | None = None,
+397|                   env: dict | None = None, stdin: str | bytes | None = None, binary: bool = False,
+398|                   on_output: OutputHandler | None = None) -> ExecResult:
+399|        stream = on_output is not None
+400|        msg = _exec_msg(self.id, argv, timeout, workdir, env, stdin, binary, stream)
+401|        streamed: dict[str, list] | None = {"stdout": [], "stderr": []} if stream else None
+402|
+403|        async def on_event(ev: dict) -> None:
+404|            data = _event_data(ev, binary)
+405|            streamed[ev["fd"]].append(data)
+406|            res = on_output(ev["fd"], data)
+407|            if asyncio.iscoroutine(res):
+408|                await res
+409|
+410|        reply = await self.client.call(msg, timeout=_exec_reply_timeout(timeout),
+411|                                       on_event=on_event if stream else None)
+412|        return _exec_result(reply, binary, streamed)
+413|
+414|    run = exec
+415|
+416|    async def put_file(self, path: str, data: str | bytes | os.PathLike, mode: int | None = None) -> None:
+417|        if isinstance(data, os.PathLike):
+418|            data = await asyncio.to_thread(Path(data).read_bytes)
+419|        elif isinstance(data, str):
+420|            data = data.encode()
+421|        msg = {"op": "put_file", "id": self.id, "path": path, "data_b64": base64.b64encode(data).decode()}
+422|        if mode is not None:
+423|            msg["mode"] = mode
+424|        await self.client.call(msg, timeout=FILE_REPLY_TIMEOUT)
+425|
+426|    async def get_file(self, path: str) -> bytes:
+427|        reply = await self.client.call({"op": "get_file", "id": self.id, "path": path}, timeout=FILE_REPLY_TIMEOUT)
+428|        return base64.b64decode(reply["data_b64"])
+429|
+430|    async def upload_dir(self, local_dir: str | os.PathLike, remote_dir: str) -> None:
+431|        tmp = f"/tmp/.sandbox-broker-{uuid.uuid4().hex}.tar.gz"
+432|        await self.put_file(tmp, await asyncio.to_thread(_tar_dir, local_dir))
+433|        r = await self.exec("sh", "-c", 'mkdir -p "$1" && tar -xzf "$2" -C "$1"; rc=$?; rm -f "$2"; exit $rc',
+434|                            "_", remote_dir, tmp, timeout=600)
+435|        if r.returncode != 0:
+436|            raise RuntimeError(f"upload_dir failed ({r.returncode}): {r.stderr}")
+437|
+438|    async def download_dir(self, remote_dir: str, local_dir: str | os.PathLike) -> None:
+439|        tmp = f"/tmp/.sandbox-broker-{uuid.uuid4().hex}.tar.gz"
+440|        r = await self.exec("tar", "-czf", tmp, "-C", remote_dir, ".", timeout=600)
+441|        if r.returncode != 0:
+442|            raise RuntimeError(f"download_dir failed ({r.returncode}): {r.stderr}")
+443|        try:
+444|            await asyncio.to_thread(_untar, await self.get_file(tmp), local_dir)
+445|        finally:
+446|            await self.exec("rm", "-f", tmp, timeout=60)
+447|
+448|    async def poll(self) -> int | None:
+449|        reply = await self.client.call({"op": "poll", "id": self.id})
+450|        return None if reply["running"] else (reply.get("rc") if reply.get("rc") is not None else 0)
+451|
+452|    async def terminate(self) -> None:
+453|        await self.client.call({"op": "terminate", "id": self.id}, timeout=180)
+454|
+455|    async def __aenter__(self) -> "AsyncSandbox":
+456|        return self
+457|
+458|    async def __aexit__(self, *exc) -> None:
+459|        try:
+460|            await self.terminate()
+461|        except Exception:  # noqa: BLE001
+462|            pass
+463|
+464|
+465|__all__ = ["AsyncBrokerClient", "AsyncSandbox", "BrokerClient", "ExecResult", "Sandbox",
+466|                          "default_socket_path", "pack_build_context"]

@@ -1,0 +1,52 @@
+edited
+changed lines: lines 1545-1564
+--- original
++++ updated
+@@
+-    snap = _log_snapshot(log_dir)
+-    notes, sent_keys = [], []
+-    deadline = time.time() + timeout_sec
+-    for n, (key, url, body) in enumerate(valid):
+-        if time.time() > deadline:
+-            notes.append(f"live: forwarding stopped at {n}/{len(valid)} (deadline)")
+-            break
+-        b = dict(body)
+-        b["max_tokens"] = 1
+-        b.pop("max_completion_tokens", None)
+-        b["stream"] = False
+-        req = urllib.request.Request(
+-            url.rstrip("/") + "/chat/completions",
+-            data=json.dumps(b).encode(), headers={"Content-Type": "application/json"}, method="POST")
+-        try:
+-            with urllib.request.urlopen(req, timeout=600) as resp:
+-                resp.read()
+-        except Exception as e:  # noqa: BLE001
+-            notes.append(f"live: {key} forward failed: {type(e).__name__}: {e}")
+-        sent_keys.append(key)
++    snap = _log_snapshot(log_dir)
++    notes, sent_keys, resp_ids = [], [], {}
++    deadline = time.time() + timeout_sec
++    for n, (key, url, body) in enumerate(valid):
++        if time.time() > deadline:
++            notes.append(f"live: forwarding stopped at {n}/{len(valid)} (deadline)")
++            break
++        b = dict(body)
++        b["max_tokens"] = 1
++        b.pop("max_completion_tokens", None)
++        b["stream"] = False
++        req = urllib.request.Request(
++            url.rstrip("/") + "/chat/completions",
++            data=json.dumps(b).encode(), headers={"Content-Type": "application/json"}, method="POST")
++        try:
++            with urllib.request.urlopen(req, timeout=600) as resp:
++                payload = resp.read()
++            try:
++                obj = json.loads(payload)
++                sglext = obj.get("sglext") or {}
++                if isinstance(sglext.get("input_ids"), list):
++                    resp_ids[key] = sglext["input_ids"]
++            except Exception:
++                pass
++        except Exception as e:  # noqa: BLE001
++            notes.append(f"live: {key} forward failed: {type(e).__name__}: {e}")
++        sent_keys.append(key)

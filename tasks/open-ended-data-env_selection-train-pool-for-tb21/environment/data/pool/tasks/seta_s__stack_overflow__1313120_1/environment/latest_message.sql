@@ -1,0 +1,1 @@
+SELECT * FROM (SELECT * FROM messages ORDER BY id DESC) x GROUP BY name;

@@ -1,0 +1,2 @@
+CREATE ROLE maintuser WITH LOGIN;
+CREATE DATABASE appdb OWNER postgres;

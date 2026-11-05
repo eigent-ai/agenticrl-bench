@@ -1,0 +1,40 @@
+def get_json_schema_constraint(
+    tools: List[Tool], tool_choice: Union[ToolChoice, Literal["required"]]
+) -> Optional[dict]:
+    """
+    Get the JSON schema constraint for the specified tool choice.
+
+    Args:
+        tool_choice: The tool choice specification
+
+    Returns:
+        JSON schema dict, or None if no valid tools found
+    """
+
+    if isinstance(tool_choice, ToolChoice):
+        # For specific function choice, return the user's parameters schema directly
+        fn_name = tool_choice.function.name
+        for tool in tools:
+            if tool.function.name == fn_name:
+                return {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 1,
+                    "items": _get_tool_schema(tool),
+                }
+        return None
+    elif tool_choice == "required":
+        json_schema = {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+                "type": "object",
+                "anyOf": [_get_tool_schema(tool) for tool in tools],
+            },
+        }
+        json_schema_defs = _get_tool_schema_defs(tools)
+        if json_schema_defs:
+            json_schema["$defs"] = json_schema_defs
+        return json_schema
+
+    return None

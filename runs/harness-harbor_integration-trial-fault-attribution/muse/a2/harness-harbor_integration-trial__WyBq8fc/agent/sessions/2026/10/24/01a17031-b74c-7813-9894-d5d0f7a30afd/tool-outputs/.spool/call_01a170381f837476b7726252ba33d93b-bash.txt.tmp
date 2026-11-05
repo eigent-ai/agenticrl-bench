@@ -1,0 +1,157 @@
+reference/harbor-0.23.0/harbor/job.py:128:            retry_config=self.config.retry,
+reference/harbor-0.23.0/harbor/job.py:427:            for _ in range(self.config.n_attempts)
+reference/harbor-0.23.0/harbor/job.py:700:    def _remove_completed_attempt_for_retry(self, trial_name: str) -> None:
+reference/harbor-0.23.0/harbor/job.py:928:            self._remove_completed_attempt_for_retry(event.trial_name)
+reference/harbor-0.23.0/harbor/job.py:1128:        # Guards ensure hooks firing on retry attempts are idempotent.
+reference/harbor-0.23.0/harbor/trial/queue.py:7:from harbor.models.job.config import RetryConfig
+reference/harbor-0.23.0/harbor/trial/queue.py:24:    with retry logic, and returns TrialResult tasks. Concurrency is
+reference/harbor-0.23.0/harbor/trial/queue.py:32:        retry_config: RetryConfig | None = None,
+reference/harbor-0.23.0/harbor/trial/queue.py:42:        self._retry_config = retry_config if retry_config is not None else RetryConfig()
+reference/harbor-0.23.0/harbor/trial/queue.py:83:    def _should_retry_exception(self, exception_type: str) -> bool:
+reference/harbor-0.23.0/harbor/trial/queue.py:84:        """Check if an exception should trigger a retry."""
+reference/harbor-0.23.0/harbor/trial/queue.py:86:            self._retry_config.exclude_exceptions
+reference/harbor-0.23.0/harbor/trial/queue.py:87:            and exception_type in self._retry_config.exclude_exceptions
+reference/harbor-0.23.0/harbor/trial/queue.py:90:                f"Exception {exception_type} is in exclude_exceptions, not retrying"
+reference/harbor-0.23.0/harbor/trial/queue.py:95:            self._retry_config.include_exceptions
+reference/harbor-0.23.0/harbor/trial/queue.py:96:            and exception_type not in self._retry_config.include_exceptions
+reference/harbor-0.23.0/harbor/trial/queue.py:99:                f"Exception {exception_type} is not in include_exceptions, not retrying"
+reference/harbor-0.23.0/harbor/trial/queue.py:105:    def _calculate_backoff_delay_sec(self, attempt: int) -> float:
+reference/harbor-0.23.0/harbor/trial/queue.py:106:        """Calculate the backoff delay for a retry attempt."""
+reference/harbor-0.23.0/harbor/trial/queue.py:107:        delay_sec = self._retry_config.min_wait_sec * (
+reference/harbor-0.23.0/harbor/trial/queue.py:108:            self._retry_config.wait_multiplier**attempt
+reference/harbor-0.23.0/harbor/trial/queue.py:110:        return min(delay_sec, self._retry_config.max_wait_sec)
+reference/harbor-0.23.0/harbor/trial/queue.py:197:        """Execute a trial with retry logic."""
+reference/harbor-0.23.0/harbor/trial/queue.py:200:        for attempt in range(self._retry_config.max_retries + 1):
+reference/harbor-0.23.0/harbor/trial/queue.py:208:            if not self._should_retry_exception(result.exception_info.exception_type):
+reference/harbor-0.23.0/harbor/trial/queue.py:210:                    "Not retrying trial because the exception is not in "
+reference/harbor-0.23.0/harbor/trial/queue.py:215:            if attempt == self._retry_config.max_retries:
+reference/harbor-0.23.0/harbor/trial/queue.py:217:                    "Not retrying trial because the maximum number of retries has been "
+reference/harbor-0.23.0/harbor/trial/queue.py:224:            delay_sec = self._calculate_backoff_delay_sec(attempt)
+reference/harbor-0.23.0/harbor/trial/queue.py:228:                f"{result.exception_info.exception_type}. Retrying in "
+reference/harbor-0.23.0/harbor/models/job/config.py:291:class RetryConfig(BaseModel):
+reference/harbor-0.23.0/harbor/models/job/config.py:293:        default=0, description="Maximum number of retry attempts", ge=0
+reference/harbor-0.23.0/harbor/models/job/config.py:297:        description="Exception types to retry on. If None, retries all exceptions.",
+reference/harbor-0.23.0/harbor/models/job/config.py:311:        description="Exception types to NOT retry on. Takes precedence over "
+reference/harbor-0.23.0/harbor/models/job/config.py:358:        Use top-level ``n_concurrent_trials``, ``quiet``, and ``retry`` instead.
+reference/harbor-0.23.0/harbor/models/job/config.py:382:            "Use top-level 'n_concurrent_trials', 'quiet', and 'retry' instead.",
+reference/harbor-0.23.0/harbor/models/job/config.py:391:            if "retry" in orch:
+reference/harbor-0.23.0/harbor/models/job/config.py:392:                data.setdefault("retry", orch["retry"])
+reference/harbor-0.23.0/harbor/models/job/config.py:403:    n_attempts: int = Field(default=1, ge=1)
+reference/harbor-0.23.0/harbor/models/job/config.py:423:    retry: RetryConfig = Field(default_factory=RetryConfig)
+reference/harbor-0.23.0/harbor/models/job/config.py:458:            "attempts expansion. The CLI passes a single source; multiple "
+reference/harbor-0.23.0/harbor/models/job/lock.py:18:from harbor.models.job.config import JobConfig, RetryConfig
+reference/harbor-0.23.0/harbor/models/job/lock.py:273:    retry: RetryConfig
+reference/harbor-0.23.0/harbor/models/job/lock.py:286:            _frozen_value(self.retry),
+reference/harbor-0.23.0/harbor/models/job/lock.py:381:        retry=config.retry,
+reference/harbor-0.23.0/harbor/models/job/result.py:220:        """Update stats for a trial, removing previous contributions if this is a retry."""
+=== job.py trial loop ===
+88:        self._existing_job_result = (
+89:            JobResult.model_validate_json(self._job_result_path.read_text())
+90:            if self._job_result_path.exists()
+93:        self.is_resuming = self._existing_job_result is not None
+99:            if self._existing_job_result is None
+100:            else self._existing_job_result.id
+119:        self._maybe_init_existing_job()
+124:        self._live_rewards = self._existing_rewards.copy()
+239:    def _maybe_init_existing_job(self):
+240:        self._existing_trial_configs: list[TrialConfig] = []
+241:        self._existing_trial_results: list[TrialResult] = []
+244:        self._existing_rewards: EvalsRewardsMap = defaultdict(dict)
+246:        self._existing_stats = JobStats()
+251:        existing_config = JobConfig.model_validate_json(
+255:        if existing_config != self.config:
+258:                "resumed with a different config."
+267:            if not trial_paths.result_path.exists():
+272:                result_text = trial_paths.result_path.read_text()
+275:                    "Skipping existing trial directory %s because result.json could not be read: %s",
+283:                    "Skipping existing trial directory %s because result.json is empty",
+292:                    "Skipping existing trial directory %s because result.json could not be parsed: %s",
+298:            self._existing_trial_configs.append(
+301:            self._existing_trial_results.append(trial_result)
+303:        for trial_result in self._existing_trial_results:
+314:            self._existing_rewards[evals_key][trial_result.trial_name] = (
+319:            self._previous_trial_results[trial_result.trial_name] = trial_result
+321:        self._existing_stats = JobStats.from_trial_results(self._existing_trial_results)
+324:        self._running_trial_names: set[str] = set()
+325:        self._cancelled_trial_names: set[str] = {
+326:            result.trial_name
+327:            for result in self._existing_trial_results
+331:            self._existing_job_result.stats.n_retries
+332:            if self._existing_job_result is not None
+338:        matched_existing_indices: set[int] = set()
+342:            existing_index = next(
+345:                    for index, existing_trial_config in enumerate(
+346:                        self._existing_trial_configs
+348:                    if index not in matched_existing_indices
+349:                    and existing_trial_config == trial_config
+353:            if existing_index is None:
+357:                matched_existing_indices.add(existing_index)
+359:                    self._existing_trial_configs[existing_index]
+362:        if len(matched_existing_indices) != len(self._existing_trial_configs):
+438:        trial names, which ``harbor job resume`` reconciliation ignores, so
+473:            existing_dir = task_dirs_by_name.get(name)
+474:            if existing_dir is not None and existing_dir != task_dir:
+477:                    f"{existing_dir} and {task_dir}."
+492:                if not trial_paths.result_path.exists():
+496:                        trial_paths.result_path.read_text()
+500:                        "Skipping trial directory %s because result.json could "
+532:                        "result.json.",
+603:        Trial.create resolves it via ``trials_dir/.sources/<uuid>``. Seeding
+633:        (or recovered from `result.json` on a resume)."""
+653:    def _job_result_path(self):
+654:        return self.job_dir / "result.json"
+672:            n_running_trials=len(self._running_trial_names),
+673:            n_cancelled_trials=len(self._cancelled_trial_names),
+700:    def _remove_completed_attempt_for_retry(self, trial_name: str) -> None:
+701:        previous_result = self._previous_trial_results.pop(trial_name, None)
+706:        self._live_rewards[evals_key].pop(trial_name, None)
+709:            self._cancelled_trial_names.discard(trial_name)
+715:            result_json = self._job_result.model_dump_json(
+720:            result_json = self._job_result.model_dump_json(indent=4)
+721:        self._job_result_path.write_text(result_json)
+902:            existing_job_lock = self._read_existing_job_lock()
+903:            if existing_job_lock is None:
+908:            self._job_lock.created_at = existing_job_lock.created_at
+909:            self._job_lock.harbor = existing_job_lock.harbor
+910:            if existing_job_lock != self._job_lock:
+919:    def _read_existing_job_lock(self) -> JobLock | None:
+928:            self._remove_completed_attempt_for_retry(event.trial_name)
+929:            self._running_trial_names.add(event.trial_name)
+936:            self._cancelled_trial_names.add(event.trial_name)
+943:        trial_name = trial_result.trial_name
+946:            previous_result = self._previous_trial_results.get(trial_name)
+950:            self._live_rewards[evals_key][trial_name] = (
+961:            self._previous_trial_results[trial_name] = trial_result
+963:            self._running_trial_names.discard(trial_name)
+967:                self._cancelled_trial_names.discard(trial_name)
+969:                self._cancelled_trial_names.add(trial_name)
+980:                self._existing_job_result.started_at
+981:                if self._existing_job_result is not None
+990:                    self._existing_trial_results,
+1007:            n_existing = len(self._existing_trial_configs)
+1024:                        total=n_remaining + n_existing,
+1025:                        completed=n_existing,
+1048:                        total=n_remaining + n_existing,
+1049:                        completed=n_existing,
+1056:            combined_trial_results = self._existing_trial_results + trial_results
+1135:                if event.trial_name not in trial_progress_tasks:
+1137:                        f"{event.trial_name}: running trial...", total=None
+1139:                    trial_progress_tasks[event.trial_name] = task_id
+1142:                if event.trial_name in trial_progress_tasks:
+1144:                        trial_progress_tasks[event.trial_name],
+1145:                        description=f"{event.trial_name}: starting environment...",
+1149:                if event.trial_name in trial_progress_tasks:
+1151:                        trial_progress_tasks[event.trial_name],
+1152:                        description=f"{event.trial_name}: running agent...",
+1156:                if event.trial_name in trial_progress_tasks:
+1158:                        trial_progress_tasks[event.trial_name],
+1159:                        description=f"{event.trial_name}: running verifier...",
+1163:                if event.trial_name in trial_progress_tasks:
+1165:                        trial_progress_tasks[event.trial_name],
+1166:                        description=f"{event.trial_name}: canceling trial; "
+1171:                if event.trial_name in trial_progress_tasks:
+1173:                        trial_progress_tasks.pop(event.trial_name)
+1175:                if event.trial_name not in advanced_trials:
+1176:                    advanced_trials.add(event.trial_name)
+1191:                if event.trial_name not in advanced_trials:
+1192:                    advanced_trials.add(event.trial_name)

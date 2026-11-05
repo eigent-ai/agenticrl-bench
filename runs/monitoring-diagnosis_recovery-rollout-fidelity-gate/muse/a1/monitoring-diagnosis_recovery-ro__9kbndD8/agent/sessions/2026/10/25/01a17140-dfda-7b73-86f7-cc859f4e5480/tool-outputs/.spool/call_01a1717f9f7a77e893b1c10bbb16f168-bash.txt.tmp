@@ -1,0 +1,44 @@
+        None if use_addition_r3 else get_routed_experts_from_response(args, choice, len(sample.tokens) - 1)
+    )
+    sample.rollout_indexer_topk = get_indexer_topk_from_response(args, choice, sample)
+
+    if trim_count > 0:
+        sample.strip_last_output_tokens(trim_count, tokenizer)
+
+    # TODO unify with Sample.update_from_meta_info
+    match choice["finish_reason"]:
+        case "stop" | "tool_calls":
+            sample.status = Sample.Status.COMPLETED
+        case "length":
+            sample.status = Sample.Status.TRUNCATED
+        case "abort":
+            sample.status = Sample.Status.ABORTED
+
+    if args.sglang_speculative_algorithm:
+        sample.spec_info.add(choice.get("meta_info", {}))
+    sample.prefix_cache_info.add(choice.get("meta_info", {}))
+    if "weight_version" in choice["meta_info"]:
+        sample.weight_versions.append(choice["meta_info"]["weight_version"])
+
+    return sample
+
+
+def merge_samples_with_addition_r3(
+    args: Namespace,
+    samples: list[Sample],
+    records: list[SessionRecord],
+    tokenizer,
+) -> Sample:
+    """Merge ordinary fields, then materialize the required append-only R3 prefix."""
+    merged = merge_samples(samples, tokenizer)
+    if all(record.response["choices"][0]["meta_info"].get("routed_experts") is None for record in records):
+        return merged
+
+    required_rows = len(merged.tokens) - 1
+    covered_rows = 0
+    chunks: list[np.ndarray] = []
+    for i, record in enumerate(records):
+        if chunks and covered_rows >= required_rows:
+/root/miles/tests/e2e/megatron/test_qwen3_5_35B_A3B_mtp/test_mtp0_spec_v2.py
+/root/miles/tests/e2e/megatron/test_qwen3_5_35B_A3B_mtp/test_amd_mtp1_spec_v2_r3.py
+/root/miles/tests/e2e/megatron/test_qwen3_5_35B_A3B_mtp/test_mtp1_spec_v2_r3.py

@@ -1,0 +1,233 @@
+/opt/verl/verl/utils/groupwise.py:91:def as_torch_index(index: Any, device: torch.device | str | None = None) -> torch.Tensor:
+/opt/verl/verl/utils/groupwise.py-92-    """
+/opt/verl/verl/utils/groupwise.py-93-    Convert arbitrary group labels to a contiguous 1-D torch.long tensor (0..G-1).
+/opt/verl/verl/utils/groupwise.py-94-
+/opt/verl/verl/utils/groupwise.py-95-    Args:
+/opt/verl/verl/utils/groupwise.py-96-        index: Any iterable of labels or tensor/ndarray.
+/opt/verl/verl/utils/groupwise.py-97-        device: Target device; if None, resolved via _resolve_device().
+/opt/verl/verl/utils/groupwise.py-98-
+/opt/verl/verl/utils/groupwise.py-99-    Returns:
+/opt/verl/verl/utils/groupwise.py-100-        torch.LongTensor with shape (N,)
+/opt/verl/verl/utils/groupwise.py-101-    """
+/opt/verl/verl/utils/groupwise.py-102-    target = _resolve_device(device)
+/opt/verl/verl/utils/groupwise.py-103-
+/opt/verl/verl/utils/groupwise.py-104-    # ---------- Fast path: torch.Tensor ----------
+/opt/verl/verl/utils/groupwise.py-105-    if isinstance(index, torch.Tensor):
+/opt/verl/verl/utils/groupwise.py-106-        t = index.reshape(-1)
+/opt/verl/verl/utils/groupwise.py-107-        if t.dtype in (
+/opt/verl/verl/utils/groupwise.py-108-            torch.int64,
+/opt/verl/verl/utils/groupwise.py-109-            torch.int32,
+/opt/verl/verl/utils/groupwise.py-110-            torch.int16,
+/opt/verl/verl/utils/groupwise.py-111-            torch.int8,
+/opt/verl/verl/utils/groupwise.py-112-            getattr(torch, "uint8", torch.uint8),
+/opt/verl/verl/utils/groupwise.py-113-            torch.bool,
+/opt/verl/verl/utils/groupwise.py-114-        ):
+/opt/verl/verl/utils/groupwise.py-115-            return t.to(device=target, dtype=torch.long)
+/opt/verl/verl/utils/groupwise.py-116-
+/opt/verl/verl/utils/groupwise.py-117-        if t.dtype in (torch.float16, torch.float32, torch.float64, torch.bfloat16):
+/opt/verl/verl/utils/groupwise.py-118-            t64 = t.to(dtype=torch.float64)
+/opt/verl/verl/utils/groupwise.py-119-            rounded = torch.round(t64)
+/opt/verl/verl/utils/groupwise.py-120-            if torch.allclose(t64, rounded, rtol=0.0, atol=1e-6):
+/opt/verl/verl/utils/groupwise.py-121-                return rounded.to(device=target, dtype=torch.long)
+/opt/verl/verl/utils/groupwise.py-122-            arr = np.array([str(x.item()) for x in t], dtype=object)
+/opt/verl/verl/utils/groupwise.py-123-        else:
+/opt/verl/verl/utils/groupwise.py-124-            arr = np.array([str(x.item()) if hasattr(x, "item") else str(x) for x in t], dtype=object)
+/opt/verl/verl/utils/groupwise.py-125-
+/opt/verl/verl/utils/groupwise.py-126-    else:
+/opt/verl/verl/utils/groupwise.py-127-        # ---------- Non-torch: go through numpy ----------
+/opt/verl/verl/utils/groupwise.py-128-        arr = _to_1d_numpy_object_array(index)
+/opt/verl/verl/utils/groupwise.py-129-
+/opt/verl/verl/utils/groupwise.py-130-        # Pure integers (incl. bool)
+/opt/verl/verl/utils/groupwise.py-131-        if arr.dtype != object and np.issubdtype(arr.dtype, np.integer):
+--
+/opt/verl/verl/utils/groupwise.py:164:def group_mean_std(
+/opt/verl/verl/utils/groupwise.py-165-    scores: torch.Tensor,
+/opt/verl/verl/utils/groupwise.py-166-    gidx: torch.Tensor,
+/opt/verl/verl/utils/groupwise.py-167-    eps: float = 1e-6,
+/opt/verl/verl/utils/groupwise.py-168-    device: torch.device | str | None = None,
+/opt/verl/verl/utils/groupwise.py-169-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+/opt/verl/verl/utils/groupwise.py-170-    """
+/opt/verl/verl/utils/groupwise.py-171-    Compute per-group mean/std/count in pure PyTorch.
+/opt/verl/verl/utils/groupwise.py-172-
+/opt/verl/verl/utils/groupwise.py-173-    mean_g = sum / count
+/opt/verl/verl/utils/groupwise.py-174-    std_g  = sqrt( max( (sum2 - sum^2/count) / max(count-1, 1), eps ) )
+/opt/verl/verl/utils/groupwise.py-175-
+/opt/verl/verl/utils/groupwise.py-176-    Singleton groups fallback to mean=0, std=1.
+/opt/verl/verl/utils/groupwise.py-177-
+/opt/verl/verl/utils/groupwise.py-178-    Args:
+/opt/verl/verl/utils/groupwise.py-179-        scores: (N,) float tensor.
+/opt/verl/verl/utils/groupwise.py-180-        gidx  : (N,) long/int tensor with group indices (0..G-1).
+/opt/verl/verl/utils/groupwise.py-181-        eps   : Numerical floor for variance.
+/opt/verl/verl/utils/groupwise.py-182-        device: Target device; if None, resolved via _resolve_device().
+/opt/verl/verl/utils/groupwise.py-183-
+/opt/verl/verl/utils/groupwise.py-184-    Returns:
+/opt/verl/verl/utils/groupwise.py-185-        mean_g: (G,) float32
+/opt/verl/verl/utils/groupwise.py-186-        std_g : (G,) float32
+/opt/verl/verl/utils/groupwise.py-187-        count : (G,) float32
+/opt/verl/verl/utils/groupwise.py-188-    """
+/opt/verl/verl/utils/groupwise.py-189-    target = _resolve_device(device)
+/opt/verl/verl/utils/groupwise.py-190-
+/opt/verl/verl/utils/groupwise.py-191-    scores = scores.reshape(-1).to(device=target, dtype=torch.float32)
+/opt/verl/verl/utils/groupwise.py-192-    gidx = gidx.reshape(-1).to(device=target, dtype=torch.long)
+/opt/verl/verl/utils/groupwise.py-193-
+/opt/verl/verl/utils/groupwise.py-194-    if scores.numel() != gidx.numel():
+/opt/verl/verl/utils/groupwise.py-195-        raise ValueError(f"scores and gidx length mismatch: {scores.numel()} vs {gidx.numel()}")
+/opt/verl/verl/utils/groupwise.py-196-
+/opt/verl/verl/utils/groupwise.py-197-    G = int(torch.max(gidx).item()) + 1 if gidx.numel() > 0 else 0
+/opt/verl/verl/utils/groupwise.py-198-    if G == 0:
+/opt/verl/verl/utils/groupwise.py-199-        # Return empty tensors on the selected device
+/opt/verl/verl/utils/groupwise.py-200-        empty = torch.empty(0, device=target, dtype=torch.float32)
+/opt/verl/verl/utils/groupwise.py-201-        return empty, empty, empty
+/opt/verl/verl/utils/groupwise.py-202-
+/opt/verl/verl/utils/groupwise.py-203-    ones = torch.ones_like(scores, dtype=torch.float32)
+/opt/verl/verl/utils/groupwise.py-204-
+210:def clip_by_value(x: torch.Tensor, tensor_min: torch.Tensor, tensor_max: torch.Tensor) -> torch.Tensor:
+211-    """Clip tensor values to a range defined by tensor bounds.
+212-
+213-    Extension of torch.clamp that supports tensor-valued min/max bounds
+214-    instead of only scalar bounds.
+215-
+216-    Args:
+217-        x: Input tensor to clip.
+218-        tensor_min: Minimum bound tensor (broadcastable to x).
+219-        tensor_max: Maximum bound tensor (broadcastable to x).
+220-
+221-    Returns:
+222-        torch.Tensor: Clipped tensor with values in [tensor_min, tensor_max].
+223-
+224-    See Also:
+225-        https://github.com/pytorch/pytorch/issues/2793#issuecomment-428784713
+226-    """
+227-    clipped = torch.max(torch.min(x, tensor_max), tensor_min)
+228-    return clipped
+229-
+230-
+231:def entropy_from_logits(logits: torch.Tensor) -> torch.Tensor:
+232-    """Calculate Shannon entropy from unnormalized logits.
+233-
+234-    Computes H(p) = -sum(p * log(p)) using the numerically stable formula:
+235-    entropy = logsumexp(logits) - sum(softmax(logits) * logits)
+236-
+237-    Args:
+238-        logits: Unnormalized log-probabilities of shape (..., vocab_size).
+239-
+240-    Returns:
+241-        torch.Tensor: Entropy values with shape (...,), one per distribution.
+242-    """
+243-    pd = torch.nn.functional.softmax(logits, dim=-1)
+244-    entropy = torch.logsumexp(logits, dim=-1) - torch.sum(pd * logits, dim=-1)
+245-    return entropy
+246-
+247-
+248:def entropy_from_logits_with_chunking(logits: torch.Tensor, chunk_size: int = 2048) -> torch.Tensor:
+249-    """Memory-efficient entropy calculation using chunked processing.
+250-
+251-    Computes entropy by processing the batch in chunks to reduce peak memory
+252-    usage. Useful for large batch sizes or when memory is constrained.
+253-
+254-    Args:
+255-        logits: Unnormalized log-probabilities of shape (batch_size, vocab_size).
+256-        chunk_size: Number of samples to process at once. Defaults to 2048.
+257-
+258-    Returns:
+259-        torch.Tensor: Entropy values with shape (batch_size,).
+260-
+261-    Note:
+262-        Converts chunks to float32 for numerical stability during computation.
+263-    """
+264-    entropy = torch.zeros(logits.shape[0], device=logits.device)
+265-    for i in range(0, logits.shape[0], chunk_size):
+266-        logits_chunk = logits[i : i + chunk_size].float()
+267-        pd_chunk = torch.nn.functional.softmax(logits_chunk, dim=-1)
+268-        entropy_chunk = torch.logsumexp(logits_chunk, dim=-1) - torch.sum(pd_chunk * logits_chunk, dim=-1)
+269-        entropy[i : i + chunk_size] = entropy_chunk
+270-    return entropy
+271-
+272-
+273:def masked_sum(values: torch.Tensor, mask: torch.Tensor, axis: int | tuple[int, ...] | None = None) -> torch.Tensor:
+274-    """Compute sum of tensor values where mask is True.
+275-
+276-    NaN values outside the mask are replaced with zeros to prevent
+277-    contaminating the sum.
+278-
+279-    Args:
+280-        values: Input tensor containing values to sum.
+281-        mask: Boolean or numeric mask tensor (same shape as values).
+282-            Non-zero values indicate elements to include.
+283-        axis: Dimension(s) along which to sum. None sums all elements.
+284-
+285-    Returns:
+286-        torch.Tensor: Sum of masked values, reduced along specified axis.
+287-    """
+288-    # If NaNs exist out of mask, replace NaNs in values with a value that
+289-    # won't affect the sum (e.g., 0 for masked regions)
+290-    valid_values = torch.where(mask.bool(), values, 0.0)
+291-    return (valid_values * mask).sum(axis=axis)
+292-
+293-
+294:def masked_mean(values, mask, axis=None):
+295-    """
+296-    Compute the mean of `values` over elements selected by `mask`.
+297-
+298-    Args:
+299-        values (Tensor): Input tensor.
+300-        mask (Tensor): Boolean or numeric mask of the same shape as `values`.
+301-        axis (int or tuple of int, optional): Dimension(s) along which to compute the mean.
+302-            Defaults to None (over all elements).
+303-
+304-    Returns:
+305-        Tensor: Masked mean, with shape equal to `values` reduced over `axis`.
+306-    """
+307-    s = masked_sum(values, mask, axis)
+308-    return s / (mask.sum(axis=axis) + 1e-8)
+309-
+310-
+311-def masked_var(values, mask, unbiased=True):
+312-    """Compute variance of tensor with masked values."""
+313-    mean = masked_mean(values, mask)
+314-    centered_values = values - mean
+315-    variance = masked_mean(centered_values**2, mask)
+316-    if unbiased:
+317-        mask_sum = mask.sum()
+318-        if mask_sum == 0:
+319-            raise ValueError("At least one element in the mask has to be 1.")
+--
+329:def masked_whiten(values, mask, shift_mean=True):
+330-    """
+331-    Whiten `values` by normalizing with mean and variance computed over `mask`.
+332-
+333-    Args:
+334-        values (torch.Tensor): Input tensor.
+335-        mask (torch.Tensor): Boolean tensor of same shape, selects elements for stats.
+336-        shift_mean (bool): If True (default), output is zero-mean;
+337-                           if False, the original mean is re-added after scaling.
+338-
+339-    Returns:
+340-        torch.Tensor: Whitened tensor of same shape as `values`.
+341-    """
+342-    mean, var = masked_mean(values, mask), masked_var(values, mask)
+343-    whitened = (values - mean) * torch.rsqrt(var + 1e-8)
+344-    if not shift_mean:
+345-        whitened += mean
+346-    return whitened
+347-
+348-
+349-def get_response_mask(response_id: torch.Tensor, eos_token: int | list[int] = 2, dtype=torch.int64):
+350-    """
+351-    end of sentence token can be int or list: 1 or [1, 2]
+352-    e.g.
+353-    response_id = torch.tensor([[20, 10, 34, 1, 0, 0, 0],
+354-                                [78, 0, 76, 2, 1, 0, 0],
+--
+605:def log_probs_from_logits_response(input_ids, logits, response_length):
+606-    """Compute the response log_probs from full logits. Note that logits = model(input_ids)
+607-
+608-    Args:
+609-        input_ids: [batch_size, seqlen]
+610-        logits: [batch_size, seqlen, vocab_size]
+611-
+612-    Returns:
+613-        response_log_prob:
+614-    """
+615-    response_logits = logits[:, -response_length - 1 : -1]
+616-    response = input_ids[:, -response_length:]

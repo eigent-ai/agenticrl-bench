@@ -1,0 +1,113 @@
+118:def _number(req: dict, key: str, default, lo, hi, kind=float):
+119-    v = req.get(key)
+120-    if v is None:
+121-        return kind(default)
+122-    if isinstance(v, bool) or not isinstance(v, (int, float)):
+123-        raise BadRequest(f"{key} must be a number")
+124-    if v < lo or v > hi:
+125-        raise PolicyDenied(f"{key}={v} is outside the allowed range [{lo}, {hi}]")
+126-    return kind(v)
+127-
+128-
+129:def _timeout(req: dict, key: str, default: int, hi: int) -> int:
+130-    v = req.get(key)
+131-    if v is None:
+132-        v = default
+133-    if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
+134-        raise BadRequest(f"{key} must be a positive number")
+135-    return int(min(max(1, int(v)), hi))
+136-
+137-
+138-def _short_argv(argv: list[str], limit: int = 2000) -> str:
+139-    text = json.dumps(argv, ensure_ascii=False)
+140-    return text if len(text) <= limit else text[:limit] + f"...(+{len(text) - limit} chars)"
+141-
+142-
+143-def safe_extract_context(data: bytes, dest: str, max_bytes: int, max_members: int = 10000,
+144-                         max_file_bytes: int | None = None) -> None:
+145-    """Extract a tar(.gz) build context, refusing links, devices and paths that escape ``dest``."""
+146-    total = 0
+147-    with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tf:
+148-        members = tf.getmembers()
+149-        if len(members) > max_members:
+        peer = self._peer(writer)
+        try:
+            while True:
+                try:
+                    line = await reader.readline()
+                except (ValueError, asyncio.LimitOverrunError):
+                    writer.write(encode({"ok": False, "error": "request is too large", "error_type": "bad_request"}))
+                    await writer.drain()
+                    break
+                if not line:
+                    break
+                if not line.strip():
+                    continue
+                reply = await self.process(line, peer, writer)
+                writer.write(encode(reply))
+                await writer.drain()
+        except (ConnectionError, BrokenPipeError):
+            pass
+        finally:
+            try:
+                writer.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def process(self, line: bytes, peer: Peer, writer: asyncio.StreamWriter | None = None) -> dict[str, Any]:
+        t0 = time.monotonic()
+        op = "?"
+        req: dict[str, Any] = {}
+        fields: dict[str, Any] = {}
+        outcome = "allowed"
+        try:
+            try:
+                req = decode(line)
+            except (ValueError, UnicodeDecodeError) as exc:
+                raise BadRequest(f"malformed request: {exc}") from exc
+            if isinstance(req.get("op"), str):
+                op = req["op"][:32]
+            op = validate_request(req)
+            self._authorize(peer, op)
+            handler = getattr(self, f"_op_{op}")
+            result = await handler(req, peer, writer, fields)
+            reply = {"ok": True, **result}
+        except BrokerError as exc:
+            outcome = "denied" if exc.kind in ("denied", "quota", "bad_request") else "failed"
+            reply = {"ok": False, "error": str(exc), "error_type": exc.kind}
+        except Exception as exc:  # noqa: BLE001
+            log.exception("unexpected error in %s", op)
+            outcome = "failed"
+            reply = {"ok": False, "error": f"internal error: {type(exc).__name__}: {exc}", "error_type": "backend"}
+        if outcome == "denied":
+            self.denied_total += 1
+        if "request_id" in req:
+            reply["request_id"] = req["request_id"]
+        if op not in _QUIET_OPS or outcome != "allowed":
+            extra = {"error": reply["error"]} if not reply["ok"] else {}
+            self.audit.write("request", op=op, peer=peer.as_dict(), outcome=outcome,
+                             duration_ms=int((time.monotonic() - t0) * 1000), **fields, **extra)
+        return reply
+
+    def _authorize(self, peer: Peer, op: str) -> None:
+        admins = self.policy.admin_uids
+        allowed = self.policy.allowed_uids
+        if allowed and peer.uid not in allowed and peer.uid not in admins and op != "ping":
+            raise PolicyDenied("this user is not allowed to use the sandbox broker")
+        if op in ADMIN_OPS and peer.uid not in admins:
+            raise PolicyDenied(f"'{op}' is restricted to administrators")
+        if op not in ("ping", "usage", "policy", "list", "poll", "shutdown") and not self.ready:
+            raise BrokerUnavailable(f"sandbox backend is not ready: {self.backend_error or 'starting'}")
+
+    def _owned(self, req: dict, peer: Peer, *, allow_ended: bool = False) -> SandboxRecord:
+        sid = req.get("id")
+        if not isinstance(sid, str):
+            raise BadRequest("missing sandbox 'id'")
+        rec = self.records.get(sid)
+        if rec is None or (rec.owner_uid != peer.uid and peer.uid not in self.policy.admin_uids):
+            raise SandboxNotFound(f"no sandbox {sid!r}")
+        if rec.ended_at is not None and not allow_ended:
+            raise SandboxNotFound(f"sandbox {sid!r} has ended ({rec.end_reason})")
+        return rec
+
+    # ------------------------------------------------------------------ operations

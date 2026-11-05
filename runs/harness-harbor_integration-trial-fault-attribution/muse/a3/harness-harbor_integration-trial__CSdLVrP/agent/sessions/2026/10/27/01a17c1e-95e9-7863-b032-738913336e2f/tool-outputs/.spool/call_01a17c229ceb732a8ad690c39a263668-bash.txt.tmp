@@ -1,0 +1,174 @@
+174:    async def exec(
+242:    async def exec_on_vm(
+251:        return await self._env._sdk_exec(
+319:            await env._sdk_exec(f"mkdir -p {shlex.quote(workdir)}")
+328:    async def exec(
+343:        return await self._env._sdk_exec(
+495:        return await self._env._sdk_exec(
+1307:    async def _sdk_exec(
+1420:            result = await self._sdk_exec(
+1431:            await self._sdk_exec(
+1481:            result = await self._sdk_exec(
+1497:            await self._sdk_exec(
+1510:    async def exec(
+
+    @retry(
+        stop=stop_after_attempt(2),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+    )
+    async def _terminate_sandbox(self) -> None:
+        """Terminate sandbox with retry logic."""
+        if self._sandbox:
+            # Modal reports an explicit terminate as exit 137 too. Mark our
+            # intent before the RPC so a concurrent exec failure cannot be
+            # mistaken for an out-of-memory kill.
+            self._sandbox_termination_requested = True
+            await self._sandbox.terminate.aio()
+
+    def _requested_memory_mb(self) -> int | None:
+        memory = self._memory_config()
+        if isinstance(memory, tuple):
+            # The tuple is (request, limit). LIMIT mode deliberately keeps a
+            # small scheduling request while the configured value is the hard
+            # ceiling whose exhaustion explains exit 137.
+            return memory[1]
+        return memory
+
+    async def _raise_if_unexpected_exit_137(
+        self,
+        *,
+        cause: Exception,
+    ) -> None:
+        """Translate a failed SDK operation when the sandbox also died with 137."""
+        if self._sandbox is None or self._sandbox_termination_requested:
+            return
+        try:
+            return_code = await self._sandbox.poll.aio()
+        except Exception as status_error:
+            # Preserve the operation's original exception when Modal cannot
+            # provide a terminal status. It remains the highest-fidelity signal.
+            self.logger.debug(
+                "Could not read Modal sandbox status after an operation failed: %s",
+                status_error,
+            )
+            return
+        if return_code == 137:
+            raise SandboxLikelyOutOfMemoryError(
+                requested_memory_mb=self._requested_memory_mb(),
+            ) from cause
+
+    async def _sdk_exec(
+        self,
+        command: str,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: int | None = None,
+        shell: str = "bash",
+        login: bool = False,
+    ) -> ExecResult:
+        """Execute a command directly on the Modal sandbox VM.
+
+        This is the low-level exec that talks to the Modal SDK.  Strategies
+        should use this (or the public ``exec``) rather than calling
+        ``sandbox.exec.aio`` directly.
+
+        Args:
+            shell: Shell to use (``"bash"`` for standard images,
+                ``"sh"`` for Alpine-based images like docker:dind).
+            login: If True, use a login shell (``-lc``) so that
+                ``.bashrc``, ``.profile``, etc. are sourced.
+        """
+        # Merge persistent env vars (--ae flags) with per-exec env vars
+        env = self._merge_env(env)
+
+        if not self._sandbox:
+            raise RuntimeError("Sandbox not found. Please start the environment first.")
+
+        try:
+            process = await self._sandbox.exec.aio(
+                shell,
+                "-lc" if login else "-c",
+                command,
+                workdir=cwd,
+                secrets=[_cached_env_secret(env)] if env else [],
+                timeout=timeout_sec,
+            )
+        except Exception as exc:
+            await self._raise_if_unexpected_exit_137(cause=exc)
+            raise
+
+        try:
+            stdout = await process.stdout.read.aio()
+        except Exception as exc:
+            await self._raise_if_unexpected_exit_137(cause=exc)
+            raise
+        try:
+            stderr = await process.stderr.read.aio()
+        except Exception as exc:
+            await self._raise_if_unexpected_exit_137(cause=exc)
+            raise
+        try:
+            return_code = await process.wait.aio()
+        except Exception as exc:
+            await self._raise_if_unexpected_exit_137(cause=exc)
+            raise
+
+        return ExecResult(
+            stdout=stdout,
+            stderr=stderr,
+            return_code=return_code,
+        )
+
+    @retry(
+        stop=stop_after_attempt(2),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=True,
+    )
+    async def _sdk_upload_file(self, source_path: Path | str, target_path: str) -> None:
+        """
+        Adds a local file to the environment.
+
+        Args:
+            source_path: The path to the source local file.
+            target_path: The path to which to copy the file.
+        """
+        if not self._sandbox:
+            raise RuntimeError("Sandbox not found. Please start the environment first.")
+
+        # Creates parent directories on the remote side if needed.
+        await self._sandbox.filesystem.copy_from_local.aio(source_path, target_path)
+
+    async def _sdk_upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
+        """
+        Adds a local directory to the environment.
+
+        Packs the directory into a single tarball locally, uploads it with
+        one SDK call, and extracts it on the sandbox. This preserves
+        permissions, symlinks, and empty directories (matching
+        ``docker compose cp`` semantics on the local Docker environment)
+        and avoids per-file SDK transfers, which have been observed to
+        silently skip files on large multi-file uploads. Requires tar and
+        gzip on the sandbox image.
+
+        Args:
+            source_dir: The path to the source local directory.
+            target_dir: The path to which to copy the directory.
+        """
+        if not self._sandbox:
+            raise RuntimeError("Sandbox not found. Please start the environment first.")
+
+        source_path = Path(source_dir)
+        if not source_path.is_dir():
+            raise FileNotFoundError(f"Source directory {source_dir} does not exist")
+
+        shell = self._default_shell
+        remote_archive = f"/tmp/harbor_upload_{uuid4().hex}.tar.gz"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            archive_path = Path(tmp_dir) / "upload.tar.gz"
+            pack_dir_to_file(source_path, archive_path)
+            await self._sdk_upload_file(archive_path, remote_archive)
+
+        try:
+            result = await self._sdk_exec(

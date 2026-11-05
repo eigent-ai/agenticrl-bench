@@ -1,0 +1,41 @@
+276:    def update_from_meta_info(self, args, meta_info: dict):
+277-        """
+278-        Update the sample with new information from meta_info returned by the rollout engine.
+279-        And extract
+280-        """
+281-        if args.sglang_speculative_algorithm:
+282-            # cannot directly use spec info from sglang because of partial rollout.
+283-            self.spec_info.add(meta_info=meta_info)
+284-
+285-        # Collect prefix cache statistics
+286-        self.prefix_cache_info.add(meta_info=meta_info)
+287-
+288-        if "weight_version" in meta_info:
+289-            self.weight_versions.append(meta_info["weight_version"])
+290-
+291-        match meta_info["finish_reason"]["type"]:
+292-            case "length":
+293-                self.status = Sample.Status.TRUNCATED
+294-            case "abort":
+295-                self.status = Sample.Status.ABORTED
+296-            case "stop":
+297-                self.status = Sample.Status.COMPLETED
+298-
+299-
+300-@dataclass(frozen=True)
+301-class ParamInfo:
+302-    name: str
+303-    dtype: torch.dtype
+304-    shape: torch.Size
+305-    attrs: dict
+306-    size: int
+307-    src_rank: int
+308-
+309-
+310-# A dict-based batch produced along the rollout -> training path
+311-# In Megatron backend, several fields are converted to torch.Tensor lists on GPU
+312-# before being consumed by data iterators (see megatron_utils.actor._get_rollout_data).
+313-RolloutBatch = dict[str, list[torch.Tensor] | list[int] | list[float] | list[str]]
+314-
+315-
+316-@dataclass

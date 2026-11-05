@@ -1,0 +1,44 @@
+65:from verl.utils.torch_functional import logprobs_from_logits
+92:def _is_scalar_unit_temperature(temperature) -> bool:
+93:    """Return whether a host scalar temperature makes scaling a no-op."""
+95:    return not isinstance(temperature, torch.Tensor) and float(temperature) == 1.0
+98:def _scale_logits_by_temperature(logits, temperature, *, is_unit_temperature: bool):
+99:    """Scale logits without copying the full vocabulary tensor for temperature 1."""
+101:    if is_unit_temperature:
+103:    return logits / temperature.clamp(min=1e-8).to(logits.dtype)
+178:        if self.engine_config.entropy_from_logits_with_chunking:
+179:            entropy_from_logits = verl_F.entropy_from_logits_with_chunking
+181:            entropy_from_logits = verl_F.entropy_from_logits
+183:        self.compute_entropy_from_logits = (
+184:            torch.compile(entropy_from_logits, dynamic=True)
+186:            else entropy_from_logits
+1159:        temperature = micro_batch["temperature"]
+1160:        temperature_item = temperature
+1161:        temperature_is_one = _is_scalar_unit_temperature(temperature)
+1163:            assert not isinstance(temperature, torch.Tensor), (
+1164:                "use_fused_kernels does not support per sample temperature yet"
+1173:        if not isinstance(temperature, torch.Tensor):
+1174:            temperature = torch.tensor([temperature] * input_ids.shape[0], device=input_ids.device)
+1176:        temperature = temperature.to(torch.float32)
+1177:        assert temperature.shape[0] == input_ids.shape[0]
+1180:        output_args = {"temperature_is_one": temperature_is_one}
+1183:            # support per sample temperature
+1184:            # temperature (bsz,)
+1186:            temperature_rmpad = verl_F.expand_as_nested(temperature, input_ids).values()  # (total_nnz,)
+1187:            temperature_rmpad = temperature_rmpad.unsqueeze(0)  # (1, total_nnz)
+1213:                temperature_rmpad, _ = pad_packed_inputs(temperature_rmpad, None, static_pad_size, pad_value=1)
+1240:                temperature_rmpad, _, _ = ulysses_pad_and_slice_inputs(
+1241:                    temperature_rmpad, position_ids_rmpad=None, sp_size=self.ulysses_sequence_parallel_size, pad_value=1
+1250:            temperature_rmpad = temperature_rmpad.squeeze(0)
+1252:            output_args["temperature_rmpad"] = temperature_rmpad
+1285:                # we store the per sample temperature
+1286:                output_args["temperature"] = temperature
+1316:            extra_args["temperature"] = temperature_item
+1354:        temperature_is_one = output_args.get("temperature_is_one", False)
+1360:            temperature_rmpad = output_args["temperature_rmpad"]
+1363:                # temperature is singleton
+1386:                logits_rmpad = _scale_logits_by_temperature(
+/opt/verl/verl/workers/engine/fsdp/transformer_impl.py:1332:    def prepare_model_outputs(self, output, output_args, micro_batch: TensorDict, logits_processor_func):
+/opt/verl/verl/workers/engine/fsdp/transformer_impl.py:1428:                    log_probs = logprobs_from_logits(
+/opt/verl/verl/workers/engine/fsdp/transformer_impl.py:1522:                        log_probs = logprobs_from_logits(logits=logits_rmpad, labels=input_ids_rmpad_rolled)
+/opt/verl/verl/workers/engine/fsdp/transformer_impl.py:1600:    def prepare_model_outputs(self, output, output_args, micro_batch: TensorDict, logits_processor_func):

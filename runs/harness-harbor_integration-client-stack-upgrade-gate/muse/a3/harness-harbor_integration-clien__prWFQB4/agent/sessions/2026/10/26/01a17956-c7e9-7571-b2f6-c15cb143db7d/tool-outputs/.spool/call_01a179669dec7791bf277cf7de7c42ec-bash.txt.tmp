@@ -1,0 +1,59 @@
+15:def create_log_targets(
+16-    *, targets: Optional[List[str]], name_prefix: str
+17-) -> List[logging.Logger]:
+18-    if not targets:
+19-        return [_create_log_target_stdout(name_prefix)]
+20-    return [_create_log_target(t, name_prefix) for t in targets]
+21-
+22-
+23-def _create_log_target(target: str, name_prefix: str) -> logging.Logger:
+24-    if target.lower() == "stdout":
+25-        return _create_log_target_stdout(name_prefix)
+26-    return _create_log_target_file(target, name_prefix)
+27-
+28-
+29-def _create_log_target_stdout(name_prefix: str) -> logging.Logger:
+30-    return _create_logger_with_handler(
+31-        f"{name_prefix}.stdout", logging.StreamHandler(sys.stdout)
+32-    )
+33-
+34-
+35-def _create_log_target_file(directory: str, name_prefix: str) -> logging.Logger:
+36-    os.makedirs(directory, exist_ok=True)
+37-    hostname = socket.gethostname()
+38-    rank = dist.get_rank() if dist.is_initialized() else 0
+39-    filename = os.path.join(directory, f"{hostname}_{rank}.log")
+40-    handler = TimedRotatingFileHandler(
+41-        filename, when="H", backupCount=0, encoding="utf-8"
+42-    )
+43-    return _create_logger_with_handler(
+44-        f"{name_prefix}.file.{directory}.{hostname}_{rank}", handler
+45-    )
+46-
+47-
+48-def _create_logger_with_handler(name: str, handler: logging.Handler) -> logging.Logger:
+49-    logger = logging.getLogger(name)
+50-    logger.setLevel(logging.INFO)
+51-    logger.propagate = False
+52-    if not logger.handlers:
+53-        handler.setFormatter(
+54-            logging.Formatter("[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+55-        )
+--
+60:def log_json(
+61-    loggers: Union[logging.Logger, List[logging.Logger]], event: str, data: dict
+62-) -> None:
+63-    log_data = {
+64-        "timestamp": datetime.now().isoformat(),
+65-        "event": event,
+66-        **data,
+67-    }
+68-    msg = json.dumps(log_data, ensure_ascii=False)
+69-
+70-    if not isinstance(loggers, list):
+71-        loggers = [loggers]
+72-
+73-    for logger in loggers:
+74-        logger.info(msg)
+/opt/venvs/engine/lib/python3.12/site-packages/sglang/srt/managers/tokenizer_manager.py:937:            self.request_logger.log_received_request(obj, self.tokenizer, request)
+/opt/venvs/engine/lib/python3.12/site-packages/sglang/srt/entrypoints/openai/serving_base.py:90:                request_logger.log_openai_received_request(request, request=raw_request)

@@ -1,0 +1,102 @@
+Read text file `/opt/miles/miles/rollout/session/server.py`.
+1|"""Standalone session-server process: HTTP chassis + upstream proxy transport.
+2|
+3|- ``SessionServer`` is a FastAPI app plus one shared httpx client; ``do_proxy`` forwards a request to the inference router (sglang or miles) — which does the load balancing to worker engines — and returns the raw result, or a 502 JSON error on transport failure.
+4|- Session/TITO logic lives in ``core.SessionCore``; ``setup_session_routes`` (``sessions.py``) wires the HTTP routes to it.
+5|- Standalone (own process, own event loop) so sessions also work with the SGLang Rust Router or any other backend, decoupled from the Miles Router.
+6|- ``run_session_server`` is the subprocess entry point: fresh interpreter, so it configures logging and the process title itself, then serves uvicorn.
+7|"""
+8|
+9|import json
+10|import logging
+11|
+12|import httpx
+13|import setproctitle
+14|import uvicorn
+15|from fastapi import FastAPI
+16|
+17|from miles.rollout.session.config import SessionServerConfig
+18|from miles.rollout.session.core import ProxyRequest
+19|from miles.rollout.session.sessions import setup_session_routes
+20|from miles.utils.logging_utils import configure_logger_raw
+21|from miles.utils.workers.argv_utils import parse_config_argv
+22|
+23|logger = logging.getLogger(__name__)
+24|
+25|# Request headers that must not be forwarded verbatim to the upstream backend.
+26|_DROP_REQUEST_HEADERS = ("content-length", "transfer-encoding", "host")
+27|
+28|
+29|class SessionServer:
+30|    """Lightweight FastAPI server that manages sessions and proxies inference
+31|    requests through the inference router (sglang or miles)."""
+32|
+33|    def __init__(self, config: SessionServerConfig):
+34|        self.backend_url = config.backend_url
+35|        self.app = FastAPI()
+36|
+37|        self.client = httpx.AsyncClient(
+38|            limits=httpx.Limits(max_connections=1024),
+39|            timeout=httpx.Timeout(config.timeout),
+40|        )
+41|
+42|        # Close the httpx connection pool when uvicorn shuts down to avoid FD leaks.
+43|        self.app.router.on_shutdown.append(self.client.aclose)
+44|
+45|        # `retract` may recompute earlier rows and must return full R3; all other
+46|        # pause modes preserve prior rows and can request only the appended R3.
+47|        self.use_addition_r3 = config.pause_generation_mode != "retract"
+48|        setup_session_routes(self.app, self, config, use_addition_r3=self.use_addition_r3)
+49|
+50|    async def do_proxy(self, request: ProxyRequest, path: str, *, body: bytes, headers: dict) -> dict:
+51|        url = f"{self.backend_url}/{path}"
+52|        if request.query:
+53|            url = f"{url}?{request.query}"
+54|
+55|        headers = {k: v for k, v in headers.items() if k.lower() not in _DROP_REQUEST_HEADERS}
+56|
+57|        try:
+58|            response = await self.client.request(request.method, url, content=body, headers=headers)
+59|        except httpx.TransportError as exc:
+60|            logger.warning("Proxy transport error for %s %s: %s", request.method, path, exc)
+61|            error_body = json.dumps({"error": f"backend transport error: {type(exc).__name__}: {exc}"}).encode()
+62|            return {
+63|                "request_body": body,
+64|                "response_body": error_body,
+65|                "status_code": 502,
+66|                "headers": {"content-type": "application/json"},
+67|            }
+68|        content = await response.aread()
+69|        return {
+70|            "request_body": body,
+71|            "response_body": content,
+72|            "status_code": response.status_code,
+73|            "headers": dict(response.headers),
+74|        }
+75|
+76|
+77|def run_session_server(config: SessionServerConfig):
+78|    """Entry point to start the standalone session server as a subprocess."""
+79|    # Spawned as a fresh interpreter, so it inherits no logging config.
+80|    configure_logger_raw("session_server")
+81|    logging.getLogger("httpx").setLevel(logging.WARNING)
+82|    logging.getLogger("httpcore").setLevel(logging.WARNING)
+83|    # Visible to `pkill -9 miles`; without this the daemon inherits "python".
+84|    setproctitle.setproctitle("miles-session-server")
+85|
+86|    server = SessionServer(config)
+87|    logger.info(
+88|        "[session-server] Starting on %s:%s, proxying to %s",
+89|        config.host,
+90|        config.port,
+91|        config.backend_url,
+92|    )
+93|    uvicorn.run(server.app, host=config.host, port=config.port, log_level="info", access_log=False)
+94|
+95|
+96|def main(argv: list[str] | None = None) -> None:
+97|    run_session_server(parse_config_argv(SessionServerConfig, argv))
+98|
+99|
+100|if __name__ == "__main__":
+101|    main()

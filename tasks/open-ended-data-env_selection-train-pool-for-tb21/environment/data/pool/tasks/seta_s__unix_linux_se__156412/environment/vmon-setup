@@ -1,0 +1,88 @@
+#!/bin/bash
+set -e
+
+source /usr/local/bin/vmon-helpers.sh
+
+CONFIG_FILE="/etc/vmon/monitors.conf"
+OUTPUT_SCRIPT="/var/run/vmon/start.sh"
+XORG_CONF="/etc/X11/xorg.conf.d/40-virtual-monitors.conf"
+PRIMARY_OUTPUT=""
+
+# Read monitors from config
+declare -a MONITORS=()
+while IFS= read -r line; do
+    [[ -z "$line" || "$line" =~ ^# ]] && continue
+    MONITORS+=("$line")
+done < "$CONFIG_FILE"
+
+# Find primary monitor
+for monitor in "${MONITORS[@]}"; do
+    IFS=',' read -r name res pos output vnc <<< "$monitor"
+    if [ "$name" = "primary" ]; then
+        PRIMARY_OUTPUT="$output"
+        parse_resolution "$res"
+        PRIMARY_WIDTH=$WIDTH
+        PRIMARY_HEIGHT=$HEIGHT
+        break
+    fi
+done
+
+# Start generating the output script
+cat > "$OUTPUT_SCRIPT" << 'HEADER'
+#!/bin/bash
+# Auto-generated virtual monitor setup script
+set -e
+HEADER
+
+# Generate xrandr commands for non-primary monitors
+for monitor in "${MONITORS[@]}"; do
+    IFS=',' read -r name res pos output_name vnc <<< "$monitor"
+    [ "$name" = "primary" ] && continue
+
+    parse_resolution "$res"
+    parse_cvt_modeline "$WIDTH" "$HEIGHT"
+
+    echo "xrandr --new-mode $MODELINE_PARAMS" >> "$OUTPUT_SCRIPT"
+    echo "xrandr --addmode $PRIMARY_OUTPUT $MODELINE_NAME" >> "$OUTPUT_SCRIPT"
+    echo "xrandr --output $output_name --mode $MODELINE_NAME --pos $pos" >> "$OUTPUT_SCRIPT"
+done
+
+# Generate x11vnc commands for VNC-exported monitors
+for monitor in "${MONITORS[@]}"; do
+    IFS=',' read -r name res pos output_name vnc <<< "$monitor"
+    [ "$vnc" != "yes" ] && continue
+
+    parse_resolution "$res"
+    parse_position "$pos"
+    clip_region=$(format_clip_region "$WIDTH" "$HEIGHT" "$POS_X" "$POS_Y")
+
+    echo "x11vnc -display 0 -clip $clip_region -forever -shared &" >> "$OUTPUT_SCRIPT"
+done
+
+chmod +x "$OUTPUT_SCRIPT"
+
+# Generate xorg.conf.d configuration
+echo "# Auto-generated virtual monitor configuration" > "$XORG_CONF"
+
+for monitor in "${MONITORS[@]}"; do
+    IFS=',' read -r name res pos output_name vnc <<< "$monitor"
+    [ "$name" = "primary" ] && continue
+
+    parse_resolution "$res"
+    parse_cvt_modeline "$WIDTH" "$HEIGHT"
+
+    cat >> "$XORG_CONF" << EOF
+Section "Monitor"
+    Identifier "$output_name"
+    Modeline $MODELINE_PARAMS
+    Option "PreferredMode" $MODELINE_NAME
+EndSection "Monitor"
+EOF
+done
+
+# Calculate and log total geometry
+calculate_total_geometry "${MONITORS[@]}"
+echo "# Total virtual desktop: ${TOTAL_WIDTH}x${TOTAL_HEIGHT}" >> "$OUTPUT_SCRIPT"
+
+echo "Virtual monitor setup generated: $OUTPUT_SCRIPT"
+echo "Xorg configuration written: $XORG_CONF"

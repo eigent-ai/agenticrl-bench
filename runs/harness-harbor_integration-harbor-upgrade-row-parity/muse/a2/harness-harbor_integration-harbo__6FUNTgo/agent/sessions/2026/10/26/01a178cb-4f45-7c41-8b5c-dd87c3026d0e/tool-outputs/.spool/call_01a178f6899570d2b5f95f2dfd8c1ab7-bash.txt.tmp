@@ -1,0 +1,91 @@
+                    target_path=self._local_asciinema_recording_path,
+                )
+
+            # Merge markers into the recording
+            if self._markers and self._local_asciinema_recording_path:
+                self._logger.debug(
+                    f"Merging {len(self._markers)} markers into recording"
+                )
+                handler = AsciinemaHandler(
+                    self._markers, self._local_asciinema_recording_path
+                )
+                handler.merge_markers()
+                self._logger.debug(
+                    f"Successfully merged markers into {self._local_asciinema_recording_path}"
+                )
+            else:
+                self._logger.debug("No markers to merge")
+        ...
+
+    def _is_enter_key(self, key: str) -> bool:
+        return key in self._ENTER_KEYS
+
+    def _ends_with_newline(self, key: str) -> bool:
+        result = re.search(self._ENDS_WITH_NEWLINE_PATTERN, key)
+        return result is not None
+
+    async def is_session_alive(self) -> bool:
+        """Check if the tmux session is still alive."""
+        result = await self.environment.exec(
+            command="tmux has-session -t {}".format(self._session_name),
+            user=self._user,
+        )
+        return result.return_code == 0
+
+    def _is_executing_command(self, key: str) -> bool:
+        return self._is_enter_key(key) or self._ends_with_newline(key)
+
+    def _prevent_execution(self, keys: list[str]) -> list[str]:
+        keys = keys.copy()
+        while keys and self._is_executing_command(keys[-1]):
+            if self._is_enter_key(keys[-1]):
+                keys.pop()
+            else:
+                stripped_key = keys[-1].rstrip(self._NEWLINE_CHARS)
+
+                if stripped_key:
+                    keys[-1] = stripped_key
+                else:
+                    keys.pop()
+
+        return keys
+
+    def _prepare_keys(
+        self,
+        keys: str | list[str],
+        block: bool,
+    ) -> tuple[list[str], bool]:
+        """
+        Prepare keys for sending to the terminal.
+
+        Args:
+            keys (str | list[str]): The keys to send to the terminal.
+            block (bool): Whether to wait for the command to complete.
+
+        Returns:
+            tuple[list[str], bool]: The keys to send to the terminal and whether the
+                the keys are blocking.
+        """
+        if isinstance(keys, str):
+            keys = [keys]
+
+        if not block or not keys or not self._is_executing_command(keys[-1]):
+            return keys, False
+
+        keys = self._prevent_execution(keys)
+        keys.extend([self._TMUX_COMPLETION_COMMAND, "Enter"])
+
+        return keys, True
+
+    def _send_keys_error(
+        self, action: str, command: str, result: ExecResult
+    ) -> RuntimeError:
+        return RuntimeError(
+            f"{self.environment.session_id}: failed to send {action} keys: "
+            f"command={command!r:.100}, return_code={result.return_code}, "
+            f"stderr={result.stderr!r}, stdout={result.stdout!r}"
+        )
+
+    def _is_command_too_long_error(self, result: ExecResult) -> bool:
+        return result.return_code != 0 and self._TMUX_COMMAND_TOO_LONG_MARKER in (
+            result.stderr or ""

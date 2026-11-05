@@ -1,0 +1,93 @@
+Read text file `/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/trial/trial.py`.
+(666 line(s) above)
+667|    async def _download_agent_logs(self) -> None:
+668|        if self._are_agent_logs_downloaded:
+669|            return
+670|
+671|        if self.agent_environment.capabilities.mounted:
+672|            await self.agent_environment.prepare_logs_for_host()
+673|            self._are_agent_logs_downloaded = True
+674|            return
+675|
+676|        await self._download_role_logs(
+677|            agent_config=self.config.agent,
+678|            source_dir=self.agent_env_paths.agent_dir,
+679|            target_dir=self.paths.agent_dir,
+680|        )
+681|        if self.user_agent is not None and self.config.user_agent is not None:
+682|            await self._download_role_logs(
+683|                agent_config=self.config.user_agent,
+684|                source_dir=self.agent_env_paths.user_agent_dir,
+685|                target_dir=self.paths.user_agent_dir,
+686|            )
+687|
+688|        self._are_agent_logs_downloaded = True
+689|
+690|    async def _download_role_logs(
+691|        self,
+692|        *,
+693|        agent_config: AgentConfig,
+694|        source_dir: PurePosixPath,
+695|        target_dir: Path,
+696|    ) -> None:
+697|        try:
+698|            if agent_config.include_logs or agent_config.exclude_logs:
+699|                await self.agent_environment.download_dir_filtered(
+700|                    source_dir=source_dir.as_posix(),
+701|                    target_dir=target_dir,
+702|                    include=agent_config.include_logs or None,
+703|                    exclude=agent_config.exclude_logs or None,
+704|                )
+705|            else:
+706|                await self.agent_environment.download_dir(
+707|                    source_dir=source_dir.as_posix(),
+708|                    target_dir=target_dir,
+709|                )
+710|        except Exception as e:
+711|            self.logger.error(
+712|                f"Failed to download logs to {target_dir}: {e}",
+713|                exc_info=True,
+714|            )
+715|
+716|    async def _upload_agent_logs(self) -> None:
+717|        """Upload locally-generated agent logs back to non-mounted environments."""
+718|        if self.agent_environment.capabilities.mounted:
+719|            return
+720|
+721|        await self._upload_role_logs(
+722|            source_dir=self.paths.agent_dir,
+723|            target_dir=self.agent_env_paths.agent_dir,
+724|        )
+725|        if self.user_agent is not None:
+726|            await self._upload_role_logs(
+727|                source_dir=self.paths.user_agent_dir,
+728|                target_dir=self.agent_env_paths.user_agent_dir,
+729|            )
+730|
+731|    async def _upload_role_logs(
+732|        self, *, source_dir: Path, target_dir: PurePosixPath
+733|    ) -> None:
+734|        try:
+735|            await self.agent_environment.upload_dir(
+736|                source_dir=source_dir,
+737|                target_dir=target_dir.as_posix(),
+738|            )
+739|        except Exception as e:
+740|            self.logger.error(
+741|                f"Failed to upload {source_dir.name} logs back to environment: {e}",
+742|                exc_info=True,
+743|            )
+744|
+745|    async def _run_step_verifier(
+746|        self,
+747|        step: StepConfig,
+748|        step_result: StepResult,
+749|        *,
+750|        artifacts_dir: Path,
+751|        mode: VerifierEnvironmentMode,
+752|    ) -> None:
+753|        if self.config.verifier.disable:
+754|            return
+755|
+756|        step_result.verifier = TimingInfo(started_at=self._now())
+(more lines below)

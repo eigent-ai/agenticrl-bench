@@ -1,0 +1,45 @@
+130:class ExecuteTrainConfig:
+131-    cuda_core_dump: bool = False
+132-    num_nodes: int = field(default_factory=lambda: int(os.environ.get("SLURM_JOB_NUM_NODES", "1")))
+133-    extra_env_vars: str = ""
+134-    output_dir: str = "/root/shared_data"
+135-
+136-
+137-def resolve_extra_env_vars(extra_env_vars: dict[str, str], config: ExecuteTrainConfig) -> dict[str, str]:
+138-    return {
+139-        **extra_env_vars,
+140-        **_parse_extra_env_vars(config.extra_env_vars),
+141-    }
+142-
+143-
+144-def execute_train(
+145-    train_args: str,
+146-    num_gpus_per_node: int,
+147-    megatron_model_type: str | None,
+148-    train_script: str = "train.py",
+149-    before_ray_job_submit=None,
+150-    extra_env_vars=None,
+151-    config: ExecuteTrainConfig | None = None,
+152-    megatron_path: str = "/root/Megatron-LM",
+153-):
+154-    if extra_env_vars is None:
+155-        extra_env_vars = {}
+156-    if config is None:
+157-        config = ExecuteTrainConfig()
+158-    if not os.path.isabs(train_script):
+159-        train_script = f"{repo_base_dir}/{train_script}"
+160-    external_ray = get_bool_env_var("MILES_SCRIPT_EXTERNAL_RAY")
+161-    master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
+162-
+163-    train_backend_fsdp = "--train-backend fsdp" in train_args
+164-    assert train_backend_fsdp == (megatron_model_type is None)
+165-
+166-    exec_command_cpu(
+167-        "pkill -9 sglang; "
+168-        "sleep 3; "
+169-        f"{'' if external_ray else 'ray stop --force; '}"
+170-        f"{'' if external_ray else 'pkill -9 ray; '}"
+step 8: {'train/loss': 0.0003161393105983734, 'train/pg_loss': 0.0003161393105983734, 'train/train_rollout_kl': 0.004105440340936184, 'train/train_rollout_logprob_abs_diff': 0.019833272323012352, 'train/tis': 0.9993702173233032, 'train/tis_clipfrac': 0.001030237996019423, 'train/ppo_kl': 0.0, 'train/pg_clipfrac': 0.0, 'train/entropy_loss': 0.0} {'train/grad_norm': 2.853717313788989}
+step 9: {'train/loss': 0.0002630874514579773, 'train/pg_loss': 0.0002630874514579773, 'train/train_rollout_kl': 0.006685088854283094, 'train/train_rollout_logprob_abs_diff': 0.027158191427588463, 'train/tis': 1.0031492710113525, 'train/tis_clipfrac': 0.002258402295410633, 'train/ppo_kl': 0.0, 'train/pg_clipfrac': 0.0, 'train/entropy_loss': 0.0} {'train/grad_norm': 3.0162914112977632}
+EVAL 9: regular_pass@1=0.4921875 hard_pass@1=0.171875 regular_cache_hit=0.7529751199614286 hard_cache_hit=0.7835032581554543
+step 10: {'train/loss': -0.00012092664837837219, 'train/pg_loss': -0.00012092664837837219, 'train/train_rollout_kl': 0.0037729772739112377, 'train/train_rollout_logprob_abs_diff': 0.018530817702412605, 'train/tis': 0.9998190402984619, 'train/tis_clipfrac': 0.0006261452799662948, 'train/ppo_kl': 0.0, 'train/pg_clipfrac': 0.0, 'train/entropy_loss': 0.0} {'train/grad_norm': 2.4074725723684876}

@@ -1,0 +1,48 @@
+diff -ruN '--exclude=__pycache__' base/verl/trainer/ppo/core_algos.py L02/verl/trainer/ppo/core_algos.py
+--- base/verl/trainer/ppo/core_algos.py	2026-10-12 11:39:31.000000000 +0000
++++ L02/verl/trainer/ppo/core_algos.py	2026-10-12 12:10:26.833063885 +0000
+@@ -301,32 +301,19 @@
+         Returns: `(torch.Tensor)`
+             shape is (bs, response_length)
+     """
+-    scores = token_level_rewards.sum(dim=-1)
+-
+-    id2score = defaultdict(list)
+-    id2mean = {}
+-    id2std = {}
+-
+     with torch.no_grad():
+-        bsz = scores.shape[0]
+-        for i in range(bsz):
+-            id2score[index[i]].append(scores[i])
+-        for idx in id2score:
+-            if len(id2score[idx]) == 1:
+-                id2mean[idx] = torch.tensor(0.0)
+-                id2std[idx] = torch.tensor(1.0)
+-            elif len(id2score[idx]) > 1:
+-                scores_tensor = torch.stack(id2score[idx])
+-                id2mean[idx] = torch.mean(scores_tensor)
+-                id2std[idx] = torch.std(scores_tensor)
+-            else:
+-                raise ValueError(f"no score in prompt index: {idx}")
+-        for i in range(bsz):
+-            if norm_adv_by_std_in_grpo:
+-                scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+-            else:
+-                scores[i] = scores[i] - id2mean[index[i]]
+-        scores = scores.unsqueeze(-1) * response_mask
++        scores = token_level_rewards.sum(dim=-1)
++        g = as_torch_index(index, device=scores.device)
++        mean_g, std_g, count_g = group_mean_std(scores, g, eps=0.0, device=scores.device)
++        # singleton groups keep their raw score (mean 0, std 1), as before
++        single = count_g[g] <= 1
++        mean_i = torch.where(single, torch.zeros_like(scores), mean_g[g].to(scores.dtype))
++        std_i = torch.where(single, torch.ones_like(scores), std_g[g].to(scores.dtype))
++        if norm_adv_by_std_in_grpo:
++            scalars = (scores - mean_i) / (std_i + epsilon)
++        else:
++            scalars = scores - mean_i
++        scores = scalars.unsqueeze(-1) * response_mask
+ 
+     return scores, scores
+ 

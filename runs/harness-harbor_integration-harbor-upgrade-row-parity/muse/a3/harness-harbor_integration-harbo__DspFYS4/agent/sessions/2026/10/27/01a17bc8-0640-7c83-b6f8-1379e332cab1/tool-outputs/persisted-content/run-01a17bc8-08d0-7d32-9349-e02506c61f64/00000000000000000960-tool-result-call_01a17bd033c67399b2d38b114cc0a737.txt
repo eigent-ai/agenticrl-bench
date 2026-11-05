@@ -1,0 +1,193 @@
+Read text file `/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/trial/trial.py`.
+(489 line(s) above)
+490|    async def run(self) -> TrialResult:
+491|        self._init_result()
+492|        await self._emit(TrialEvent.START)
+493|
+494|        try:
+495|            await self._prepare()
+496|            if not self.config.install_only:
+497|                # Setup/install ran in _prepare(); skip the agent run + verification.
+498|                await self._run()
+499|        except asyncio.CancelledError as exc:
+500|            self.logger.debug(f"Trial {self.config.trial_name} cancelled")
+501|            self._record_exception(exc)
+502|            await self._emit(TrialEvent.CANCEL)
+503|            await self._close_bridge()
+504|            await self._recover_outputs()
+505|            raise
+506|        except Exception as exc:
+507|            self.logger.debug(f"Trial {self.config.trial_name} failed: {exc}")
+508|            self._record_exception(exc)
+509|            await self._close_bridge()
+510|            await self._recover_outputs()
+511|        finally:
+512|            try:
+513|                await self._finalize()
+514|            finally:
+515|                try:
+516|                    self._scrub_jobs_dir()
+517|                finally:
+518|                    self._close_logger_handler()
+519|
+520|        return self.result
+521|
+522|    @abstractmethod
+523|    async def _run(self) -> None:
+524|        pass
+525|
+526|    @abstractmethod
+527|    async def _recover_outputs(self) -> None:
+528|        pass
+529|
+530|    async def _prepare(self) -> None:
+531|        if self._task_trajectory_error is not None:
+532|            raise self._task_trajectory_error
+533|        self._validate_agent_capabilities()
+534|        await self._setup_agent_environment()
+535|        try:
+536|            await self.agent_environment.run_healthcheck()
+537|            await self._upload_injected_skills()
+538|            with self.agent_environment.with_default_user(self.task.config.agent.user):
+539|                if self.user_agent is not None:
+540|                    await self._setup_user_agent()
+541|                await self._setup_agent()
+542|                if self.user_agent is not None:
+543|                    await self._setup_bridge()
+544|        finally:
+545|            # if fails, can be used for debugging
+546|            self._write_stream_handle()
+547|        self.result.agent_info = self.agent.to_agent_info()
+548|
+549|    async def _finalize(self) -> None:
+550|        try:
+551|            await self._close_bridge()
+552|        finally:
+553|            await self._stop_agent_environment()
+554|        self.result.finished_at = self._now()
+555|        self.paths.result_path.write_text(self.result.model_dump_json(indent=4))
+556|        await self._emit(TrialEvent.END)
+557|
+558|    def _record_exception(self, exc: BaseException) -> None:
+559|        if self.result.exception_info is not None:
+560|            self.logger.debug(
+561|                "Skipping exception record because trial already has exception_info",
+562|                exc_info=(type(exc), exc, exc.__traceback__),
+563|            )
+564|            return
+565|
+566|        self.result.exception_info = ExceptionInfo.from_exception(exc)
+567|        self.paths.exception_message_path.write_text(traceback.format_exc())
+568|
+569|    def _resolve_timeout_sec(
+570|        self,
+571|        *,
+572|        base_sec: float,
+573|        max_sec: float | None = None,
+574|        multiplier: float | None,
+575|    ) -> float:
+576|        resolved_multiplier = (
+577|            multiplier if multiplier is not None else self.config.timeout_multiplier
+578|        )
+579|        return min(base_sec, max_sec or float("inf")) * resolved_multiplier
+580|
+581|    async def _run_agent_phase(
+582|        self,
+583|        *,
+584|        target: TrialResult | StepResult,
+585|        instruction: str,
+586|        timeout_sec: float | None,
+587|        user: str | int | None,
+588|        step_cfg: StepConfig | None = None,
+589|        resume: bool = False,
+590|        load: bool = False,
+591|    ) -> None:
+592|        await self._emit(TrialEvent.AGENT_START)
+593|
+594|        target.agent_result = AgentContext()
+595|        target.agent_execution = TimingInfo(started_at=self._now())
+596|
+597|        running_agent = self.agent
+598|        exec_env = self.agent.extra_env
+599|        if self.user_agent is not None:
+600|            if self.bridge is None or self.config.user_agent is None:
+601|                raise RuntimeError("User-agent trial requires an initialized bridge")
+602|
+603|            running_agent = self.user_agent
+604|            instruction = render_user_prompt(
+605|                instruction,
+606|                self.bridge.prompt(),
+607|                template_path=self.config.user_agent.user_prompt_template_path,
+608|                persona_path=self.config.user_agent.user_persona_path,
+609|            )
+610|
+611|            # ACPX launches and may restart the target from this ambient
+612|            # environment. Apply target values last so the target always sees
+613|            # its own resolved credentials when the two roles share a key.
+614|            exec_env = {
+615|                **self.user_agent.extra_env,
+616|                **self.bridge.env(),
+617|                **self.agent.extra_env,
+618|            }
+619|
+620|        try:
+621|            plan = self._network_plan(step_cfg)
+622|            step_name = step_cfg.name if step_cfg is not None else None
+623|            with self.agent_environment.with_default_user(user):
+624|                async with self._phase_network_policy(
+625|                    self.agent_environment,
+626|                    baseline_policy=plan.agent_env_baseline,
+627|                    phase_policy=plan.agent_phase,
+628|                ):
+629|                    with self.agent_environment.scoped_exec_env(exec_env):
+630|                        with self._log_context(
+631|                            "agent", self.agent_environment, step_name
+632|                        ):
+633|                            if load:
+634|                                run = self.agent.load
+635|                            elif resume:
+636|                                run = running_agent.resume
+637|                            else:
+638|                                run = running_agent.run
+639|                            from harbor.trial.sync_trajectory import sync_trajectory
+640|
+641|                            async with sync_trajectory(
+642|                                self.agent_environment,
+643|                                running_agent,
+644|                                self.paths.step_agent_dir(step_name)
+645|                                if step_name is not None
+646|                                else self.paths.agent_dir,
+647|                                enabled=self.user_agent is None,
+648|                            ):
+649|                                await asyncio.wait_for(
+650|                                    run(
+651|                                        instruction=instruction,
+652|                                        environment=self.agent_environment,
+653|                                        context=target.agent_result,
+654|                                    ),
+655|                                    timeout=timeout_sec,
+656|                                )
+657|        except asyncio.TimeoutError as exc:
+658|            raise AgentTimeoutError(
+659|                f"Agent execution timed out after {timeout_sec} seconds"
+660|            ) from exc
+661|        finally:
+662|            if self.user_agent is not None:
+663|                await self._close_bridge(user=user)
+664|            target.agent_execution.finished_at = self._now()
+665|            await self._emit(TrialEvent.AGENT_END)
+666|
+667|    async def _download_agent_logs(self) -> None:
+668|        if self._are_agent_logs_downloaded:
+669|            return
+670|
+671|        if self.agent_environment.capabilities.mounted:
+672|            await self.agent_environment.prepare_logs_for_host()
+673|            self._are_agent_logs_downloaded = True
+674|            return
+675|
+676|        await self._download_role_logs(
+677|            agent_config=self.config.agent,
+678|            source_dir=self.agent_env_paths.agent_dir,
+679|            target_dir=self.paths.agent_dir,
+(more lines below)

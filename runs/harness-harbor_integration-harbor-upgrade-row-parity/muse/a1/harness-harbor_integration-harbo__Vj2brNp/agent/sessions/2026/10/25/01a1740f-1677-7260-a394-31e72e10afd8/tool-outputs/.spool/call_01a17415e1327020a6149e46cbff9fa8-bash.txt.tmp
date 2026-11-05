@@ -1,0 +1,117 @@
+480:    def _tmux_capture_pane(self, capture_entire: bool = False) -> str:
+481-        if capture_entire:
+482-            extra_args = ["-S", "-"]
+483-        else:
+484-            extra_args = []
+485-
+486-        return " ".join(
+487-            [
+488-                "tmux",
+489-                "capture-pane",
+490-                "-p",
+491-                *extra_args,
+492-                "-t",
+493-                self._session_name,
+494-            ]
+495-        )
+496-
+497-    async def start(self) -> None:
+498-        await self._attempt_tmux_installation()
+499-        start_session_result = await self.environment.exec(
+500-            command=self._tmux_start_session, user=self._user
+501-        )
+502-        if start_session_result.return_code != 0:
+503-            raise RuntimeError(
+504-                f"Failed to start tmux session. Error: {start_session_result.stderr}"
+505-            )
+506-
+507-        history_limit = 10_000_000
+508-        command = f"tmux set-option -g history-limit {history_limit}"
+509-        set_history_result = await self.environment.exec(
+510-            command=command, user=self._user
+511-        )
+512-        if set_history_result.return_code != 0:
+513-            self._logger.debug(
+514-                "Failed to increase tmux history-limit: %s",
+515-                (set_history_result.stderr or "").strip(),
+516-            )
+517-
+518-        if self._remote_asciinema_recording_path:
+519-            self._logger.debug("Starting recording.")
+520-            await self.send_keys(
+521-                keys=[
+522-                    f"asciinema rec --stdin {self._remote_asciinema_recording_path}",
+523-                    "Enter",
+524-                ],
+525-                min_timeout_sec=1.0,
+526-            )
+527-            await self.send_keys(
+528-                keys=[
+529-                    "clear",
+530-                    "Enter",
+531-                ],
+532-            )
+533-
+534-        if self._remote_asciinema_recording_path:
+535-            await self.environment.upload_file(
+536-                source_path=self._GET_ASCIINEMA_TIMESTAMP_SCRIPT_HOST_PATH,
+537-                target_path=str(self.GET_ASCIINEMA_TIMESTAMP_SCRIPT_CONTAINER_PATH),
+538-            )
+539-
+540-    async def stop(self) -> None:
+--
+822:    async def capture_pane(self, capture_entire: bool = False) -> str:
+823-        result = await self.environment.exec(
+824:            self._tmux_capture_pane(capture_entire=capture_entire), user=self._user
+825-        )
+826-        return result.stdout or ""
+827-
+828-    async def _get_visible_screen(self) -> str:
+829:        return await self.capture_pane(capture_entire=False)
+830-
+831-    async def _find_new_content(self, current_buffer: str) -> str | None:
+832-        pb = "" if self._previous_buffer is None else self._previous_buffer.strip()
+833-        if pb in current_buffer:
+834-            idx = current_buffer.index(pb)
+835-            # Find the end of the previous buffer content
+836-            if "\n" in pb:
+837-                idx = pb.rfind("\n")
+838-            return current_buffer[idx:]
+839-        return None
+840-
+841:    async def get_incremental_output(self) -> str:
+842-        """
+843-        Get either new terminal output since last call, or current screen if
+844-        unable to determine.
+845-
+846-        This method tracks the previous buffer state and attempts to find new content
+847-        by comparing against the current full buffer. This provides better handling for
+848-        commands with large output that would overflow the visible screen.
+849-
+850-        Returns:
+851-            str: Formatted output with either "New Terminal Output:" or
+852:                 "Current Terminal Screen:"
+853-        """
+854:        current_buffer = await self.capture_pane(capture_entire=True)
+855-
+856-        # First capture - no previous state
+857-        if self._previous_buffer is None:
+858-            self._previous_buffer = current_buffer
+859-            visible_screen = await self._get_visible_screen()
+860:            return f"Current Terminal Screen:\n{visible_screen}"
+861-
+862-        # Try to find new content
+863-        new_content = await self._find_new_content(current_buffer)
+864-
+865-        # Update state
+866-        self._previous_buffer = current_buffer
+867-
+868-        if new_content is not None:
+869-            if new_content.strip():
+870-                return f"New Terminal Output:\n{new_content}"
+871-            else:
+872-                # No new content, show current screen
+873:                return f"Current Terminal Screen:\n{await self._get_visible_screen()}"
+874-        else:
+875-            # Couldn't reliably determine new content, fall back to current screen
+876:            return f"Current Terminal Screen:\n{await self._get_visible_screen()}"

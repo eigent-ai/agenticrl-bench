@@ -1,0 +1,93 @@
+Read text file `/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/trial/trial.py`.
+(1329 line(s) above)
+1330|    def _main_artifacts_mount_dir(self) -> Path:
+1331|        """Host dir bind-mounted to the main container's convention publish dir."""
+1332|        return self.paths.host_artifact_path(
+1333|            MAIN_SERVICE_NAME, self.agent_env_paths.artifacts_dir.as_posix()
+1334|        )
+1335|
+1336|    def _prepare_artifact_mount_dirs(self) -> None:
+1337|        self._main_artifacts_mount_dir.mkdir(parents=True, exist_ok=True)
+1338|
+1339|    def _chmod_artifact_mount_chain(self) -> None:
+1340|        """Make the artifacts subtree writable for the in-container agent user."""
+1341|        current = self._main_artifacts_mount_dir
+1342|        while True:
+1343|            current.chmod(0o777)
+1344|            if current == self.paths.artifacts_dir:
+1345|                break
+1346|            current = current.parent
+1347|
+1348|    def _init_artifact_handler(self) -> None:
+1349|        self._validate_artifact_configuration()
+1350|        self._artifact_handler = ArtifactHandler(
+1351|            artifacts=[*self.task.config.artifacts, *self.config.artifacts],
+1352|            logger=self.logger,
+1353|        )
+1354|
+1355|    def _validate_artifact_configuration(self) -> None:
+1356|        """Validate merged artifact sets and provider support for sidecar work."""
+1357|        convention_source = self.agent_env_paths.artifacts_dir.as_posix()
+1358|        base_entries = [*self.task.config.artifacts, *self.config.artifacts]
+1359|
+1360|        validate_artifact_entries(base_entries, convention_source=convention_source)
+1361|        for step in self.task.config.steps or []:
+1362|            validate_artifact_entries(
+1363|                [*base_entries, *step.artifacts],
+1364|                convention_source=convention_source,
+1365|            )
+1366|
+1367|        referenced = self._referenced_sidecar_services()
+1368|        if not referenced:
+1369|            return
+1370|
+1371|        if not self.agent_environment.capabilities.docker_compose:
+1372|            raise ValueError(
+1373|                "Task references compose sidecar services "
+1374|                f"{sorted(referenced)!r} (via artifact entries or verifier "
+1375|                "collect hooks), but the "
+1376|                f"'{self.agent_environment.type()}' environment does not "
+1377|                "support Docker Compose. Use a compose-capable provider."
+1378|            )
+1379|
+1380|        has_compose_definition = (
+1381|            self.task.paths.environment_dir / "docker-compose.yaml"
+1382|        ).exists() or bool(self.config.environment.extra_docker_compose)
+1383|        if not has_compose_definition:
+1384|            raise ValueError(
+1385|                "Task references compose sidecar services "
+1386|                f"{sorted(referenced)!r} (via artifact entries or verifier "
+1387|                "collect hooks), but neither the task's environment/ directory "
+1388|                "nor the job config defines a docker-compose file, so those "
+1389|                "services cannot exist."
+1390|            )
+1391|
+1392|    def _referenced_sidecar_services(self) -> set[str]:
+1393|        """All non-main services referenced by artifacts or collect hooks."""
+1394|        entries = [
+1395|            *self.task.config.artifacts,
+1396|            *self.config.artifacts,
+1397|            *(
+1398|                artifact
+1399|                for step in self.task.config.steps or []
+1400|                for artifact in step.artifacts
+1401|            ),
+1402|        ]
+1403|        services = sidecar_services(entries)
+1404|        for hook in self._all_collect_hooks():
+1405|            if hook.service != MAIN_SERVICE_NAME:
+1406|                services.add(hook.service)
+1407|        return services
+1408|
+1409|    def _all_collect_hooks(self) -> list[VerifierCollectConfig]:
+1410|        hooks = list(self.task.config.verifier.collect)
+1411|        for step in self.task.config.steps or []:
+1412|            hooks.extend(step.verifier.collect)
+1413|        return hooks
+1414|
+1415|    def _collect_hooks_for(
+1416|        self, step_cfg: StepConfig | None
+1417|    ) -> list[VerifierCollectConfig]:
+1418|        """Effective collect hooks for one collection pass."""
+1419|        hooks = list(self.task.config.verifier.collect)
+(more lines below)

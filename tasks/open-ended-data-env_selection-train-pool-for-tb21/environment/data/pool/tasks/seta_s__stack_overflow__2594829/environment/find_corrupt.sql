@@ -1,0 +1,2 @@
+-- Find corrupt rows where 3 or more columns (name, email, phone, address) are NULL
+-- These rows are considered too incomplete to be useful

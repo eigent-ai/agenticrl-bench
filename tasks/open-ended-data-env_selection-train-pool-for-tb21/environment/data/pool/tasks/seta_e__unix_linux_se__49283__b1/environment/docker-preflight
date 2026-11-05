@@ -1,0 +1,25 @@
+#!/bin/bash
+# Docker storage driver readiness check
+FSINFO=${DOCKER_FSINFO:-/proc/filesystems}
+
+check_storage_support() {
+    if grep -qw "overlay_fs" "$FSINFO" || grep -qw "aufs_mod" "$FSINFO"; then
+        return 0
+    fi
+    return 1
+}
+
+main() {
+    echo "=== Docker Preflight Check ==="
+
+    if check_storage_support; then
+        echo "OK: Storage driver support detected"
+        echo "PASS: System is Docker-ready"
+        exit 0
+    else
+        echo "FAIL: No supported storage driver (overlay/aufs missing from kernel)"
+        exit 0
+    fi
+}
+
+main "$@"

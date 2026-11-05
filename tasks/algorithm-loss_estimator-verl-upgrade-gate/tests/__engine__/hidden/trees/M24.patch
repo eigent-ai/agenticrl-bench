@@ -1,0 +1,13 @@
+diff -ruN '--exclude=__pycache__' base/verl/workers/engine_workers.py M24/verl/workers/engine_workers.py
+--- base/verl/workers/engine_workers.py	2026-10-12 11:39:31.000000000 +0000
++++ M24/verl/workers/engine_workers.py	2026-10-12 18:17:50.563007800 +0000
+@@ -235,6 +235,9 @@
+                 final_metrics["mfu"] /= 3.0
+         # model outputs
+         model_output = output.pop("model_output", {})
++        if forward_only:
++            # hand the scored outputs back in the compute dtype (halves the transfer queue payload)
++            model_output = {k: v.to(torch.bfloat16) for k, v in model_output.items()}
+         # We only return final_metrics
+         final_output = tu.get_tensordict(tensor_dict=model_output, non_tensor_dict={"metrics": final_metrics})
+         return final_output

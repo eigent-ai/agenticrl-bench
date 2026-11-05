@@ -1,0 +1,48 @@
+# sglang parser resolution (per-family binding + assert-equal on user input)
+# ---------------------------------------------------------------------------
+
+
+def resolve_reasoning_and_tool_call_parser(
+    tito_model: TITOTokenizerType | str,
+    user_reasoning_parser: str | None = None,
+    user_tool_call_parser: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Resolve sglang ``--reasoning-parser`` and ``--tool-call-parser`` for the
+    given TITO family.
+
+    Both parsers are bound on the TITO subclass as class attributes because
+    the model's reasoning / tool-call emission shapes are per-family facts.
+    For each parser independently:
+
+    * If the user didn't pass a value, return the family's bound value
+      (which may itself be ``None`` for ``DEFAULT`` or unbound subclasses
+      — the caller is then responsible for supplying one downstream).
+    * If the user passed a value and the family is bound, assert equality;
+      a mismatch is a configuration bug and raises ``ValueError`` rather
+      than silently overriding.
+    * If the user passed a value and the family is unbound, accept it.
+
+    Returns ``(reasoning_parser, tool_call_parser)``.
+    """
+    if isinstance(tito_model, str):
+        tito_model = TITOTokenizerType(tito_model)
+    cls = TITOTokenizerType.get_tokenizer_class(tito_model)
+
+    def _resolve_one(field: str, bound: str | None, user: str | None) -> str | None:
+        if user is None:
+            return bound
+        if bound is None:
+            return user
+        if user != bound:
+            raise ValueError(
+                f"--{field.replace('_', '-')}={user!r} disagrees with the parser "
+                f"registered for tito_model={tito_model.value!r}: {bound!r}. The "
+                f"parser is bound on the TITO subclass; either pass {bound!r} or "
+                f"omit the flag to auto-resolve."
+            )
+        return user
+
+    return (
+        _resolve_one("reasoning_parser", cls.reasoning_parser, user_reasoning_parser),
+        _resolve_one("tool_call_parser", cls.tool_call_parser, user_tool_call_parser),
+    )

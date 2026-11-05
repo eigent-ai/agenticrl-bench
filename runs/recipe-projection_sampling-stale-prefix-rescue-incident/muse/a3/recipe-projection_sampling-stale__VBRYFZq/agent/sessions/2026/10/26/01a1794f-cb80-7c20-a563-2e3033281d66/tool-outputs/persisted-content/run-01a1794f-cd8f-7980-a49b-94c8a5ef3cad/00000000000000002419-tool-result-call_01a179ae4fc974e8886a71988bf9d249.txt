@@ -1,0 +1,111 @@
+Read text file `/root/miles/examples/sql_agent/rescue/projection.py`.
+1|"""Projection sampler for one SQL question, with the gold query shown in the prompt as a hint.
+2|
+3|Turn-level version of the block sampler in Karan et al. (2026), "Finetuning with Sampling": the hinted policy (same
+4|weights, gold query shown in the prompt) proposes; the student, which never sees the hint, decides what is kept.
+5|Target: trajectories the student itself could have produced that also pass, p_C(x) ∝ pi(x | plain prompt) * 1[x passes]
+6|(tool responses are deterministic given the queries, so only the policy's own tokens enter the score).
+7|
+8|    init:  roll out with the hinted prompt until a trajectory passes (at most `init_attempts` tries)
+9|    move:  cut x at a uniformly random turn j, keep turns < j, regenerate turns >= j with the hinted prompt -> x';
+10|           reject x' if it does not pass; otherwise apply the Metropolis-Hastings rule for the target
+11|           p_C(x) ∝ pi(x | plain prompt) * 1[x passes] against that proposal,
+12|               log alpha = [S(x') - S(x)] - [H_j(x') - H_j(x)] + log T - log T'
+13|           where S is the summed student log-prob over the policy's own tokens, H_j is the summed hinted
+14|           log-prob over the regenerated suffix (turns >= j), and T, T' are the turn counts of x, x'
+15|           (the reverse move must re-choose the same cut j). Accept x' with probability min(1, exp(log alpha)).
+16|"""
+17|
+18|from __future__ import annotations
+19|
+20|import json
+21|import math
+22|import random
+23|from dataclasses import dataclass
+24|
+25|from miles.utils.misc import load_function
+26|from miles.utils.types import Sample
+27|
+28|from .episode import Episode, EpisodeRunner
+29|
+30|
+31|@dataclass
+32|class ChainResult:
+33|    episode: Episode
+34|    init_tries: int
+35|    proposals: int
+36|    accepted: int
+37|    passed: int
+38|
+39|
+40|def _student_sum(ep: Episode) -> float:
+41|    """Summed student log-prob over the policy's own tokens: log pi(x | plain prompt)."""
+42|    assert ep.student is not None
+43|    return sum(lp for lp, m in zip(ep.student, ep.mask(), strict=True) if m)
+44|
+45|
+46|def _hinted_suffix_sum(ep: Episode, j: int) -> float:
+47|    """Summed hinted log-prob over the policy tokens of turns >= j: log q(suffix | prefix)."""
+48|    cut = ep.turns[j][0] if j < len(ep.turns) else len(ep.ids)
+49|    return sum(lp for lp, m in zip(ep.logprobs[cut:], ep.mask()[cut:], strict=True) if m)
+50|
+51|
+52|def mh_log_accept(cur: Episode, cand: Episode, j: int) -> float:
+53|    """Log of the (uncapped) MH acceptance ratio for replacing `cur` by passing `cand` cut at turn `j`."""
+54|    return (
+55|        (_student_sum(cand) - _student_sum(cur))
+56|        - (_hinted_suffix_sum(cand, j) - _hinted_suffix_sum(cur, j))
+57|        + math.log(cur.num_turns)
+58|        - math.log(cand.num_turns)
+59|    )
+60|
+61|
+62|class ProjectionSampler:
+63|    def __init__(self, args, runner: EpisodeRunner):
+64|        self.args = args
+65|        self.runner = runner
+66|        self.steps = args.rescue_mcmc_steps
+67|        self.init_attempts = args.rescue_init_attempts
+68|        self.reward_fn = load_function(args.custom_rm_path)
+69|        self.rng = random.Random(args.rollout_seed)  # one stream for the whole run
+70|
+71|    async def passes(self, template: Sample, ep: Episode) -> bool:
+72|        if not ep.finished:
+73|            return False
+74|        probe = Sample(prompt=template.prompt, label=template.label, response=ep.text, metadata=dict(template.metadata))
+75|        reward = await self.reward_fn(self.args, probe)
+76|        return bool(reward["acc"]) if isinstance(reward, dict) else reward > 0
+77|
+78|    async def score_student(self, prompt_ids: list[int], ep: Episode) -> None:
+79|        """Per-token log-probs of the response under the student's own (plain) prompt."""
+80|        ep.student = await self.runner.token_logprobs(prompt_ids + ep.ids, len(prompt_ids))
+81|
+82|    async def run(self, template: Sample, prompt_ids: list[int], hinted_ids: list[int]) -> ChainResult | None:
+83|        cur = None
+84|        tries = 0
+85|        for tries in range(1, self.init_attempts + 1):
+86|            ep = await self.runner.continue_episode(hinted_ids, Episode())
+87|            if await self.passes(template, ep):
+88|                cur = ep
+89|                break
+90|        if cur is None:
+91|            return None
+92|        await self.score_student(prompt_ids, cur)
+93|
+94|        proposals = accepted = passed = 0
+95|        for _ in range(self.steps):
+96|            j = self.rng.randrange(cur.num_turns)
+97|            cand = await self.runner.continue_episode(hinted_ids, cur.prefix(j))
+98|            proposals += 1
+99|            if not await self.passes(template, cand):
+100|                continue
+101|            passed += 1
+102|            await self.score_student(prompt_ids, cand)
+103|            if self.rng.random() < math.exp(min(0.0, mh_log_accept(cur, cand, j))):
+104|                cur = cand
+105|                accepted += 1
+106|        return ChainResult(cur, tries, proposals, accepted, passed)
+107|
+108|
+109|def gold_query(sample: Sample) -> str:
+110|    return json.loads(sample.label)["query"]

@@ -1,0 +1,111 @@
+/opt/SDPO/tests/utils/_test_module.py
+/opt/SDPO/tests/utils/test_activation_offload.py
+/opt/SDPO/tests/utils/test_config_on_cpu.py
+/opt/SDPO/tests/utils/test_flops_counter.py
+/opt/SDPO/tests/utils/test_fs_on_cpu.py
+/opt/SDPO/tests/utils/test_groupwise.py
+/opt/SDPO/tests/utils/test_import_utils_on_cpu.py
+/opt/SDPO/tests/utils/test_linear_cross_entropy.py
+/opt/SDPO/tests/utils/test_mlflow_key_sanitization.py
+/opt/SDPO/tests/utils/test_model_on_cpu.py
+# Copyright 2024 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+from pathlib import Path
+
+import verl.utils.fs as fs
+
+
+def test_record_and_check_directory_structure(tmp_path):
+    # Create test directory structure
+    test_dir = tmp_path / "test_dir"
+    test_dir.mkdir()
+    (test_dir / "file1.txt").write_text("test")
+    (test_dir / "subdir").mkdir()
+    (test_dir / "subdir" / "file2.txt").write_text("test")
+
+    # Create structure record
+    record_file = fs._record_directory_structure(test_dir)
+
+    # Verify record file exists
+    assert os.path.exists(record_file)
+
+    # Initial check should pass
+    assert fs._check_directory_structure(test_dir, record_file) is True
+
+    # Modify structure and verify check fails
+    (test_dir / "new_file.txt").write_text("test")
+    assert fs._check_directory_structure(test_dir, record_file) is False
+
+
+def test_copy_from_hdfs_with_mocks(tmp_path, monkeypatch):
+    # Mock HDFS dependencies
+    monkeypatch.setattr(fs, "is_non_local", lambda path: True)
+
+    # side_effect will simulate the copy by creating parent dirs + empty file
+    def fake_copy(src: str, dst: str, *args, **kwargs):
+        dst_path = Path(dst)
+        dst_path.parent.mkdir(parents=True, exist_ok=True)
+        dst_path.write_bytes(b"")  # touch an empty file
+
+    monkeypatch.setattr(fs, "copy", fake_copy)  # Mock actual HDFS copy
+
+    # Test parameters
+    test_cache = tmp_path / "cache"
+    hdfs_path = "hdfs://test/path/file.txt"
+
+    # Test initial copy
+    local_path = fs.copy_to_local(hdfs_path, cache_dir=test_cache)
+===
+# Copyright 2024 PRIME team and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import asyncio
+import json
+import os
+
+import pytest
+
+from verl.utils.reward_score import default_compute_score, sandbox_fusion
+from verl.workers.reward_manager.prime import parallel_compute_score_async
+
+prime_math_answers = [
+    """\\begin{bmatrix}\n -7 & 6 & -8 \\\\\n 11 & -9 & 12 \\\\\n 15 & -16 & 19 \n \\end{bmatrix}""",
+    """\\frac{\\sqrt{505}}{7}""",
+    """x^2 + y^2 + 4x - 6y + 13""",
+]
+prime_math_gts = [
+    """\\begin{pmatrix}\n -7 & 6 & -8 \\\\\n 11 & -9 & 12 \\\\\n 15 & -16 & 19\n \\end{pmatrix}""",  # mat test
+    """\\frac{\\sqrt{505}}{7}""",  # frac test
+    """(x + 2)^2 + (y - 3)^2 """,  # symbolic test
+]
+
+prime_code_answers = [
+    """import sys
+from collections import deque
+
+def main():
+    data = sys.stdin.read().split()

@@ -1,0 +1,133 @@
+Read text file `/app/reference/harbor-0.23.0/harbor/trial/trial.py`.
+(999 line(s) above)
+1000|    def _close_logger_handler(self) -> None:
+1001|        if self._log_handler is None:
+1002|            return
+1003|
+1004|        self.logger.removeHandler(self._log_handler)
+1005|        self._log_handler.close()
+1006|        self._log_handler = None
+1007|
+1008|    def _scrub_jobs_dir(self) -> None:
+1009|        env_sources = [
+1010|            self.agent.extra_env,
+1011|            self.task.config.verifier.env,
+1012|            self.config.verifier.env,
+1013|        ]
+1014|        if self.user_agent is not None:
+1015|            env_sources.append(self.user_agent.extra_env)
+1016|            bridge = getattr(self, "bridge", None)
+1017|            if bridge is not None:
+1018|                try:
+1019|                    env_sources.append(bridge.env())
+1020|                except Exception as exc:
+1021|                    self.logger.debug(
+1022|                        "Could not collect bridge env for scrubbing: %s", exc
+1023|                    )
+1024|
+1025|        secrets: set[str] = set()
+1026|        for env in env_sources:
+1027|            for key, value in env.items():
+1028|                if is_sensitive_env_key(key):
+1029|                    try:
+1030|                        value = resolve_env_vars({key: value})[key]
+1031|                        if value:
+1032|                            secrets.add(value)
+1033|                    except ValueError:
+1034|                        continue
+1035|        if not secrets:
+1036|            return
+1037|
+1038|        for path in self.paths.trial_dir.rglob("*"):
+1039|            if not path.is_file() or path.is_symlink():
+1040|                continue
+1041|            try:
+1042|                with path.open("rb") as file:
+1043|                    sample = file.read(8192)
+1044|                if b"\0" in sample:
+1045|                    continue
+1046|                try:
+1047|                    sample.decode("utf-8")
+1048|                except UnicodeDecodeError:
+1049|                    continue
+1050|                text = path.read_text()
+1051|                scrubbed = text
+1052|                for secret in sorted(secrets, key=len, reverse=True):
+1053|                    scrubbed = scrubbed.replace(secret, "[REDACTED]")
+1054|                if scrubbed != text:
+1055|                    path.write_text(scrubbed)
+1056|            except (OSError, UnicodeDecodeError) as exc:
+1057|                # Leave unreadable/unscrubbable files alone; don't delete them.
+1058|                self.logger.debug(
+1059|                    "Skipping unscrubbable trial output %s: %s", path, exc
+1060|                )
+1061|                continue
+1062|
+1063|    def _init_agent(self) -> None:
+1064|        extra_kwargs: dict[str, Any] = {}
+1065|        if self.config.agent.name == AgentName.ORACLE.value:
+1066|            extra_kwargs = {
+1067|                "task_dir": self.task.task_dir,
+1068|                "trial_paths": self.paths,
+1069|                "agent_timeout_sec": self._agent_timeout_sec,
+1070|            }
+1071|        mcp_servers = {
+1072|            server.name: server
+1073|            for server in [
+1074|                *self.task.config.environment.mcp_servers,
+1075|                *self.config.agent.mcp_servers,
+1076|            ]
+1077|        }
+1078|        if mcp_servers:
+1079|            extra_kwargs["mcp_servers"] = list(mcp_servers.values())
+1080|        if self._effective_skills_dir:
+1081|            extra_kwargs["skills_dir"] = self._effective_skills_dir
+1082|        self._resolve_load_trajectory()
+1083|        if self._load_trajectory is not None:
+1084|            extra_kwargs["load_trajectory"] = str(self._load_trajectory)
+1085|
+1086|        self.agent = AgentFactory.create_agent_from_config(
+1087|            self.config.agent,
+1088|            logs_dir=self.paths.agent_dir,
+1089|            logger=self.logger,
+1090|            **extra_kwargs,
+1091|        )
+1092|        self.agent.session_id = f"{self.config.trial_name}__agent"
+1093|        self.agent.context_id = self._id
+1094|        self._validate_load_trajectory_support()
+1095|
+1096|    def _resolve_load_trajectory(self) -> None:
+1097|        """Pick the trajectory to seed the agent's session from, if any.
+1098|
+1099|        A run-level ``agent.load_trajectory`` overrides a task-declared
+1100|        ``trajectory.json``.
+1101|        """
+1102|        if self.config.agent.load_trajectory:
+1103|            self._load_trajectory = Path(self.config.agent.load_trajectory)
+1104|            return
+1105|        # The oracle runs the task's own solution and nop does nothing, so a
+1106|        # task's prior context does not apply to them. Skipping beats refusing:
+1107|        # the oracle is the default agent and task authors validate with it.
+1108|        if self.config.agent.name in (AgentName.ORACLE.value, AgentName.NOP.value):
+1109|            return
+1110|        try:
+1111|            path = self._task_trajectory_path()
+1112|            if path is not None:
+1113|                self._validate_task_trajectory_document(path)
+1114|        except ValueError as exc:
+1115|            # Raising would escape Trial.create() and cancel every sibling trial
+1116|            # in the job, so hold it until _prepare().
+1117|            self._task_trajectory_error = exc
+1118|            return
+1119|        self._load_trajectory = path
+1120|
+1121|    @property
+1122|    def _load_trajectory_from_task(self) -> bool:
+1123|        return (
+1124|            self._load_trajectory is not None and not self.config.agent.load_trajectory
+1125|        )
+1126|
+1127|    def _task_trajectory_path(self) -> Path | None:
+1128|        """Locate the ATIF trajectory the task ships beside its instruction."""
+1129|        paths = self.task.paths
+(more lines below)

@@ -1,0 +1,101 @@
+Read text file `/opt/venvs/rollout-next/lib/python3.12/site-packages/harbor/trial/sync_trajectory.py`.
+1|"""Sync native session logs over SSH and reuse the agent's ATIF converter."""
+2|
+3|import asyncio
+4|import contextlib
+5|import json
+6|import shlex
+7|import tarfile
+8|import tempfile
+9|from collections.abc import AsyncIterator
+10|from io import BytesIO
+11|from pathlib import Path
+12|
+13|from harbor.agents.base import BaseAgent
+14|from harbor.agents.installed.base import BaseInstalledAgent
+15|from harbor.environments.base import BaseEnvironment
+16|from harbor.environments.factory import EnvironmentFactory
+17|from harbor.environments.ssh import SSHAccess
+18|
+19|POLL_INTERVAL_SEC = 2
+20|
+21|
+22|def _write_trajectory(agent: BaseInstalledAgent, directory: Path, data: bytes) -> None:
+23|    # Each download is independent; replaced/deleted logs need no bookkeeping.
+24|    with tempfile.TemporaryDirectory(prefix="harbor-stream-") as temporary:
+25|        logs_dir = Path(temporary)
+26|        with tarfile.open(fileobj=BytesIO(data), mode="r:gz") as archive:
+27|            archive.extractall(logs_dir / "sessions", filter="data")
+28|        trajectory = agent.convert_trajectory(logs_dir)
+29|        if trajectory is not None:
+30|            directory.mkdir(parents=True, exist_ok=True)
+31|            temporary_path = directory / "trajectory.tmp"
+32|            temporary_path.write_text(
+33|                json.dumps(trajectory.to_json_dict(), ensure_ascii=False),
+34|                encoding="utf-8",
+35|            )
+36|            temporary_path.replace(directory / "trajectory.json")
+37|
+38|
+39|async def _download_trajectory(
+40|    access: SSHAccess, agent: BaseInstalledAgent, directory: Path
+41|) -> None:
+42|    # Only transcripts, never config/credentials. tar exit 1 can mean a file
+43|    # changed during the read; invalid downloads leave the previous ATIF intact.
+44|    data = await access.run(
+45|        f"cd {shlex.quote(str(agent.remote_session_logs_dir))} && "
+46|        "{ find . -type f -name '*.jsonl' -print0 | "
+47|        "COPYFILE_DISABLE=1 tar --null -T - -czf -; test $? -le 1; }"
+48|    )
+49|    await asyncio.to_thread(_write_trajectory, agent, directory, data)
+50|
+51|
+52|@contextlib.asynccontextmanager
+53|async def sync_trajectory(
+54|    environment: BaseEnvironment,
+55|    agent: BaseAgent,
+56|    directory: Path,
+57|    *,
+58|    enabled: bool = True,
+59|) -> AsyncIterator[None]:
+60|    if (
+61|        not enabled
+62|        or not environment.stream_enabled
+63|        or not isinstance(agent, BaseInstalledAgent)
+64|        or agent.remote_session_logs_dir is None
+65|    ):
+66|        yield
+67|        return
+68|    stopping = asyncio.Event()
+69|
+70|    async def poll() -> None:
+71|        while not stopping.is_set():
+72|            try:
+73|                async with EnvironmentFactory.connect_ssh(
+74|                    environment.stream_handle
+75|                ) as access:
+76|                    while True:
+77|                        try:
+78|                            await _download_trajectory(access, agent, directory)
+79|                        except (ValueError, tarfile.TarError):
+80|                            environment.logger.debug(
+81|                                "Trajectory not ready", exc_info=False
+82|                            )
+83|                        if stopping.is_set():
+84|                            return
+85|                        with contextlib.suppress(TimeoutError):
+86|                            await asyncio.wait_for(stopping.wait(), POLL_INTERVAL_SEC)
+87|            except Exception:
+88|                environment.logger.debug("Trajectory download failed", exc_info=False)
+89|                with contextlib.suppress(TimeoutError):
+90|                    await asyncio.wait_for(stopping.wait(), POLL_INTERVAL_SEC)
+91|
+92|    # Finish polling before post-run conversion writes the authoritative ATIF.
+93|    # Keeping the agent outside this task preserves its original exception type.
+94|    worker = asyncio.create_task(poll())
+95|    try:
+96|        yield
+97|    finally:
+98|        stopping.set()
+99|        with contextlib.suppress(Exception):
+100|            await worker

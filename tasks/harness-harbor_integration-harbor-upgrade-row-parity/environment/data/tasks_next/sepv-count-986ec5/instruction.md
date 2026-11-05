@@ -1,0 +1,1 @@
+The log at /app/service.log has one event per line, starting with its level. Count the WARN lines and write just that number to /app/answer.txt.

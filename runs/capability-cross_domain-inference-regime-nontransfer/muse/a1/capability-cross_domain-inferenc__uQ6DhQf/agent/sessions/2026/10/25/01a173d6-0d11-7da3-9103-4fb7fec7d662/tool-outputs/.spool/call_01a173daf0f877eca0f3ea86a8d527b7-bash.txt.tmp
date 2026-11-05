@@ -1,0 +1,67 @@
+            logprob_result_processor=SchedulerLogprobResultProcessor(
+                server_args=self.server_args, model_config=self.model_config
+            ),
+            output_streamer=self.output_streamer,
+            abort_request=self.abort_request,
+        )
+
+    def init_req_max_new_tokens(self, req):
+        input_len = len(req.origin_input_ids)
+        # Keep this bound consistent with PrefillAdder's admission budget:
+        # ceil_page(input_len) + max_new_tokens + page_size must be strictly
+        # smaller than max_total_num_tokens. Otherwise a request can be accepted
+        # into the waiting queue but can never be scheduled, blocking the queue
+        # and eventually making health checks fail.
+        paged_input_len = -(-input_len // self.page_size) * self.page_size
+        req.sampling_params.max_new_tokens = max(
+            0,
+            min(
+                (
+                    req.sampling_params.max_new_tokens
+                    if req.sampling_params.max_new_tokens is not None
+                    else 1 << 30
+                ),
+                self.max_req_len - input_len - 1,
+                self.max_total_num_tokens - paged_input_len - self.page_size - 1,
+            ),
+        )
+
+    def _process_and_broadcast_mm_inputs(
+        self,
+        raw_mm_inputs,
+            if self.server_args.allow_auto_truncate:
+                logger.warning(
+                    f"The input ({input_token_num} tokens) is longer than the "
+                    f"model's context length ({self.context_len} tokens). "
+                    "Truncating the input."
+                )
+                del input_ids[_max_req_len:]
+                input_token_num = len(input_ids)
+            else:
+                raise ValueError(
+                    f"The input ({input_token_num} tokens) is longer than the "
+                    f"model's context length ({self.context_len} tokens)."
+                )
+
+        # Validate total tokens (input + max_new_tokens)
+        max_new_tokens = obj.sampling_params.get("max_new_tokens")
+        if (
+            self.validate_total_tokens
+            and max_new_tokens is not None
+            and (max_new_tokens + input_token_num) > _max_req_len
+        ):
+            if self.server_args.allow_auto_truncate:
+                logger.warning(
+                    f"Requested token count ({input_token_num} input + {max_new_tokens} new) "
+                    f"exceeds the model's context length ({self.context_len} tokens). "
+                    "Truncating max_new_tokens."
+                )
+                obj.sampling_params["max_new_tokens"] = max(
+                    0, _max_req_len - input_token_num
+                )
+            else:
+                total_tokens = max_new_tokens + input_token_num
+                error_msg = (
+                    f"Requested token count exceeds the model's maximum context length "
+                    f"of {self.context_len} tokens. You requested a total of {total_tokens} "
+                    f"tokens: {input_token_num} tokens from the input messages and "

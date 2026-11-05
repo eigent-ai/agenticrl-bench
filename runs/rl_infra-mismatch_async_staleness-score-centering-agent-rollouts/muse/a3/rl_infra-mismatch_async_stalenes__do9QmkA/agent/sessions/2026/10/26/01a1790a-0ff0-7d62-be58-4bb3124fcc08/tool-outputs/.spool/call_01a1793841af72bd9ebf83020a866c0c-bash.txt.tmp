@@ -1,0 +1,46 @@
+        if not os.path.exists(args.ref_load):
+            raise FileNotFoundError(f"ref_load {args.ref_load} does not exist, please check the path.")
+
+        if not os.path.exists(os.path.join(args.ref_load, "latest_checkpointed_iteration.txt")):
+            logger.info(
+                f"ref_load {args.ref_load} does not have latest_checkpointed_iteration.txt, "
+                "please make sure it is a valid megatron checkpoint directory."
+            )
+
+    # Validate on-policy distillation (OPD) arguments
+    if args.use_opd:
+        if args.opd_type is None:
+            raise ValueError("--opd-type must be specified when --use-opd is enabled. Choose 'sglang' or 'megatron'.")
+        if args.opd_log_prob_top_k < 0:
+            raise ValueError("--opd-log-prob-top-k must be non-negative.")
+        if args.opd_log_prob_top_k > 0 and args.opd_type != "sglang":
+            raise ValueError("--opd-log-prob-top-k is currently supported only with --opd-type=sglang.")
+        if args.opd_log_prob_top_k > 0 and args.opd_top_k_strategy != "only-teacher" and not use_legacy_rollout_v1():
+            raise ValueError(
+                "--opd-log-prob-top-k with a student-side strategy needs opd_student_top_logprobs, "
+                "which only the v1 rollout produces; set MILES_USE_LEGACY_ROLLOUT_V1=1"
+            )
+        if args.opd_teacher_urls:
+            if args.opd_type != "sglang":
+                raise ValueError("--opd-teacher-urls is only supported with --opd-type=sglang.")
+            # Local import to keep miles.utils free of rollout imports at module load.
+            from miles.rollout.on_policy_distillation import parse_teacher_urls
+
+            parse_teacher_urls(args.opd_teacher_urls)  # fail fast on malformed/duplicate entries
+
+        if args.opd_type == "megatron":
+            if args.opd_teacher_load is None:
+                raise ValueError(
+                    "--opd-teacher-load is required when --opd-type=megatron. "
+                    "Please provide the path to the teacher model checkpoint."
+                )
+            if not os.path.exists(args.opd_teacher_load):
+                raise FileNotFoundError(
+                    f"opd_teacher_load {args.opd_teacher_load} does not exist, please check the path."
+                )
+            if not os.path.exists(os.path.join(args.opd_teacher_load, "latest_checkpointed_iteration.txt")):
+                logger.info(
+                    f"opd_teacher_load {args.opd_teacher_load} does not have latest_checkpointed_iteration.txt, "
+                    "please make sure it is a valid megatron checkpoint directory."
+                )
+

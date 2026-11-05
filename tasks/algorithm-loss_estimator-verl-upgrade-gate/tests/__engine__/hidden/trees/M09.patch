@@ -1,0 +1,17 @@
+diff -ruN '--exclude=__pycache__' base/verl/workers/engine/fsdp/transformer_impl.py M09/verl/workers/engine/fsdp/transformer_impl.py
+--- base/verl/workers/engine/fsdp/transformer_impl.py	2026-10-12 11:39:31.000000000 +0000
++++ M09/verl/workers/engine/fsdp/transformer_impl.py	2026-10-12 12:10:25.393066110 +0000
+@@ -726,11 +726,8 @@
+         tu.assign_non_tensor(data, sp_size=self.ulysses_sequence_parallel_size)
+         return_model_output = tu.get_non_tensor_data(data=data, key="return_model_output", default=False)
+ 
+-        # compute num_tokens in global batch for loss normalization
+-        batch_num_tokens = data["loss_mask"].sum().to(get_device_id())
+-        torch.distributed.all_reduce(
+-            batch_num_tokens, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
+-        )
++        # compute num_tokens in global batch for loss normalization (balanced ranks: local x dp)
++        batch_num_tokens = data["loss_mask"].sum().to(get_device_id()) * self.get_data_parallel_size()
+         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
+         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
+ 

@@ -1,0 +1,162 @@
+                await self.agent_environment.stop_service(MAIN_SERVICE_NAME)
+                self.logger.debug("Main service stopped")
+            except Exception as exc:
+                self.logger.warning(
+                    f"Failed to stop main service before sidecar collection: {exc}"
+                )
+
+        self.logger.debug(
+            f"Collecting sidecar artifacts from services: {sorted(sidecars)}"
+        )
+        await self._run_collect_hooks(sidecar_hooks)
+        await self._artifact_handler.download_artifacts(
+            self.agent_environment,
+            artifacts_dir,
+            source_artifacts_dir=self.agent_env_paths.artifacts_dir,
+            artifacts=step_artifacts,
+            services=sidecars,
+        )
+
+    def _init_timeouts(self) -> None:
+        self._agent_timeout_sec = self._compute_agent_timeout_sec()
+        self._verifier_timeout_sec = self._compute_verifier_timeout_sec()
+        self._agent_setup_timeout_sec = self._compute_agent_setup_timeout_sec()
+        self._environment_build_timeout_sec = (
+            self._compute_environment_build_timeout_sec()
+        )
+
+    def _compute_agent_timeout_sec(self) -> float | None:
+        base_timeout_sec = (
+            self.config.agent.override_timeout_sec or self.task.config.agent.timeout_sec
+        )
+        if base_timeout_sec is None:
+            return None
+
+        return self._resolve_timeout_sec(
+            base_sec=base_timeout_sec,
+            max_sec=self.config.agent.max_timeout_sec,
+            multiplier=self.config.agent_timeout_multiplier,
+        )
+
+    def _compute_verifier_timeout_sec(self) -> float:
+        return self._resolve_timeout_sec(
+            base_sec=(
+                self.config.verifier.override_timeout_sec
+                or self.task.config.verifier.timeout_sec
+            ),
+            max_sec=self.config.verifier.max_timeout_sec,
+            multiplier=self.config.verifier_timeout_multiplier,
+        )
+
+    def _compute_agent_setup_timeout_sec(self) -> float:
+        base_timeout_sec = self.config.agent.override_setup_timeout_sec
+        if base_timeout_sec is None:
+            agent_cls = AgentFactory.get_agent_class_from_config(self.config.agent)
+            base_timeout_sec = agent_cls.DEFAULT_SETUP_TIMEOUT_SEC
+
+        return self._resolve_timeout_sec(
+            base_sec=base_timeout_sec,
+            multiplier=self.config.agent_setup_timeout_multiplier,
+        )
+
+    def _compute_environment_build_timeout_sec(self) -> float:
+        return self._resolve_timeout_sec(
+            base_sec=self.task.config.environment.build_timeout_sec,
+            multiplier=self.config.environment_build_timeout_multiplier,
+        )
+
+    def _resolve_injected_skills(self) -> list[ResolvedSkill]:
+        if not self.config.agent.skills:
+            return []
+        return resolve_skills(self.config.agent.skills)
+
+    @staticmethod
+    def _resolve_agent_skills(config: TrialConfig) -> None:
+        """Resolve any string entries in ``skills`` to local paths.
+
+        Mirrors :meth:`Job._resolve_agent_skills` for the standalone-trial
+        path (``harbor trial run``).
+        """
+        agent = config.agent
+        str_sources = [s for s in agent.skills if isinstance(s, str)]
+197:class EnvironmentConfig(BaseModel):
+198-    type: EnvironmentType | None = None
+199-    import_path: str | None = None
+200-    force_build: bool = False
+201-    delete: bool = True
+202-    stream: bool = False
+203-    cpu_enforcement_policy: ResourceMode = ResourceMode.AUTO
+204-    memory_enforcement_policy: ResourceMode = ResourceMode.AUTO
+205-    override_cpus: int | None = None
+206-    override_memory_mb: int | None = None
+207-    override_storage_mb: int | None = None
+208-    override_gpus: int | None = None
+209-    override_tpu: TpuSpec | None = None
+210-    suppress_override_warnings: bool = Field(
+211-        default=False,
+212-        exclude=True,
+213-        description="Deprecated; has no effect.",
+214-    )
+215-    mounts: list[ServiceVolumeConfig] | None = Field(
+216-        default=None,
+217-        description="Additional mounts for the agent environment only.",
+218-    )
+219-    extra_docker_compose: list[Path] = Field(
+220-        default_factory=list,
+221-        description="Additional Docker Compose overlays for the agent environment only.",
+222-    )
+223-    env: dict[str, str] = Field(default_factory=dict, exclude_if=lambda v: not v)
+224-    kwargs: dict[str, Any] = Field(default_factory=dict)
+225-    extra_allowed_hosts: list[str] = Field(
+226-        default_factory=list,
+227-        description=(
+228-            "Run-specific hostnames or IP addresses merged into the "
+229-            "[environment] network baseline at agent env start."
+230-        ),
+231-    )
+232-
+233-    @field_validator("extra_allowed_hosts")
+234-    @classmethod
+235-    def validate_extra_allowed_hosts(cls, hosts: list[str]) -> list[str]:
+236-        return normalize_allowed_hosts(hosts)
+237-
+238-    @model_validator(mode="before")
+239-    @classmethod
+240-    def _accept_legacy_mounts_json(cls, data: Any) -> Any:
+241-        """Accept the legacy ``mounts_json`` input key as an alias for ``mounts``."""
+242-        if isinstance(data, dict) and "mounts_json" in data:
+243-            legacy = data.pop("mounts_json")
+244-            if "mounts" not in data:
+245-                warnings.warn(
+246-                    "EnvironmentConfig.mounts_json is deprecated; "
+247-                    "use 'mounts' instead.",
+248-                    DeprecationWarning,
+249-                    stacklevel=2,
+250-                )
+251-                data["mounts"] = legacy
+252-        if isinstance(data, dict) and "suppress_override_warnings" in data:
+253-            warnings.warn(
+254-                "EnvironmentConfig.suppress_override_warnings is deprecated and "
+255-                "has no effect; resource override warnings are no longer emitted.",
+256-                DeprecationWarning,
+257-                stacklevel=2,
+258-            )
+259-        return data
+260-
+261-    @field_validator(
+262-        "cpu_enforcement_policy",
+263-        "memory_enforcement_policy",
+264-        mode="before",
+265-    )
+266-    @classmethod
+267-    def _normalize_resource_mode(cls, value: Any) -> Any:
+268-        if isinstance(value, str):
+269-            return value.lower()
+270-        return value
+271-
+272-    @property
+273-    def mounts_json(self) -> list[ServiceVolumeConfig] | None:
+274-        """Deprecated alias for :attr:`mounts`. Will be removed in a future release."""
+275-        warnings.warn(
+276-            "EnvironmentConfig.mounts_json is deprecated; use 'mounts' instead.",
+277-            DeprecationWarning,

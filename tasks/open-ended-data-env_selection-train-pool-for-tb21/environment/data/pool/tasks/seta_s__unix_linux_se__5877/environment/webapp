@@ -1,0 +1,39 @@
+#!/usr/bin/env python3
+"""Web Application Service"""
+import http.server
+import json
+import os
+import time
+
+PORT = int(os.environ.get('APP_PORT', '8080'))
+APP_ENV = os.environ.get('APP_ENV', 'development')
+APP_VERSION = os.environ.get('APP_VERSION', 'unknown')
+
+_start_time = time.time()
+
+
+class AppHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/health':
+            data = {
+                'status': 'ok',
+                'environment': APP_ENV,
+                'version': APP_VERSION,
+                'uptime': int(time.time() - _start_time),
+            }
+            body = json.dumps(data).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+if __name__ == '__main__':
+    server = http.server.HTTPServer(('0.0.0.0', PORT), AppHandler)
+    server.serve_forever()

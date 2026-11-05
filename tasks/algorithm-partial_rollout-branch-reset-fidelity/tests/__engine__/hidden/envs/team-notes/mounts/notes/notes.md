@@ -1,0 +1,3 @@
+# Team notes
+
+- kickoff done

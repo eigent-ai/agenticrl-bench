@@ -1,0 +1,46 @@
+877:            session_id=self._separate_verifier_session_id(key),
+878-            trial_paths=self.paths,
+879-            task_env_config=env_config,
+880-            logger=self.logger,
+881-            mounts=self._verifier_env_mounts(env_config),
+882-            network_policy=plan.verifier_env_baseline,
+--
+924:    def _separate_verifier_session_id(self, key: str) -> str:
+925-        raw = f"{self.config.trial_name}__verifier__{key}"
+926-        safe = "".join(char if char.isalnum() or char in "-._" else "_" for char in raw)
+927-        if len(safe) <= _MAX_VERIFIER_ENV_SESSION_ID_LEN:
+928-            return safe
+929-
+32:    if spec.idle_timeout_s:
+33:        kwargs["idle_timeout"] = int(spec.idle_timeout_s)
+224:        proc = await sb.exec.aio(*argv, timeout=int(timeout_s), workdir=workdir, env=env or None, text=False)
+247:            p = await sb.exec.aio("chmod", format(mode, "o"), path, timeout=60)
+KEEPALIVE = ("sh", "-c", "sleep infinity")
+
+
+def build_create_kwargs(spec: CreateSpec) -> dict[str, Any]:
+    """Keyword arguments for ``modal.Sandbox.create`` (without app/image/client).
+
+    Networking is fixed here: every sandbox gets ``block_network=True`` and nothing that
+    could open a path out (no allowlists, ports, tunnels, volumes, secrets or GPUs).
+    """
+    kwargs: dict[str, Any] = {
+        "timeout": int(spec.timeout_s),
+        "cpu": (float(spec.cpu), float(spec.cpu)),
+        "memory": (int(spec.memory_mb), int(spec.memory_mb)),
+        "block_network": True,
+    }
+    if spec.idle_timeout_s:
+        kwargs["idle_timeout"] = int(spec.idle_timeout_s)
+    if spec.workdir:
+        kwargs["workdir"] = spec.workdir
+    if spec.env:
+        kwargs["env"] = dict(spec.env)
+    if spec.tags:
+        kwargs["tags"] = dict(spec.tags)
+    return kwargs
+
+
+class ModalBackend(Backend):
+    name = "modal"
+

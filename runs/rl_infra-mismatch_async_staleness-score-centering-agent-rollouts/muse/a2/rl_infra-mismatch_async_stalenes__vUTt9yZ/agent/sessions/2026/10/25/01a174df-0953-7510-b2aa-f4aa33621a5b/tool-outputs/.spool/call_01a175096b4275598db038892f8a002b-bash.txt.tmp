@@ -1,0 +1,88 @@
+            rollout_count_share = sum(num_rollouts) / parallel_state.intra_dp.size
+
+        for key, val in rollout_data.items():
+            if key in [
+                "tokens",
+                "multimodal_train_inputs",
+                "loss_masks",
+                "sample_indices",
+                "rollout_ids",
+                "rollout_mask_sums",
+                "rollout_routed_experts",
+                "rollout_indexer_topk",
+                "rollout_sampling_mask_ids",
+                "rollout_sampling_mask_offsets",
+                "max_seq_lens",
+                "dynamic_global_batch_size",
+                "witness_ids",
+                "weight_versions",
+                "metadata",
+                "num_microbatches",
+                "micro_batch_indices",
+                "num_rollouts",
+                "n_adapters",
+                "adapter_slots",
+                "prompt_group_sizes",
+            ]:
+                continue
+            if isinstance(val, (list, tuple)):
+                if isinstance(val[0], torch.Tensor):
+                    count = len(val)
+                    # NOTE: Here we have to do the clone().detach(), otherwise the tensor will be
+                    # modified in place and will cause problem for the next rollout.
+                    tensor = torch.cat(val).clone().detach()
+                    if tensor.device != loss_masks[0].device:
+                        tensor = tensor.to(loss_masks[0].device)
+                    if key in [
+                        "log_probs",
+                        "ref_log_probs",
+                        "rollout_log_probs",
+                        "returns",
+                        "advantages",
+                        "values",
+                        "teacher_log_probs",
+                        "opd_reverse_kl",
+                        "entropy",
+                    ]:
+                        sum_of_sample_mean = get_sum_of_sample_mean(
+                            total_lengths,
+                            response_lengths,
+                            loss_masks,
+                            qkv_format=args.qkv_format,
+                            max_seq_lens=max_seq_lens,
+                            denominators=rollout_data.get("rollout_mask_sums", None),
+                        )
+                        per_rank_sum = cp_size * sum_of_sample_mean(tensor)
+                        if rollout_count_share is not None:
+                            count = rollout_count_share
+                    else:
+                        per_rank_sum = tensor.mean() * cp_size * count
+                    log_dict[key] = (per_rank_sum.item(), count)
+                else:
+                    # Flatten nested lists (e.g. list of lists from async rollout)
+                    flat = val
+                    if isinstance(val[0], (list, tuple)):
+                        flat = [x for sublist in val for x in sublist]
+                    # Skip non-numeric values (e.g. strings from async rollout metadata)
+                    if flat and not isinstance(flat[0], (int, float)):
+                        continue
+                    log_dict[key] = (sum(flat), len(flat))
+            elif isinstance(val, torch.Tensor):
+                log_dict[key] = (val.float().mean().item(), 1)
+            else:
+                raise ValueError(f"Unsupported type: {type(val)} for key: {key}")
+
+        reduced_log_dict = gather_log_data("rollout", args, rollout_id, log_dict)
+        if args.ci_test and not args.ci_disable_logprobs_checker and reduced_log_dict is not None:
+            reduced_log_dict = strip_metrics_namespace(reduced_log_dict, trainer_model_id=args.trainer_model_id)
+            if (
+                rollout_id == 0
+                and "rollout/log_probs" in reduced_log_dict
+                and "rollout/ref_log_probs" in reduced_log_dict
+54
+1541:  loss_type ....................................... score_centering
+1951:  rollout_top_logprobs_num ........................ 128
+2077:  score_centering_is .............................. mis
+2078:  score_centering_mis_high ........................ 5.0
+2079:  score_centering_mis_low ......................... 0.5
+2080:  score_centering_tis_clip ........................ 2.0

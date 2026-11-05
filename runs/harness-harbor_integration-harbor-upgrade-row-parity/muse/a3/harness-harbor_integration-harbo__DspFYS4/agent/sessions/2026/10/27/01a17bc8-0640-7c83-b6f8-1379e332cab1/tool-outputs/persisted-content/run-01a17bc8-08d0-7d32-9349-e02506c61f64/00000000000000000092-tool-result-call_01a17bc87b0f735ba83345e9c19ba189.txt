@@ -1,0 +1,273 @@
+Read text file `/app/rollout/replay/run_replay.py`.
+1|"""Replay recorded trials through the real rollout path and write the training rows they produce.
+2|
+3|    python -m replay.run_replay --trials data/recorded/batch_0927.jsonl --out /tmp/rows.jsonl
+4|
+5|Everything a training rollout runs is real except the policy: Miles' session server (TITO), our generate hook and
+6|agent function, Harbor (Terminus-2, the trial, the verifier) and the task sandboxes from the sandbox service. The
+7|policy is ``replay.engine``, which answers each request from the recorded trial it belongs to.
+8|
+9|Settings come from the recipe (``recipe.env`` next to this package, the same file the training launcher sources), so a
+10|replay sees what a training rollout sees. One JSON line per trial in ``--out``: the row the trainer would get
+11|(``replay.rows``).
+12|"""
+13|
+14|from __future__ import annotations
+15|
+16|import argparse
+17|import asyncio
+18|import contextlib
+19|import json
+20|import os
+21|import shlex
+22|import socket
+23|import sys
+24|import threading
+25|import time
+26|from pathlib import Path
+27|from types import SimpleNamespace
+28|
+29|ROLLOUT_DIR = Path(__file__).resolve().parents[1]
+30|
+31|
+32|def read_recipe(path: Path) -> dict[str, str]:
+33|    env = {}
+34|    for line in path.read_text().splitlines():
+35|        line = line.strip()
+36|        if not line or line.startswith("#"):
+37|            continue
+38|        if line.startswith("export "):
+39|            line = line[len("export "):]
+40|        key, _, value = line.partition("=")
+41|        value = value.strip()
+42|        parts = shlex.split(value) if value else [""]
+43|        env[key.strip()] = parts[0] if parts else ""
+44|    return env
+45|
+46|
+47|def free_port() -> int:
+48|    with contextlib.closing(socket.socket()) as s:
+49|        s.bind(("127.0.0.1", 0))
+50|        return s.getsockname()[1]
+51|
+52|
+53|class ThreadServer:
+54|    def __init__(self, app, port: int):
+55|        import uvicorn
+56|
+57|        self.server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning",
+58|                                                    access_log=False, timeout_keep_alive=600))
+59|        self.thread = threading.Thread(target=self.server.run, daemon=True)
+60|
+61|    def start(self):
+62|        self.thread.start()
+63|        while not self.server.started:
+64|            time.sleep(0.05)
+65|
+66|    def stop(self):
+67|        self.server.should_exit = True
+68|        self.thread.join(timeout=10)
+69|
+70|
+71|def start_engine(model: str, trial_files: list[str], log_path: str | None) -> tuple[ThreadServer, str]:
+72|    from transformers import AutoTokenizer
+73|
+74|    from replay.engine import ScriptedEngine, build_app, load_trials
+75|
+76|    tok = AutoTokenizer.from_pretrained(model)
+77|    port = free_port()
+78|    srv = ThreadServer(build_app(ScriptedEngine(tok, load_trials(trial_files), log_path)), port)
+79|    srv.start()
+80|    return srv, f"http://127.0.0.1:{port}"
+81|
+82|
+83|def start_session_server(recipe: dict[str, str], backend_url: str) -> tuple[ThreadServer, str]:
+84|    from miles.rollout.session.config import SessionServerConfig
+85|    from miles.rollout.session.server import SessionServer
+86|
+87|    port = free_port()
+88|    cfg = SessionServerConfig(
+89|        host="127.0.0.1",
+90|        port=port,
+91|        instance_id=None,
+92|        backend_url=backend_url,
+93|        timeout=None,
+94|        hf_checkpoint=recipe["HF_CHECKPOINT"],
+95|        chat_template_path=None,
+96|        tito_model=recipe["TITO_MODEL"],
+97|        apply_chat_template_kwargs=json.loads(recipe.get("APPLY_CHAT_TEMPLATE_KWARGS") or "null"),
+98|        use_rollout_routing_replay=False,
+99|        use_rollout_indexer_replay=False,
+100|        use_sampling_support_replay=False,
+101|        sglang_speculative_algorithm=None,
+102|        num_layers=None,
+103|        moe_router_topk=None,
+104|        save_debug_trajectory_data=None,
+105|        lora_rank=0,
+106|        lora_adapter_path=None,
+107|        lora_train_only=False,
+108|        use_session_server=True,
+109|        session_message_matcher="strict",
+110|        pause_generation_mode=None,
+111|        session_sample_picker_path=None,
+112|        session_sample_postprocessor_path=None,
+113|        rollout_top_logprobs_num=0,
+114|        rollout_sampling_logprobs_mode="selected",
+115|        rollout_temperature=float(recipe.get("ROLLOUT_TEMPERATURE", "1.0")),
+116|    )
+117|    srv = ThreadServer(SessionServer(cfg).app, port)
+118|    srv.start()
+119|    return srv, f"127.0.0.1:{port}"
+120|
+121|
+122|def rollout_args(recipe: dict[str, str], session_addr: str) -> SimpleNamespace:
+123|    from miles.rollout.session.types import SessionServerInstance
+124|
+125|    return SimpleNamespace(
+126|        session_server_instances=[SessionServerInstance(addr=session_addr)],
+127|        custom_agent_function_path=recipe["CUSTOM_AGENT_FUNCTION_PATH"],
+128|        max_seq_len=int(recipe["MAX_SEQ_LEN"]),
+129|        partial_rollout=False,
+130|        use_session_server=True,
+131|        sglang_speculative_algorithm=None,
+132|        use_sampling_support_replay=False,
+133|        rollout_temperature=float(recipe.get("ROLLOUT_TEMPERATURE", "1.0")),
+134|    )
+135|
+136|
+137|def sampling_params(recipe: dict[str, str], seed: int) -> dict:
+138|    return {
+139|        "temperature": float(recipe.get("ROLLOUT_TEMPERATURE", "1.0")),
+140|        "top_p": 1.0,
+141|        "max_new_tokens": int(recipe["ROLLOUT_MAX_RESPONSE_LEN"]),
+142|        "sampling_seed": seed,
+143|    }
+144|
+145|
+146|async def run_trial(trial: dict, args, recipe: dict[str, str], generate_fn, reward_fn) -> dict:
+147|    from miles.rollout.base_types import GenerateFnInput
+148|    from miles.utils.types import Sample
+149|
+150|    from replay.rows import sample_to_row
+151|
+152|    sample = Sample(
+153|        group_index=trial.get("group_index", 0),
+154|        index=trial.get("index", 0),
+155|        prompt=[{"role": "user", "content": trial.get("prompt", trial["instance_id"])}],
+156|        metadata={"instance_id": trial["instance_id"], "agent_name": trial.get("agent_name", "terminus-2")},
+157|    )
+158|    gen_input = GenerateFnInput(
+159|        state=SimpleNamespace(args=args), sample=sample,
+160|        sampling_params=sampling_params(recipe, int(trial["seed"])), evaluation=False,
+161|    )
+162|    t0 = time.time()
+163|    out = await generate_fn(gen_input)
+164|    samples = out.samples if isinstance(out.samples, list) else [out.samples]
+165|    rows = []
+166|    for s in samples:
+167|        if s.status != Sample.Status.ABORTED:
+168|            s.reward = await reward_fn(args, s)
+169|        rows.append(sample_to_row(s))
+170|    return {"trial_id": trial["trial_id"], "seed": int(trial["seed"]), "instance_id": trial["instance_id"],
+171|            "rows": rows, "wall_s": round(time.time() - t0, 1),
+172|            "exit_status": (samples[0].metadata or {}).get("exit_status") if samples else None}
+173|
+174|
+175|async def main_async(a) -> int:
+176|    # the process environment wins over the recipe file (how the launcher lets a box override a path)
+177|    recipe = {key: os.environ.get(key, value) for key, value in read_recipe(Path(a.recipe)).items()}
+178|    os.environ.update(recipe)
+179|    if a.tasks_dir:
+180|        os.environ["HARBOR_TASKS_DIR"] = a.tasks_dir
+181|    os.environ["HARBOR_TRIALS_DIR"] = a.trials_dir or os.environ.get("HARBOR_TRIALS_DIR", "/tmp/harbor_trials")
+182|    sys.path.insert(0, str(Path(a.glue_dir).resolve()))
+183|
+184|    from miles.utils.function_registry import load_function
+185|
+186|    trials = []
+187|    for path in a.trials:
+188|        with open(path) as f:
+189|            trials += [json.loads(line) for line in f if line.strip()]
+190|    if a.only:
+191|        wanted = set(a.only.split(","))
+192|        trials = [t for t in trials if t["trial_id"] in wanted]
+193|
+194|    if a.engine_url:
+195|        engine, engine_url = None, a.engine_url.rstrip("/")
+196|    else:
+197|        engine, engine_url = start_engine(recipe["HF_CHECKPOINT"], a.trials, a.engine_log)
+198|    session, session_addr = start_session_server(recipe, engine_url)
+199|    args = rollout_args(recipe, session_addr)
+200|    from miles.utils.http_utils import init_http_client
+201|
+202|    init_http_client(SimpleNamespace(rollout_num_gpus=1, rollout_num_gpus_per_engine=1, sglang_server_concurrency=512,
+203|                                     eval_num_gpus=0, eval_uses_snapshots=False, use_distributed_post=False))
+204|    generate_fn = load_function(recipe["CUSTOM_GENERATE_FUNCTION_PATH"])
+205|    reward_fn = load_function(recipe["CUSTOM_RM_PATH"])
+206|
+207|    sem = asyncio.Semaphore(a.concurrency)
+208|    out_path = Path(a.out)
+209|    out_path.parent.mkdir(parents=True, exist_ok=True)
+210|    lock = asyncio.Lock()
+211|    done = 0
+212|
+213|    async def one(trial):
+214|        nonlocal done
+215|        async with sem:
+216|            try:
+217|                rec = await run_trial(trial, args, recipe, generate_fn, reward_fn)
+218|            except Exception as exc:  # noqa: BLE001 - report the replay error in the rows file
+219|                rec = {"trial_id": trial["trial_id"], "seed": int(trial["seed"]), "instance_id": trial["instance_id"],
+220|                       "error": f"{type(exc).__name__}: {exc}"}
+221|        async with lock:
+222|            with open(out_path, "a") as f:
+223|                f.write(json.dumps(rec) + "\n")
+224|            done += 1
+225|            if not a.quiet:
+226|                status = rec.get("error") or ",".join(r["status"] for r in rec["rows"])
+227|                print(f"[{done}/{len(trials)}] {rec['trial_id']}: {status} ({rec.get('wall_s')}s)", flush=True)
+228|
+229|    out_path.write_text("")
+230|    try:
+231|        await asyncio.gather(*(one(t) for t in trials))
+232|    finally:
+233|        session.stop()
+234|        if engine is not None:
+235|            engine.stop()
+236|        write_meta(out_path)
+237|    return 0
+238|
+239|
+240|def write_meta(out_path: Path) -> None:
+241|    """Which stack produced these rows (python, harbor, miles), next to the rows file."""
+242|    mods = {}
+243|    for name, mod in sorted(sys.modules.items()):
+244|        if name == "harbor" or name.startswith("harbor."):
+245|            mods[name] = getattr(mod, "__file__", None)
+246|    import harbor
+247|
+248|    meta = {"python": sys.executable, "harbor_file": getattr(harbor, "__file__", None),
+249|            "harbor_modules": mods, "glue": {k: getattr(sys.modules.get(k), "__file__", None)
+250|                                             for k in ("generate", "harbor_agent_function")}}
+251|    Path(str(out_path) + ".meta.json").write_text(json.dumps(meta, indent=1))
+252|
+253|
+254|def main():
+255|    ap = argparse.ArgumentParser()
+256|    ap.add_argument("--trials", nargs="+", required=True)
+257|    ap.add_argument("--out", required=True)
+258|    ap.add_argument("--recipe", default=str(ROLLOUT_DIR / "recipe.env"))
+259|    ap.add_argument("--glue-dir", default=str(ROLLOUT_DIR), help="where the generate / agent-function modules live")
+260|    ap.add_argument("--engine-url", help="use an already running replay engine instead of starting one")
+261|    ap.add_argument("--tasks-dir")
+262|    ap.add_argument("--trials-dir")
+263|    ap.add_argument("--engine-log")
+264|    ap.add_argument("--only", help="comma-separated trial ids")
+265|    ap.add_argument("--concurrency", type=int, default=8)
+266|    ap.add_argument("--quiet", action="store_true")
+267|    a = ap.parse_args()
+268|    sys.exit(asyncio.run(main_async(a)))
+269|
+270|
+271|if __name__ == "__main__":
+272|    main()

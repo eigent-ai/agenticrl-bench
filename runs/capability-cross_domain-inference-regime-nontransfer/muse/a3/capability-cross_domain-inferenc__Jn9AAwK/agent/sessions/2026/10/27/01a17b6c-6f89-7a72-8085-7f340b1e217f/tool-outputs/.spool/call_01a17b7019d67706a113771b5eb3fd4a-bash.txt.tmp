@@ -1,0 +1,161 @@
+                        msg, "string", [], [], [], []
+                    )
+
+            for msg in messages:
+                if msg.get("content") is None:
+                    msg["content"] = ""
+                processed_msg = process_content_for_template_format(
+                    msg,
+                    template_content_format,
+                    image_data,
+                    video_data,
+                    audio_data,
+                    modalities,
+                    use_dpsk_v32_encoding=self.chat_encoding_spec == "dsv32",
+                )
+                msg.update(processed_msg)
+
+            # Handle continue_final_message: separate final assistant message
+            messages, assistant_prefix = self._handle_last_assistant_message(
+                messages, request
+            )
+
+            if messages[0]["role"] != "system":
+                # insert an empty system prompt to help render tool system prompt
+                messages.insert(0, {"role": "system", "content": ""})
+            if request.tools:
+                messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
+
+            # Default encoding (dsv4/dsv32)
+            if self.chat_encoding_spec == "dsv4":
+                # V4 encoder only accepts "max" / "high" / None.
+                # OpenAI protocol defaults to "medium" which V4 rejects; drop it.
+                # Fallback: if request didn't set it, try env SGLANG_DSV4_REASONING_EFFORT.
+                effort_source = request.reasoning_effort
+                if effort_source is None:
+                    env_val = envs.SGLANG_DSV4_REASONING_EFFORT.get()
+                    if env_val:
+                        effort_source = env_val
+                v4_reasoning_effort = (
+                    effort_source if effort_source in ("max", "high") else None
+                )
+                if request.task is not None:
+                    encoding_dsv4.attach_task_to_last_user_message(
+                        messages, request.task
+                    )
+                real_input = encoding_dsv4.encode_messages(
+                    messages,
+                    thinking_mode=thinking_mode,
+                    reasoning_effort=v4_reasoning_effort,
+                )
+                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+            else:
+                real_input = encoding_dsv32.encode_messages(
+                    messages, thinking_mode=thinking_mode
+                )
+                prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
+
+            # Append assistant prefix if continue_final_message is enabled
+            if assistant_prefix:
+                prompt_ids = self._append_assistant_prefix_to_prompt_ids(
+                    prompt_ids, assistant_prefix
+                )
+        else:
+            for msg_dict in copy.deepcopy(messages):
+                if msg_dict.get("content") is None:
+                    msg_dict["content"] = ""
+
+                # Process content based on detected template format
+                processed_msg = process_content_for_template_format(
+                    msg_dict,
+                    template_content_format,
+                    image_data,
+                    video_data,
+                    audio_data,
+                    modalities,
+                )
+
+                processed_msg["content"] = normalize_tool_content(
+                    processed_msg["role"], processed_msg.get("content")
+                )
+
+                openai_compatible_messages.append(processed_msg)
+
+            # Handle continue_final_message: separate final assistant message
+            openai_compatible_messages, assistant_prefix = (
+                self._handle_last_assistant_message(openai_compatible_messages, request)
+            )
+
+            extra_template_kwargs = {}
+            if request.reasoning_effort is not None:
+                extra_template_kwargs["reasoning_effort"] = request.reasoning_effort
+            if request.chat_template_kwargs:
+                extra_template_kwargs.update(request.chat_template_kwargs)
+
+            # Split apply_chat_template(tokenize=True) into render + encode so we
+            # can skip add_special_tokens=False on tokenizers that don't auto-add
+            # specials (Kimi-like, OpenAI-chat analogue of #25265). Chat
+            # templates already include role/special tokens, so the encode must
+            # avoid double BOS on tokenizers that would add it.
+            encode_kwargs = (
+                {"add_special_tokens": False}
+                if self._tokenizer_auto_adds_specials
+                else {}
+            )
+            try:
+                rendered_prompt = self.tokenizer_manager.tokenizer.apply_chat_template(
+                    openai_compatible_messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    tools=tools,
+                    return_dict=False,
+                    **extra_template_kwargs,
+                )
+                prompt_ids = self.tokenizer_manager.tokenizer.encode(
+                    rendered_prompt, **encode_kwargs
+                )
+            except Exception:
+                # If the first attempt fails, try with flat function-only format.
+                # Some templates (e.g. Mistral) expect tools without the OpenAI wrapper.
+                tools = (
+                    [t["function"] if "function" in t else t for t in tools]
+                    if tools
+                    else None
+                )
+                try:
+                    rendered_prompt = (
+                        self.tokenizer_manager.tokenizer.apply_chat_template(
+                            openai_compatible_messages,
+                            tokenize=False,
+                            add_generation_prompt=True,
+                            tools=tools,
+                            return_dict=False,
+                            **extra_template_kwargs,
+                        )
+                    )
+                    prompt_ids = self.tokenizer_manager.tokenizer.encode(
+                        rendered_prompt, **encode_kwargs
+                    )
+                except (jinja2.TemplateError, TypeError) as template_error:
+                    # Template errors (e.g., from raise_exception in Jinja templates)
+                    # and TypeError (e.g., tojson filter on Jinja2 Undefined variables)
+                    # should be treated as client errors (400 BadRequest)
+                    raise ValueError(str(template_error)) from template_error
+
+            # Append assistant prefix if continue_final_message is enabled
+            if assistant_prefix:
+                prompt_ids = self._append_assistant_prefix_to_prompt_ids(
+                    prompt_ids, assistant_prefix
+                )
+
+            if is_multimodal:
+                prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
+
+        stop = request.stop
+        image_data = image_data if image_data else None
+        audio_data = audio_data if audio_data else None
+        video_data = video_data if video_data else None
+        modalities = modalities if modalities else []
+        return MessageProcessingResult(
+            prompt=prompt,
+            prompt_ids=prompt_ids,

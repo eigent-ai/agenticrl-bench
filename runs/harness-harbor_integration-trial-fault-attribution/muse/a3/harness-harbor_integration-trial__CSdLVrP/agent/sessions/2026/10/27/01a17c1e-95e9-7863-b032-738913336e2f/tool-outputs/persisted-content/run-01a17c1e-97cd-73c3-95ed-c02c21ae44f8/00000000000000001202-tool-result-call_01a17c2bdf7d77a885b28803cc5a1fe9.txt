@@ -1,0 +1,303 @@
+Read text file `/app/reference/harbor-0.23.0/harbor/agents/terminus_2/terminus_2.py`.
+(1477 line(s) above)
+1478|
+1479|            if feedback and "ERROR:" in feedback:
+1480|                prompt = (
+1481|                    f"Previous response had parsing errors:\n{feedback}\n\n"
+1482|                    f"Please fix these issues and provide a proper "
+1483|                    f"{self._get_error_response_type()}."
+1484|                )
+1485|                # For error cases, we still want to record the step
+1486|                # Use the raw response as the message since parsing failed
+1487|                cache_tokens_used = chat.total_cache_tokens - tokens_before_cache
+1488|                step_cost = chat.total_cost - cost_before
+1489|
+1490|                if llm_response.model_name:
+1491|                    self._last_response_model_name = llm_response.model_name
+1492|                self._trajectory_steps.append(
+1493|                    Step(
+1494|                        step_id=len(self._trajectory_steps) + 1,
+1495|                        timestamp=datetime.now(timezone.utc).isoformat(),
+1496|                        source="agent",
+1497|                        model_name=llm_response.model_name or self._model_name,
+1498|                        message=llm_response.content,
+1499|                        reasoning_content=llm_response.reasoning_content,
+1500|                        observation=Observation(
+1501|                            results=[
+1502|                                ObservationResult(
+1503|                                    content=prompt,
+1504|                                )
+1505|                            ]
+1506|                        ),
+1507|                        metrics=Metrics(
+1508|                            prompt_tokens=chat.total_input_tokens - tokens_before_input,
+1509|                            completion_tokens=chat.total_output_tokens
+1510|                            - tokens_before_output,
+1511|                            cached_tokens=cache_tokens_used
+1512|                            if cache_tokens_used > 0
+1513|                            else None,
+1514|                            cost_usd=step_cost if step_cost > 0 else None,
+1515|                            prompt_token_ids=llm_response.prompt_token_ids,
+1516|                            completion_token_ids=llm_response.completion_token_ids,
+1517|                            logprobs=llm_response.logprobs,
+1518|                        ),
+1519|                    )
+1520|                )
+1521|                continue
+1522|
+1523|            timeout_occurred, terminal_output = await self._execute_commands(
+1524|                commands,
+1525|                self._session,
+1526|            )
+1527|
+1528|            # Capture the pending completion state before potentially modifying it
+1529|            was_pending_completion = self._pending_completion
+1530|
+1531|            # Construct the observation (what gets sent back to the LLM)
+1532|            if is_task_complete:
+1533|                if self._pending_completion:
+1534|                    observation = terminal_output
+1535|                else:
+1536|                    self._pending_completion = True
+1537|                    observation = self._get_completion_confirmation_message(
+1538|                        terminal_output
+1539|                    )
+1540|            else:
+1541|                self._pending_completion = False
+1542|                if feedback and "WARNINGS:" in feedback:
+1543|                    observation = (
+1544|                        f"Previous response had warnings:\n{feedback}\n\n"
+1545|                        f"{self._limit_output_length(terminal_output)}"
+1546|                    )
+1547|                else:
+1548|                    observation = self._limit_output_length(terminal_output)
+1549|
+1550|            # Record the step in trajectory
+1551|            cache_tokens_used = chat.total_cache_tokens - tokens_before_cache
+1552|            step_cost = chat.total_cost - cost_before
+1553|
+1554|            # Create tool_calls array from commands and task completion
+1555|            # Note: Although Terminus 2 doesn't offer native tool calling (it uses text-based command parsing),
+1556|            # we represent parsed commands as tool calls for better trajectory analysis and compatibility with tooling.
+1557|            # However, when raw_content mode is enabled, we skip tool_calls generation to preserve the raw LLM response.
+1558|            tool_calls: list[ToolCall] | None = None
+1559|            observation_results: list[ObservationResult] = []
+1560|
+1561|            if not (self.options.trajectory_config or {}).get("raw_content", False):
+1562|                # Only create tool_calls when NOT in raw_content mode
+1563|                tool_calls_list: list[ToolCall] = []
+1564|
+1565|                if commands:
+1566|                    for i, cmd in enumerate(commands):
+1567|                        tool_call_id = f"call_{episode}_{i + 1}"
+1568|                        tool_calls_list.append(
+1569|                            ToolCall(
+1570|                                tool_call_id=tool_call_id,
+1571|                                function_name="bash_command",
+1572|                                arguments={
+1573|                                    "keystrokes": cmd.keystrokes,
+1574|                                    "duration": cmd.duration_sec,
+1575|                                },
+1576|                            )
+1577|                        )
+1578|
+1579|                    # Multi-command batches share one terminal output, so only
+1580|                    # single-command observations can be linked precisely.
+1581|                    observation_results.append(
+1582|                        ObservationResult(
+1583|                            source_call_id=_terminal_observation_source_call_id(
+1584|                                commands, episode
+1585|                            ),
+1586|                            content=observation,
+1587|                        )
+1588|                    )
+1589|
+1590|                # Add task_complete as a tool call if the agent marked the task complete
+1591|                if is_task_complete:
+1592|                    task_complete_call_id = f"call_{episode}_task_complete"
+1593|                    tool_calls_list.append(
+1594|                        ToolCall(
+1595|                            tool_call_id=task_complete_call_id,
+1596|                            function_name="mark_task_complete",
+1597|                            arguments={},
+1598|                        )
+1599|                    )
+1600|                    # If there are no commands, we still need to add an observation result
+1601|                    if not commands:
+1602|                        observation_results.append(
+1603|                            ObservationResult(
+1604|                                content=observation,
+1605|                            )
+1606|                        )
+1607|                elif not commands:
+1608|                    # No commands and no task completion, just the observation
+1609|                    observation_results.append(
+1610|                        ObservationResult(
+1611|                            content=observation,
+1612|                        )
+1613|                    )
+1614|
+1615|                tool_calls = tool_calls_list or None
+1616|            else:
+1617|                # In raw_content mode, just add observation without tool_calls
+1618|                observation_results.append(
+1619|                    ObservationResult(
+1620|                        content=observation,
+1621|                    )
+1622|                )
+1623|
+1624|            # Build the step object using Pydantic models
+1625|            if llm_response.model_name:
+1626|                self._last_response_model_name = llm_response.model_name
+1627|            self._trajectory_steps.append(
+1628|                Step(
+1629|                    step_id=len(self._trajectory_steps) + 1,
+1630|                    timestamp=datetime.now(timezone.utc).isoformat(),
+1631|                    source="agent",
+1632|                    model_name=llm_response.model_name or self._model_name,
+1633|                    message=message_content,
+1634|                    reasoning_content=llm_response.reasoning_content,
+1635|                    tool_calls=tool_calls,
+1636|                    observation=Observation(results=observation_results),
+1637|                    metrics=Metrics(
+1638|                        prompt_tokens=chat.total_input_tokens - tokens_before_input,
+1639|                        completion_tokens=chat.total_output_tokens
+1640|                        - tokens_before_output,
+1641|                        cached_tokens=cache_tokens_used
+1642|                        if cache_tokens_used > 0
+1643|                        else None,
+1644|                        cost_usd=step_cost if step_cost > 0 else None,
+1645|                        prompt_token_ids=llm_response.prompt_token_ids,
+1646|                        completion_token_ids=llm_response.completion_token_ids,
+1647|                        logprobs=llm_response.logprobs,
+1648|                    ),
+1649|                )
+1650|            )
+1651|
+1652|            # Dump trajectory after every episode to ensure we persist even if program terminates
+1653|            self._dump_trajectory()
+1654|
+1655|            if is_task_complete:
+1656|                if was_pending_completion:
+1657|                    # Task is confirmed complete (this is the second time task_complete was True), return
+1658|                    return
+1659|                else:
+1660|                    # First completion attempt - ask for confirmation and continue
+1661|                    prompt = observation
+1662|                    continue
+1663|
+1664|            prompt = observation
+1665|
+1666|    def _reset_per_run_state(self) -> None:
+1667|        """Reset all per-run state. The same Terminus2 instance is reused
+1668|        across multiple `run()` invocations in multi-step trials, so any
+1669|        accumulator that should be scoped to a single step must be reset here.
+1670|        """
+1671|        self._trajectory_steps = []
+1672|        self._api_request_times = []
+1673|        self._n_episodes = 0
+1674|        self._summarization_count = 0
+1675|        self._subagent_metrics = SubagentMetrics()
+1676|        self._subagent_rollout_details = []
+1677|        self._pending_completion = False
+1678|        self._pending_subagent_refs = None
+1679|        self._pending_handoff_prompt = None
+1680|        self._session_id = (
+1681|            self.options.session_id or self.session_id or str(uuid.uuid4())
+1682|        )
+1683|        session_id_headers = {
+1684|            name: self._session_id for name in self._session_id_headers or []
+1685|        }
+1686|        if session_id_headers:
+1687|            extra_headers = self._llm_call_kwargs.setdefault("extra_headers", {})
+1688|            if not isinstance(extra_headers, dict):
+1689|                raise ValueError("llm_call_kwargs.extra_headers must be a mapping")
+1690|            extra_headers.update(session_id_headers)
+1691|
+1692|    @override
+1693|    async def run(
+1694|        self,
+1695|        instruction: str,
+1696|        environment: BaseEnvironment,
+1697|        context: AgentContext,
+1698|    ) -> None:
+1699|        self._reset_per_run_state()
+1700|        self._chat = Chat(
+1701|            self._llm, interleaved_thinking=self.options.interleaved_thinking
+1702|        )
+1703|        self._context = context
+1704|
+1705|        if self._session is None:
+1706|            raise RuntimeError("Session is not set")
+1707|
+1708|        # Get the terminal state for the initial prompt
+1709|        terminal_state = self._limit_output_length(
+1710|            await self._session.get_incremental_output()
+1711|        )
+1712|
+1713|        augmented_instruction = instruction
+1714|        if self.mcp_servers:
+1715|            mcp_info = "\n\nMCP Servers:\nThe following MCP servers are available for this task.\n"
+1716|            for s in self.mcp_servers:
+1717|                if s.transport == "stdio":
+1718|                    args_str = " ".join(s.args)
+1719|                    mcp_info += f"- {s.name}: stdio transport, command: {s.command} {args_str}\n"
+1720|                else:
+1721|                    mcp_info += f"- {s.name}: {s.transport} transport, url: {s.url}\n"
+1722|            augmented_instruction = instruction + mcp_info
+1723|
+1724|        skills_section = await self._build_skills_section(environment)
+1725|        if skills_section:
+1726|            augmented_instruction += skills_section
+1727|
+1728|        initial_prompt = self._prompt_template.format(
+1729|            instruction=augmented_instruction,
+1730|            terminal_state=terminal_state,
+1731|        )
+1732|
+1733|        self._trajectory_steps.append(
+1734|            Step(
+1735|                step_id=1,
+1736|                timestamp=datetime.now(timezone.utc).isoformat(),
+1737|                source="user",
+1738|                message=initial_prompt,
+1739|            )
+1740|        )
+1741|
+1742|        try:
+1743|            await self._run_agent_loop(
+1744|                initial_prompt=initial_prompt,
+1745|                chat=self._chat,
+1746|                original_instruction=instruction,
+1747|            )
+1748|        finally:
+1749|            # Always capture metrics and rollout details even if the agent times out or errors
+1750|            # Combine main chat rollout details with subagent rollout details
+1751|            context.rollout_details = (
+1752|                self._chat.rollout_details + self._subagent_rollout_details
+1753|            )
+1754|
+1755|            # Include subagent metrics in context totals
+1756|            context.n_input_tokens = (
+1757|                self._chat.total_input_tokens
+1758|                + self._subagent_metrics.total_prompt_tokens
+1759|            )
+1760|            context.n_output_tokens = (
+1761|                self._chat.total_output_tokens
+1762|                + self._subagent_metrics.total_completion_tokens
+1763|            )
+1764|            context.n_cache_tokens = (
+1765|                self._chat.total_cache_tokens
+1766|                + self._subagent_metrics.total_cached_tokens
+1767|            )
+1768|            total_cost = self._chat.total_cost + self._subagent_metrics.total_cost_usd
+1769|            context.cost_usd = total_cost if total_cost > 0 else None
+1770|            context.metadata = {
+1771|                "n_episodes": self._n_episodes,
+1772|                "api_request_times_msec": self._api_request_times,
+1773|                "summarization_count": self._summarization_count,
+1774|            }
+1775|            if self.options.store_all_messages:
+1776|                context.metadata["all_messages"] = self._chat.messages
+1777|
+(more lines below)

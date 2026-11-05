@@ -1,0 +1,40 @@
+103:    reward_score: Optional[float] = None
+143:        # rm_scores: reward score for each token
+144:        reward_score = output.pop("reward_score", None)
+145:        if reward_score is not None:
+146:            rm_scores = torch.zeros_like(output["response_mask"], dtype=torch.float32)
+147:            rm_scores[-1] = reward_score
+148:            output["rm_scores"] = rm_scores
+822:        await self._compute_score([output], kwargs=kwargs)
+862:            reward_score=output.reward_score,
+967:    async def _compute_score(self, outputs: list[AgentLoopOutput], kwargs: dict) -> None:
+972:        if final_output.reward_score is None and enable_async_reward:
+1027:                final_output.reward_score = result["reward_score"]
+1093:        scores = [input.reward_score for input in inputs]
+1097:            rm_scores = torch.zeros_like(response_mask, dtype=torch.float32)
+1098:            rm_scores[torch.arange(response_mask.size(0)), response_length] = torch.tensor(scores, dtype=torch.float32)
+1099:            batch["rm_scores"] = rm_scores
+1137:        # Only include reward_extra_keys in meta_info if rm_scores is in batch
+1139:        if "rm_scores" in batch.keys():
+1267:        t_compute_score = np.array([metric["compute_score"] for chunk in metrics for metric in chunk])
+1278:        timing["agent_loop/compute_score/min"] = t_compute_score.min()
+1279:        timing["agent_loop/compute_score/max"] = t_compute_score.max()
+1280:        timing["agent_loop/compute_score/mean"] = t_compute_score.mean()
+1283:        slowest = np.argmax(t_generate_sequences + t_tool_calls + t_compute_score)
+1287:        timing["agent_loop/slowest/compute_score"] = t_compute_score[slowest]
+1130:            fields = ["uid", "rm_scores", "num_turns", "reward_model", "data_source", "extra_fields"]
+1136:            scores = data["rm_scores"].sum(dim=1).tolist()
+1315:            fields = ["uid", "prompts", "responses", "rm_scores", "reward_model"]
+1323:            scores = data["rm_scores"].sum(dim=1).tolist()
+1581:        # 4. write rm_scores (and reward extra info) back to TransferQueue.
+1582:        padded_rm_scores = rm_output.batch["rm_scores"]
+1583:        rm_scores = torch.nested.as_nested_tensor(
+1584:            [padded_rm_scores[i, : response_lengths[i]] for i in range(len(batch))],
+1587:        write_back = {"rm_scores": rm_scores}
+1760:        fields = ["uid", "response_mask", "rm_scores", "rollout_log_probs", "old_log_probs", "ref_log_prob", "values"]
+1765:        data.batch["token_level_scores"] = data.batch["rm_scores"]
+1775:            data.batch["token_level_rewards"] = data.batch["token_level_scores"]
+1893:            "rm_scores",
+1935:        data["token_level_scores"] = data["rm_scores"]
+1937:            data["token_level_rewards"] = data["rm_scores"]
+164:    reward_tensor = batch.batch["rm_scores"]

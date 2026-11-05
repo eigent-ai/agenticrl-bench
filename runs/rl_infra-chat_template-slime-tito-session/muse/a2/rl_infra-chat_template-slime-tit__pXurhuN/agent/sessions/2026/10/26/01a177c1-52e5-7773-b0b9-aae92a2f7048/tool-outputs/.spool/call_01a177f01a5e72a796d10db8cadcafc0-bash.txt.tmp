@@ -1,0 +1,30 @@
+            # Single string template
+            return template
+
+        except Exception as e:
+            logger.warning(f"Error getting chat template: {e}")
+            return None
+
+    def _select_named_template(
+        self, templates: Dict[str, str], tokenizer_manager: TokenizerManager
+    ) -> str:
+        if not templates:
+            raise ValueError("Empty templates dict provided")
+
+        available_names = list(templates.keys())
+        logger.info(f"Multiple HuggingFace chat templates available: {available_names}")
+
+        # Use specified template if provided
+        if preferred_name := tokenizer_manager.server_args.hf_chat_template_name:
+            if preferred_name not in templates:
+                raise ValueError(
+                    f"Specified template '{preferred_name}' not found. "
+                    f"Available templates: {available_names}"
+                )
+            logger.info(f"Using specified chat template: '{preferred_name}'")
+            return templates[preferred_name]
+
+        # Fallback: Use first available template
+        first_name = available_names[0]
+        logger.info(f"Using first available template: '{first_name}'")
+        return templates[first_name]

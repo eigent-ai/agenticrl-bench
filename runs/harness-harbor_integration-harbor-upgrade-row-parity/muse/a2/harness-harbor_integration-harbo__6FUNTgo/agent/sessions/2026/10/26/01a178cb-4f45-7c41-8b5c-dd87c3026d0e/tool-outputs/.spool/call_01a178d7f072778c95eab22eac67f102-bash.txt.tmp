@@ -1,0 +1,81 @@
+19:def merge_samples(samples: list[Sample], tokenizer) -> Sample:
+20-    acc = samples[0]
+21-    for sample in samples[1:]:
+22-        # Only a COMPLETED turn can be extended by a later turn; if an
+23-        # intermediate turn truncated, the trajectory ends there.
+24-        # TODO (shi.dong): figure out how in-turn truncation should be handled.
+25-        if acc.status != Sample.Status.COMPLETED:
+26-            break
+27-        # Replay metadata must be complete through the merged prefix.
+28-        if _introduces_replay_gap(acc, sample):
+29-            break
+30-        acc = _merge_sample_pair(acc, sample, tokenizer=tokenizer)
+31-    return acc
+32-
+33-
+34-def _introduces_replay_gap(a: Sample, b: Sample) -> bool:
+35-    return any(getattr(a, field) is not None and getattr(b, field) is None for field in _REPLAY_FIELDS)
+36-
+37-
+38-def _merge_sample_pair(a: Sample, b: Sample, tokenizer) -> Sample:
+39-    """Merge two samples generated from sibling inference engine calls."""
+40-    a, b = deepcopy(a), deepcopy(b)
+41-
+42-    def _merge_equal_value(field):
+43-        x = getattr(a, field)
+44-        y = getattr(b, field)
+45-        assert x == y, f"{field} mismatch: a.{field}={x}, b.{field}={y}"
+46-        return x
+47-
+48-    def _fill_defaults(sample: Sample):
+49-        if sample.loss_mask is None:
+50-            sample.loss_mask = [1] * sample.response_length
+51-        if sample.rollout_log_probs is None:
+52-            sample.rollout_log_probs = [0.0] * sample.response_length
+53-
+54-    def _merge_optional_per_token(field):
+55-        # Optional OPD per-token lists (teacher_log_probs, opd_reverse_kl): merge like
+56-        # rollout_log_probs when present (zeros over the injected observation span), else keep None.
+57-        av, bv = getattr(a, field), getattr(b, field)
+58-        if av is None and bv is None:
+59-            return None
+60-        av = av if av is not None else [0.0] * a.response_length
+61-        bv = bv if bv is not None else [0.0] * b.response_length
+62-        return av + [0.0] * obs_len + bv
+63-
+64-    def _pop_opd_student_top_logprobs(metadata):
+65-        if metadata is None:
+66-            return None, None
+67-        metadata = deepcopy(metadata)
+68-        top_logprobs = metadata.pop(_OPD_STUDENT_TOP_LOGPROBS_KEY, None)
+69-        return metadata, top_logprobs
+70-
+71-    def _merge_opd_student_top_logprobs(av, bv):
+72-        if av is None and bv is None:
+73-            return None
+74-        assert av is not None and bv is not None, (
+75-            f"{_OPD_STUDENT_TOP_LOGPROBS_KEY} must be present on both samples when merging top-k OPD metadata: "
+76-            f"a has {av is not None}, b has {bv is not None}"
+77-        )
+78-        assert len(av) == a.response_length, (
+79-            f"{_OPD_STUDENT_TOP_LOGPROBS_KEY} length mismatch: "
+80-            f"a.{_OPD_STUDENT_TOP_LOGPROBS_KEY} has length {len(av)}, "
+81-            f"a.response_length={a.response_length}"
+82-        )
+83-        assert len(bv) == b.response_length, (
+84-            f"{_OPD_STUDENT_TOP_LOGPROBS_KEY} length mismatch: "
+85-            f"b.{_OPD_STUDENT_TOP_LOGPROBS_KEY} has length {len(bv)}, "
+86-            f"b.response_length={b.response_length}"
+87-        )
+88-        return av + [[] for _ in range(obs_len)] + bv
+89-
+90-    def _pop_lifecycle(metadata):
+91-        if not metadata or "lifecycle" not in metadata:
+92-            return metadata, []
+93-        value = metadata["lifecycle"]
+94-        rest = {k: v for k, v in metadata.items() if k != "lifecycle"}
+95-        return rest, value if isinstance(value, list) else [value]
+96-
+97-    def _pop_messages(metadata):
+98-        if not metadata or "messages" not in metadata:
+99-            return metadata, None

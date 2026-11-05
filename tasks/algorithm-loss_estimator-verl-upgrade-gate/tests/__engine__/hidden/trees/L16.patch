@@ -1,0 +1,40 @@
+diff -ruN '--exclude=__pycache__' base/verl/workers/utils/padding.py L16/verl/workers/utils/padding.py
+--- base/verl/workers/utils/padding.py	2026-10-12 11:39:31.000000000 +0000
++++ L16/verl/workers/utils/padding.py	2026-11-02 17:52:18.763934279 +0000
+@@ -94,6 +94,16 @@
+     return data
+ 
+ 
++def _shifted_response(values: torch.Tensor, seq_end, resp_len) -> torch.Tensor:
++    """Rows of a packed model output that score one sequence's response tokens.
++
++    Row t of the model output predicts token t + 1, so the ``resp_len`` response tokens that end the sequence at
++    ``seq_end`` are scored by the ``resp_len`` rows that end one row earlier.
++    """
++    start = seq_end - resp_len - 1
++    return values[start : start + resp_len]
++
++
+ def no_padding_2_padding(tensor: torch.Tensor, data: TensorDict) -> torch.Tensor:
+     """Slice response from unpad model output.
+ 
+@@ -134,8 +144,7 @@
+     skip_padding = (0, 0) * (values.ndim - 1)
+     for resp_len, seq_offset in zip(response_lens, sequence_offsets, strict=True):
+         pad_size = max_response_len - resp_len
+-        # left-shift model output by one token for log_probs/values
+-        response_list.append(F.pad(values[seq_offset - resp_len - 1 : seq_offset - 1], (*skip_padding, 0, pad_size)))
++        response_list.append(F.pad(_shifted_response(values, seq_offset, resp_len), (*skip_padding, 0, pad_size)))
+ 
+     output = torch.stack(response_list, dim=0)
+     return output
+@@ -205,8 +214,7 @@
+     response_lens = response_mask.offsets().diff()
+     response_list = []
+     for resp_len, seq_offset in zip(response_lens, offsets[1:], strict=True):
+-        # left-shift model output by one token for log_probs/values
+-        response_list.append(values[seq_offset - resp_len - 1 : seq_offset - 1])
++        response_list.append(_shifted_response(values, seq_offset, resp_len))
+     return torch.nested.as_nested_tensor(response_list, layout=torch.jagged)
+ 
+ 

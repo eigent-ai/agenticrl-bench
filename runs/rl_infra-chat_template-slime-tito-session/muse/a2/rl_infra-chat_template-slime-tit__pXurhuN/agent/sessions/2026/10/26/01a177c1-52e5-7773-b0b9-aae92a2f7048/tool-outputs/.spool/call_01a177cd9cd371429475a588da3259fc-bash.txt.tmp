@@ -1,0 +1,56 @@
+/usr/local/lib/python3.12/site-packages/sglang/srt/managers/tokenizer_manager.py:789:                obj.sampling_params["max_new_tokens"] = max(
+/usr/local/lib/python3.12/site-packages/sglang/srt/managers/io_struct.py:875:            self.sampling_params["max_new_tokens"] = 0
+/usr/local/lib/python3.12/site-packages/sglang/srt/entrypoints/openai/serving_responses.py:1319:                    sampling_params["max_new_tokens"] = max(remaining_tokens, 1)
+/usr/local/lib/python3.12/site-packages/sglang/srt/entrypoints/ollama/serving.py:64:            sampling_params["max_new_tokens"] = 2048
+/usr/local/lib/python3.12/site-packages/sglang/srt/sampling/sampling_params.py:42:        max_new_tokens: int = 128,
+                        )
+                        generators.append(
+                            self._wait_one_response(tmp_obj, state, request)
+                        )
+                        rids.append(tmp_obj.rid)
+        else:
+            # FIXME: When using batch and parallel_sample_num together, the perf is not optimal.
+            if batch_size > 128:
+                logger.warning(
+                    "Sending a single large batch with parallel sampling (n > 1) has not been well optimized. "
+                    "The performance might be better if you just duplicate the requests n times or use "
+                    "many threads to send them one by one with parallel sampling (n > 1)."
+                )
+
+            # Tokenize all requests
+            objs = [obj[i] for i in range(batch_size)]
+            tokenized_objs = await asyncio.gather(
+                *(self._tokenize_one_request(obj) for obj in objs)
+            )
+
+            # Cache the common prefix for parallel sampling
+            for i in range(batch_size):
+                tmp_obj = copy.copy(objs[i])
+                tokenized_obj = copy.copy(tokenized_objs[i])
+                tokenized_obj.rid = tmp_obj.regenerate_rid()
+                tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
+                tokenized_obj.sampling_params.max_new_tokens = 0
+                tokenized_obj.stream = False
+                state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                await self._wait_one_response(tmp_obj, state, request).__anext__()
+
+            # Expand requests, assign new rids for them, and send them
+            for i in range(batch_size):
+                for _ in range(obj.parallel_sample_num):
+                    tmp_obj = copy.copy(objs[i])
+                    tokenized_obj = copy.copy(tokenized_objs[i])
+                    tokenized_obj.rid = tmp_obj.regenerate_rid()
+                    state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                    generators.append(self._wait_one_response(tmp_obj, state, request))
+                    rids.append(tmp_obj.rid)
+
+        # Wait for all requests
+        is_stream = hasattr(obj, "stream") and obj.stream
+        if not is_stream:
+            outputs = await asyncio.gather(*(gen.__anext__() for gen in generators))
+            yield outputs
+        else:
+            rid_to_index = {rid: i for i, rid in enumerate(rids)}
+            task_map = {asyncio.create_task(gen.__anext__()): gen for gen in generators}
+            while task_map:
+                done, _ = await asyncio.wait(

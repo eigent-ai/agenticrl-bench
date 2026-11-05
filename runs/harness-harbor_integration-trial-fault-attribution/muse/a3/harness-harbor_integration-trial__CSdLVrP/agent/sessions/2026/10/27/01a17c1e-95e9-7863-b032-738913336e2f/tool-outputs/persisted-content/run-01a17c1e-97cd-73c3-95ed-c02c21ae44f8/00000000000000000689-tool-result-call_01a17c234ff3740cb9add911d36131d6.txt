@@ -1,0 +1,143 @@
+Read text file `/app/reference/harbor-0.23.0/harbor/agents/installed/base.py`.
+(894 line(s) above)
+895|            tuple[int, re.Pattern[str], type[NonZeroAgentExitCodeError]] | None
+896|        ) = None
+897|        for compiled, exception in self._compiled_error_patterns:
+898|            if skip_asr and exception is AgentSafetyRefusalError:
+899|                continue
+900|            for match in compiled.finditer(output):
+901|                if last_match is None or match.end() > last_match[0]:
+902|                    last_match = (match.end(), compiled, exception)
+903|
+904|        if last_match is not None:
+905|            _, compiled, exception = last_match
+906|            self.logger.debug(
+907|                f"Classified failed command as {exception.__name__} "
+908|                f"(pattern: {compiled.pattern!r})"
+909|            )
+910|            return exception(detail)
+911|        return NonZeroAgentExitCodeError(detail)
+912|
+913|    async def _exec(
+914|        self,
+915|        environment: BaseEnvironment,
+916|        command: str,
+917|        user: str | int | None = None,
+918|        env: dict[str, str] | None = None,
+919|        cwd: str | None = None,
+920|        timeout_sec: int | None = None,
+921|    ) -> Any:
+922|        """Execute a command with logging and error handling.
+923|
+924|        Agent ``extra_env`` is wired into the real environment by ``Trial`` with
+925|        a scoped exec-env context. Keeping this method limited to per-exec env
+926|        preserves one precedence rule for both installed and import-path agents.
+927|
+928|        Returns the ExecResult on success, raises RuntimeError on failure.
+929|        """
+930|        self.logger.debug(
+931|            f"Running command: {self._redact_command(command)}",
+932|            extra={
+933|                "user": str(user),
+934|                # Whether a formatter renders this extra is configuration-
+935|                # dependent, so credentials (API keys etc.) are redacted
+936|                # before they reach the logging layer at all.
+937|                "env": {
+938|                    key: redact_sensitive_value(value)
+939|                    if is_sensitive_env_key(key)
+940|                    else value
+941|                    for key, value in (env or {}).items()
+942|                },
+943|            },
+944|        )
+945|
+946|        result = await environment.exec(
+947|            command=f"set -o pipefail; {command}",
+948|            user=user,
+949|            env=env,
+950|            cwd=cwd,
+951|            timeout_sec=timeout_sec,
+952|        )
+953|        if result.return_code != 0:
+954|            self.logger.debug(
+955|                "Command failed",
+956|                extra={
+957|                    "return_code": result.return_code,
+958|                    "stdout": self._truncate_output(result.stdout),
+959|                    "stderr": self._truncate_output(result.stderr),
+960|                },
+961|            )
+962|            raise self._classify_exec_error(command, result)
+963|
+964|        self.logger.debug(
+965|            "Command outputs captured",
+966|            extra={
+967|                "stdout": self._truncate_output(result.stdout),
+968|                "stderr": self._truncate_output(result.stderr),
+969|            },
+970|        )
+971|        return result
+972|
+973|    async def exec_as_root(
+974|        self,
+975|        environment: BaseEnvironment,
+976|        command: str,
+977|        env: dict[str, str] | None = None,
+978|        cwd: str | None = None,
+979|        timeout_sec: int | None = None,
+980|    ) -> Any:
+981|        """Execute a command as root (for system packages, symlinks, etc.)."""
+982|        return await self._exec(
+983|            environment, command, user="root", env=env, cwd=cwd, timeout_sec=timeout_sec
+984|        )
+985|
+986|    async def exec_as_agent(
+987|        self,
+988|        environment: BaseEnvironment,
+989|        command: str,
+990|        env: dict[str, str] | None = None,
+991|        cwd: str | None = None,
+992|        timeout_sec: int | None = None,
+993|    ) -> Any:
+994|        """Execute a command as the default agent user."""
+995|        return await self._exec(
+996|            environment, command, env=env, cwd=cwd, timeout_sec=timeout_sec
+997|        )
+998|
+999|    async def _upload_config_text(
+1000|        self,
+1001|        environment: BaseEnvironment,
+1002|        *,
+1003|        content: str,
+1004|        remote_path: str,
+1005|        filename: str,
+1006|    ) -> None:
+1007|        """Upload rendered agent configuration with private file permissions."""
+1008|        with tempfile.TemporaryDirectory(prefix="harbor-agent-config-") as temp_dir:
+1009|            local_path = Path(temp_dir) / filename
+1010|            local_path.write_text(content)
+1011|            await environment.upload_file(local_path, remote_path)
+1012|
+1013|        if environment.default_user is not None:
+1014|            owner = shlex.quote(str(environment.default_user))
+1015|            quoted_remote_path = shlex.quote(remote_path)
+1016|            await self.exec_as_root(
+1017|                environment,
+1018|                command=(
+1019|                    f"chown {owner} {quoted_remote_path} && "
+1020|                    f"chmod 600 {quoted_remote_path}"
+1021|                ),
+1022|            )
+1023|
+1024|    def render_instruction(self, instruction: str) -> str:
+1025|        """Render the instruction through the prompt template, if configured."""
+1026|        if self._prompt_template_path:
+1027|            return render_prompt_template(self._prompt_template_path, instruction)
+1028|        return instruction
+1029|
+1030|    @abstractmethod
+1031|    async def install(self, environment: BaseEnvironment) -> None:
+1032|        """Install the agent in the environment.
+1033|
+1034|        Use ``exec_as_root`` for system packages and ``exec_as_agent``
+(more lines below)

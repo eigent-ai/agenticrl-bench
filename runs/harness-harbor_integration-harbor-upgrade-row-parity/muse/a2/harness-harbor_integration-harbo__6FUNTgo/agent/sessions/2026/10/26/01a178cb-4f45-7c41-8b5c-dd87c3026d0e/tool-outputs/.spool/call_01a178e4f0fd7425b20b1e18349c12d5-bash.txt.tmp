@@ -1,0 +1,60 @@
+305:                **self._build_base_kwargs(logging_path),
+306-                "messages": messages,
+307-                "response_format": response_format,
+308-                "reasoning_effort": self._reasoning_effort,
+309-            }
+310-            if self._temperature is not None:
+311-                completion_kwargs["temperature"] = self._temperature
+312-
+313-            # Add logprobs and return_token_ids if rollout details collection is enabled
+314-            if self._collect_rollout_details:
+315-                completion_kwargs["logprobs"] = True
+316-                # Request token IDs from provider (supported by vLLM)
+317-                # Note: Some providers (e.g., OpenAI) will reject this parameter, but we'll catch and retry without it
+318-                if "extra_body" not in completion_kwargs:
+319-                    completion_kwargs["extra_body"] = {}
+320-                extra_body: dict[str, Any] = completion_kwargs["extra_body"]  # ty: ignore[invalid-assignment]
+321-                extra_body["return_token_ids"] = True
+322-
+323-            # Add any additional kwargs, deep-merging extra_body to preserve
+324-            # internally-set fields (e.g., return_token_ids) when caller also
+325-            # passes extra_body via llm_call_kwargs.
+326-            if "extra_body" in completion_kwargs and "extra_body" in kwargs:
+327-                existing_extra_body: dict[str, Any] = completion_kwargs["extra_body"]  # ty: ignore[invalid-assignment]
+328-                new_extra_body: dict[str, Any] = kwargs.pop("extra_body")
+329-                completion_kwargs["extra_body"] = {
+330-                    **existing_extra_body,
+331-                    **new_extra_body,
+332-                }
+333-            elif "extra_body" in kwargs:
+334-                kwargs["extra_body"] = {**kwargs["extra_body"]}
+335-            completion_kwargs.update(kwargs)
+336-
+337-            # Add thinking parameter for Anthropic models if max_thinking_tokens is set
+338-            if self._max_thinking_tokens is not None and (
+339-                "anthropic" in self._model_name.lower()
+340-                or "claude" in self._model_name.lower()
+341-            ):
+342-                budget = self._max_thinking_tokens
+343-                if budget < 1024:
+344-                    self._logger.warning(
+345-                        f"max_thinking_tokens={budget} is below minimum of 1024. "
+--
+643:    def _build_base_kwargs(self, logging_path: Path | None = None) -> dict[str, Any]:
+644-        """Build the base kwargs shared by both completion and responses API calls."""
+645-        logger_fn = (
+646-            self._init_logger_fn(logging_path) if logging_path is not None else None
+647-        )
+648-        return {
+649-            **self._llm_kwargs,
+650-            "model": self._model_name,
+651-            "drop_params": True,
+652-            "logger_fn": logger_fn,
+653-            "api_base": self._api_base,
+654-        }
+655-
+656-    def _is_context_length_error(self, error: LiteLLMBadRequestError) -> bool:
+657-        """Check provider error payloads for context-length overflow signals."""
+658-
+659-        parts = [
+660-            str(error),

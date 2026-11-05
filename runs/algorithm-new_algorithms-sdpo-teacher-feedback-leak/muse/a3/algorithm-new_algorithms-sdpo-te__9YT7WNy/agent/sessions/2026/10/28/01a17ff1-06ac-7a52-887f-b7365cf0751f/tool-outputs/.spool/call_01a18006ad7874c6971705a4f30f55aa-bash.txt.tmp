@@ -1,0 +1,152 @@
+total 82
+drwxr-xr-x 1 root root   100 Oct 28 00:46 .
+drwxr-xr-x 1 root root    60 Oct 28 00:42 ..
+-rw-r--r-- 1 root root   556 Jul  1 13:51 .git-blame-ignore-revs
+-rw-r--r-- 1 root root  1420 Jul  1 13:51 .gitignore
+-rw-r--r-- 1 root root    91 Jul  1 13:51 .gitmodules
+drwxr-xr-x 1 root root   120 Oct 28 00:46 .pytest_cache
+-rw-r--r-- 1 root root   333 Jul  1 13:51 .readthedocs.yaml
+-rw-r--r-- 1 root root  1333 Jul  1 13:51 Dockerfile
+-rw-r--r-- 1 root root   989 Jul  1 13:51 Dockerfile.gh200
+-rw-r--r-- 1 root root  3034 Jul  1 13:51 INSTALL.md
+-rw-r--r-- 1 root root 11358 Jul  1 13:51 LICENSE
+-rw-r--r-- 1 root root 14404 Jul  1 13:51 README.md
+drwxr-xr-x 1 root root    26 Jul  1 13:51 baseline_multiturn
+drwxr-xr-x 1 root root   168 Jul  1 13:51 data
+drwxr-xr-x 1 root root    40 Jul  1 13:51 datasets
+drwxr-xr-x 1 root root  4096 Jul  1 13:51 docker
+drwxr-xr-x 1 root root  4096 Jul  1 13:51 docs
+drwxr-xr-x 1 root root  4096 Jul  1 13:51 examples
+drwxr-xr-x 1 root root    76 Jul  1 13:51 experiments
+drwxr-xr-x 1 root root   190 Jul  1 13:51 figures
+-rw-r--r-- 1 root root  3162 Jul  1 13:51 pyproject.toml
+-rw-r--r-- 1 root root    10 Jul  1 13:51 requirements-cuda.txt
+-rw-r--r-- 1 root root  5150 Jul  1 13:51 requirements-full.txt
+-rw-r--r-- 1 root root  4069 Jul  1 13:51 requirements-gh200.txt
+-rw-r--r-- 1 root root   317 Jul  1 13:51 requirements-npu.txt
+-rw-r--r-- 1 root root    61 Jul  1 13:51 requirements-test.txt
+-rw-r--r-- 1 root root   801 Jul  1 13:51 requirements.txt
+-rw-r--r-- 1 root root   320 Jul  1 13:51 requirements_sglang.txt
+-rwxr-xr-x 1 root root  2098 Jul  1 13:51 run_local_grpo.sh
+-rwxr-xr-x 1 root root  2472 Jul  1 13:51 run_local_sdpo.sh
+-rwxr-xr-x 1 root root  2742 Jul  1 13:51 run_local_test.sh
+drwxr-xr-x 1 root root  4096 Jul  1 13:51 scripts
+-rw-r--r-- 1 root root  3004 Jul  1 13:51 setup.py
+drwxr-xr-x 1 root root    60 Oct 28 00:45 tests
+drwxr-xr-x 1 root root    30 Jul  1 13:51 training
+drwxr-xr-x 1 root root    60 Oct 28 00:42 verl
+drwxr-xr-x 1 root root   110 Jul  1 13:51 verl.egg-info
+---
+# -------------------------------
+# build-system
+# -------------------------------
+[build-system]
+requires = [
+    "setuptools>=61.0",
+    "wheel"
+]
+build-backend = "setuptools.build_meta"
+
+# -------------------------------
+# project (PEP 621 metadata)
+# -------------------------------
+[project]
+name = "verl"
+# We'll mark the version as "dynamic" because it's read from the file "verl/version/version" 
+# (PEP 621 calls this "dynamic version"). 
+# The actual version is specified in the [tool.setuptools.dynamic] section below.
+dynamic = ["version", "dependencies", "optional-dependencies", "authors", "urls"]
+
+description = "verl: Volcano Engine Reinforcement Learning for LLM"
+license = {text = "Apache-2.0"}  # Changed from file to text format
+readme = {file = "README.md", content-type = "text/markdown"}
+requires-python = ">=3.10"
+
+# -------------------------------
+# tool.ruff - Linting configuration
+# -------------------------------
+[tool.ruff]
+# Note: While the formatter will attempt to format lines such that they remain within the line-length,
+# it isn't a hard upper bound, and formatted lines may exceed the line-length.
+line-length = 120
+exclude = ["scripts/legacy_model_merger.py"]
+
+[tool.ruff.lint]
+isort = {known-first-party = ["verl"]}
+# c.f. https://github.com/vllm-project/vllm/blob/ce8d6b75fc0586045df75ee1568a5b5f9957251b/pyproject.toml
+select = [
+    # pycodestyle
+    "E",
+    # Pyflakes
+    "F",
+    # pyupgrade
+    "UP",
+    # flake8-bugbear
+    "B",
+    # isort
+    "I",
+    "G",
+]
+ignore = [
+    # star imports
+    "F405", "F403",
+    # lambda expression assignment
+    "E731",
+    # Loop control variable not used within loop body
+    "B007",
+    # f-string format
+    "UP032",
+    # `.log()` statement uses f-string
+    "G004",
+    # X | None for type annotations
+    "UP045",
+    # deprecated import
+    "UP035",
+]
+
+# -------------------------------
+# tool.mypy - typechecking config
+# -------------------------------
+[tool.mypy]
+pretty            = true
+ignore_missing_imports = true
+explicit_package_bases = true
+follow_imports = "skip"
+
+# Blanket silence
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = [
+"verl.trainer.config.algorithm",
+"verl.trainer.ppo.core_algos",
+"verl.trainer.ppo.reward",
+"verl.workers.reward_manager",
+"verl.workers.reward_manager.*",
+]
+ignore_errors = false
+
+# -------------------------------
+# tool.setuptools - Additional config
+# -------------------------------
+[tool.setuptools]
+# True means `setuptools` will attempt to include all relevant files in package_data automatically.
+# This corresponds to `include_package_data=True` in setup.py.
+include-package-data = true
+
+# We read the version from a file in 'verl/version/version'
+[tool.setuptools.dynamic]
+version = {file = "verl/version/version"}
+
+# If you need to mimic `package_dir={'': '.'}`:
+[tool.setuptools.package-dir]
+"" = "."
+
+# If you need to include specific non-Python data (like YAML files or version file):
+# This is the rough equivalent of package_data={'': ['version/*'], 'verl': ['trainer/config/*.yaml']}
+[tool.setuptools.package-data]
+verl = [
+  "version/*",
+  "trainer/config/*.yaml",
+  "trainer/config/*/*.yaml",
+]

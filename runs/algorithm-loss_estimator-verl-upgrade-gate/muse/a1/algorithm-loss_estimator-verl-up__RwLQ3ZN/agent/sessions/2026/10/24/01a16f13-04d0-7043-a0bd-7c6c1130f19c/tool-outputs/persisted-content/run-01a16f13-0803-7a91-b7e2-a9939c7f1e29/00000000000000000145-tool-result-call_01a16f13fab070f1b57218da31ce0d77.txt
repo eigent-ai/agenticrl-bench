@@ -1,0 +1,452 @@
+Read text file `/opt/verl/verl/trainer/ppo/core_algos.py`.
+1|# Copyright 2024 Bytedance Ltd. and/or its affiliates
+2|# Copyright 2022 The HuggingFace Team. All rights reserved.
+3|#
+4|# Licensed under the Apache License, Version 2.0 (the "License");
+5|# you may not use this file except in compliance with the License.
+6|# You may obtain a copy of the License at
+7|#
+8|#     http://www.apache.org/licenses/LICENSE-2.0
+9|#
+10|# Unless required by applicable law or agreed to in writing, software
+11|# distributed under the License is distributed on an "AS IS" BASIS,
+12|# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+13|# See the License for the specific language governing permissions and
+14|# limitations under the License.
+15|"""
+16|Core functions to implement PPO algorithms.
+17|The function implemented in this file should be used by trainer with different distributed strategies to
+18|implement PPO-like algorithms.
+19|"""
+20|
+21|__all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
+22|
+23|from collections import defaultdict
+24|from enum import Enum
+25|from typing import Any, Callable, Optional
+26|
+27|import numpy as np
+28|import torch
+29|from omegaconf import DictConfig
+30|
+31|import verl.utils.torch_functional as verl_F
+32|from verl.trainer.config import AlgoConfig
+33|from verl.utils import as_torch_index, group_mean_std
+34|from verl.utils.import_utils import deprecated
+35|from verl.workers.config import ActorConfig
+36|
+37|PolicyLossFn = Callable[
+38|    [
+39|        torch.Tensor,  # old_log_prob
+40|        torch.Tensor,  # log_prob
+41|        torch.Tensor,  # advantages
+42|        torch.Tensor,  # response_mask
+43|        str,  # loss_agg_mode
+44|        Optional[DictConfig | ActorConfig],  # config
+45|        torch.Tensor | None,  # rollout_log_probs
+46|    ],
+47|    tuple[torch.Tensor, dict[str, Any]],
+48|]
+49|
+50|POLICY_LOSS_REGISTRY: dict[str, PolicyLossFn] = {}
+51|
+52|
+53|def register_policy_loss(name: str) -> Callable[[PolicyLossFn], PolicyLossFn]:
+54|    """Register a policy loss function with the given name.
+55|
+56|    Args:
+57|        name (str): The name to register the policy loss function under.
+58|
+59|    Returns:
+60|        function: Decorator function that registers the policy loss function.
+61|    """
+62|
+63|    def decorator(func: PolicyLossFn) -> PolicyLossFn:
+64|        POLICY_LOSS_REGISTRY[name] = func
+65|        return func
+66|
+67|    return decorator
+68|
+69|
+70|def get_policy_loss_fn(name):
+71|    """Get the policy loss with a given name.
+72|
+73|    Args:
+74|        name: `(str)`
+75|            The name of the policy loss.
+76|
+77|    Returns:
+78|        `(callable)`: The policy loss function.
+79|    """
+80|    loss_name = name
+81|    if loss_name not in POLICY_LOSS_REGISTRY:
+82|        raise ValueError(
+83|            f"Unsupported loss mode: {loss_name}. Supported modes are: {list(POLICY_LOSS_REGISTRY.keys())}"
+84|        )
+85|    return POLICY_LOSS_REGISTRY[loss_name]
+86|
+87|
+88|class AdvantageEstimator(str, Enum):
+89|    """Using an enumeration class to avoid spelling errors in adv_estimator.
+90|
+91|    Note(haibin.lin): this enum class is immutable after creation. Extending this
+92|    enum for new estimators may not be necessary since users can always just call
+93|    `verl.trainer.ppo.core_algos.register` with string name for a custom advantage
+94|    estimator instead.
+95|    """
+96|
+97|    GAE = "gae"
+98|    GRPO = "grpo"
+99|    REINFORCE_PLUS_PLUS = "reinforce_plus_plus"
+100|    REINFORCE_PLUS_PLUS_BASELINE = "reinforce_plus_plus_baseline"
+101|    REMAX = "remax"
+102|    RLOO = "rloo"
+103|    OPO = "opo"
+104|    GRPO_PASSK = "grpo_passk"
+105|    GPG = "gpg"
+106|    RLOO_VECTORIZED = "rloo_vectorized"
+107|    GRPO_VECTORIZED = "grpo_vectorized"
+108|    OPTIMAL_TOKEN_BASELINE = "optimal_token_baseline"
+109|    TIR_OPTIMAL_TOKEN_BASELINE = "tir_optimal_token_baseline"
+110|    GDPO = "gdpo"
+111|
+112|
+113|ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
+114|
+115|
+116|def register_adv_est(name_or_enum: str | AdvantageEstimator) -> Any:
+117|    """Decorator to register a advantage estimator function with a given name.
+118|
+119|    Args:
+120|        name_or_enum: `(str)` or `(AdvantageEstimator)`
+121|            The name or enum of the advantage estimator.
+122|
+123|    """
+124|
+125|    def decorator(fn):
+126|        name = name_or_enum.value if isinstance(name_or_enum, Enum) else name_or_enum
+127|        if name in ADV_ESTIMATOR_REGISTRY and ADV_ESTIMATOR_REGISTRY[name] != fn:
+128|            raise ValueError(
+129|                f"Adv estimator {name} has already been registered: {ADV_ESTIMATOR_REGISTRY[name]} vs {fn}"
+130|            )
+131|        ADV_ESTIMATOR_REGISTRY[name] = fn
+132|        return fn
+133|
+134|    return decorator
+135|
+136|
+137|def get_adv_estimator_fn(name_or_enum):
+138|    """Get the advantage estimator function with a given name.
+139|
+140|    Args:
+141|        name_or_enum: `(str)` or `(AdvantageEstimator)`
+142|            The name or enum of the advantage estimator.
+143|
+144|    Returns:
+145|        `(callable)`: The advantage estimator function.
+146|    """
+147|    name = name_or_enum.value if isinstance(name_or_enum, Enum) else name_or_enum
+148|    if name not in ADV_ESTIMATOR_REGISTRY:
+149|        raise ValueError(f"Unknown advantage estimator simply: {name}")
+150|    return ADV_ESTIMATOR_REGISTRY[name]
+151|
+152|
+153|class AdaptiveKLController:
+154|    """
+155|    Adaptive KL controller described in the paper:
+156|    https://arxiv.org/pdf/1909.08593.pdf
+157|    """
+158|
+159|    def __init__(self, init_kl_coef, target_kl, horizon):
+160|        self.value = init_kl_coef
+161|        self.target = target_kl
+162|        self.horizon = horizon
+163|
+164|    def update(self, current_kl, n_steps):
+165|        """Update the KL coefficient based on current KL divergence.
+166|
+167|        Args:
+168|            current_kl (float): Current KL divergence value.
+169|            n_steps (int): Number of steps taken.
+170|        """
+171|        target = self.target
+172|        proportional_error = np.clip(current_kl / target - 1, -0.2, 0.2)
+173|        mult = 1 + proportional_error * n_steps / self.horizon
+174|        self.value *= mult
+175|
+176|
+177|class FixedKLController:
+178|    """Fixed KL controller."""
+179|
+180|    def __init__(self, kl_coef):
+181|        self.value = kl_coef
+182|
+183|    def update(self, current_kl, n_steps):
+184|        """Update method for fixed KL controller (no-op).
+185|
+186|        Args:
+187|            current_kl (float): Current KL divergence value (unused).
+188|            n_steps (int): Number of steps taken (unused).
+189|        """
+190|        pass
+191|
+192|
+193|def get_kl_controller(kl_ctrl):
+194|    """Factory function to create appropriate KL controller based on configuration.
+195|
+196|    Args:
+197|        kl_ctrl: Configuration object containing KL controller settings.
+198|
+199|    Returns:
+200|        KL controller instance (FixedKLController or AdaptiveKLController).
+201|
+202|    Raises:
+203|        NotImplementedError: If controller type is not supported.
+204|        AssertionError: If adaptive controller horizon is not positive.
+205|    """
+206|    if kl_ctrl.type == "fixed":
+207|        return FixedKLController(kl_coef=kl_ctrl.kl_coef)
+208|    elif kl_ctrl.type == "adaptive":
+209|        assert kl_ctrl.horizon > 0, f"horizon must be larger than 0. Got {kl_ctrl.horizon}"
+210|        return AdaptiveKLController(init_kl_coef=kl_ctrl.kl_coef, target_kl=kl_ctrl.target_kl, horizon=kl_ctrl.horizon)
+211|    else:
+212|        raise NotImplementedError
+213|
+214|
+215|@register_adv_est(AdvantageEstimator.GAE)  # or simply: @register_adv_est("gae")
+216|def compute_gae_advantage_return(
+217|    token_level_rewards: torch.Tensor,
+218|    values: torch.Tensor,
+219|    response_mask: torch.Tensor,
+220|    gamma: torch.Tensor,
+221|    lam: torch.Tensor,
+222|):
+223|    """Adapted from https://github.com/huggingface/trl/blob/main/trl/trainer/ppo_trainer.py
+224|
+225|    Args:
+226|        token_level_rewards: `(torch.Tensor)`
+227|            shape is (bs, response_length)
+228|        values: `(torch.Tensor)`
+229|            shape is (bs, response_length)
+230|        response_mask: `(torch.Tensor)`
+231|            shape is (bs, response_length). [EOS] mask. The token after [EOS] have mask zero.
+232|        gamma is `(float)`
+233|            discounted factor used in RL
+234|        lam: `(float)`
+235|            lambda value when computing Generalized Advantage Estimation (https://arxiv.org/abs/1506.02438)
+236|
+237|    Returns:
+238|        advantages: `(torch.Tensor)`
+239|            shape: (bs, response_length)
+240|        Returns: `(torch.Tensor)`
+241|            shape: (bs, response_length)
+242|
+243|    """
+244|    with torch.no_grad():
+245|        nextvalues = 0
+246|        lastgaelam = 0
+247|        advantages_reversed = []
+248|        gen_len = token_level_rewards.shape[-1]
+249|
+250|        for t in reversed(range(gen_len)):
+251|            delta = token_level_rewards[:, t] + gamma * nextvalues - values[:, t]
+252|            lastgaelam_ = delta + gamma * lam * lastgaelam
+253|
+254|            # skip values and TD-error on observation tokens
+255|            nextvalues = values[:, t] * response_mask[:, t] + (1 - response_mask[:, t]) * nextvalues
+256|            lastgaelam = lastgaelam_ * response_mask[:, t] + (1 - response_mask[:, t]) * lastgaelam
+257|
+258|            advantages_reversed.append(lastgaelam)
+259|        advantages = torch.stack(advantages_reversed[::-1], dim=1)
+260|
+261|        returns = advantages + values
+262|        advantages = verl_F.masked_whiten(advantages, response_mask)
+263|    return advantages, returns
+264|
+265|
+266|# NOTE(sgm): this implementation only consider outcome supervision, where the reward is a scalar.
+267|@register_adv_est(AdvantageEstimator.GRPO)  # or simply: @register_adv_est("grpo")
+268|def compute_grpo_outcome_advantage(
+269|    token_level_rewards: torch.Tensor,
+270|    response_mask: torch.Tensor,
+271|    index: np.ndarray,
+272|    epsilon: float = 1e-6,
+273|    norm_adv_by_std_in_grpo: bool = True,
+274|    config: Optional[AlgoConfig] = None,
+275|) -> tuple[torch.Tensor, torch.Tensor]:
+276|    """
+277|    Compute advantage for GRPO, operating only on Outcome reward
+278|    (with only one scalar reward for each response).
+279|
+280|    Args:
+281|        token_level_rewards: `(torch.Tensor)`
+282|            shape is (bs, response_length)
+283|        response_mask: `(torch.Tensor)`
+284|            shape is (bs, response_length)
+285|        index: `(np.ndarray)`
+286|            index array for grouping
+287|        epsilon: `(float)`
+288|            small value to avoid division by zero
+289|        norm_adv_by_std_in_grpo: `(bool)`
+290|            whether to scale the GRPO advantage
+291|        config: `(Optional[AlgoConfig])`
+292|            algorithm configuration object
+293|
+294|    Note:
+295|        If norm_adv_by_std_in_grpo is True, the advantage is scaled by the std, as in the original GRPO.
+296|        If False, the advantage is not scaled, as in Dr.GRPO (https://arxiv.org/abs/2503.20783).
+297|
+298|    Returns:
+299|        advantages: `(torch.Tensor)`
+300|            shape is (bs, response_length)
+301|        Returns: `(torch.Tensor)`
+302|            shape is (bs, response_length)
+303|    """
+304|    scores = token_level_rewards.sum(dim=-1)
+305|
+306|    id2score = defaultdict(list)
+307|    id2mean = {}
+308|    id2std = {}
+309|
+310|    with torch.no_grad():
+311|        bsz = scores.shape[0]
+312|        for i in range(bsz):
+313|            id2score[index[i]].append(scores[i])
+314|        for idx in id2score:
+315|            if len(id2score[idx]) == 1:
+316|                id2mean[idx] = torch.tensor(0.0)
+317|                id2std[idx] = torch.tensor(1.0)
+318|            elif len(id2score[idx]) > 1:
+319|                scores_tensor = torch.stack(id2score[idx])
+320|                id2mean[idx] = torch.mean(scores_tensor)
+321|                id2std[idx] = torch.std(scores_tensor)
+322|            else:
+323|                raise ValueError(f"no score in prompt index: {idx}")
+324|        for i in range(bsz):
+325|            if norm_adv_by_std_in_grpo:
+326|                scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+327|            else:
+328|                scores[i] = scores[i] - id2mean[index[i]]
+329|        scores = scores.unsqueeze(-1) * response_mask
+330|
+331|    return scores, scores
+332|
+333|
+334|@register_adv_est(AdvantageEstimator.GRPO_VECTORIZED)
+335|def compute_grpo_vectorized_outcome_advantage(
+336|    token_level_rewards: torch.Tensor,
+337|    response_mask: torch.Tensor,
+338|    index: np.ndarray,
+339|    epsilon: float = 1e-6,
+340|    norm_adv_by_std_in_grpo: bool = True,
+341|    config: Optional[AlgoConfig] = None,
+342|) -> tuple[torch.Tensor, torch.Tensor]:
+343|    """
+344|    Vectorized GRPO（outcome-only）:
+345|      For each group g:
+346|      a_i = \\frac{r_i - \\mu_g}{\\sigma_g} (or without dividing by \\sigma_g),
+347|      then broadcast the scalar across the token dimension (multiplied by response_mask).。
+348|    """
+349|    with torch.no_grad():
+350|        scores = token_level_rewards.sum(dim=-1)
+351|        g = as_torch_index(index, device=scores.device)
+352|        mean_g, std_g, _ = group_mean_std(scores, g, eps=0.0, device=scores.device)
+353|        if norm_adv_by_std_in_grpo:
+354|            scalars = (scores - mean_g[g]) / (std_g[g] + epsilon)
+355|        else:
+356|            scalars = scores - mean_g[g]
+357|        advantages = scalars.unsqueeze(-1) * response_mask
+358|        return advantages, advantages
+359|
+360|
+361|@register_adv_est(AdvantageEstimator.GDPO)  # or simply: @register_adv_est("gdpo")
+362|def compute_gdpo_outcome_advantage(
+363|    token_level_rewards: torch.Tensor,
+364|    response_mask: torch.Tensor,
+365|    index: np.ndarray,
+366|    epsilon: float = 1e-6,
+367|    norm_adv_by_std_in_grpo: bool = True,
+368|    config: Optional[AlgoConfig] = None,
+369|    non_tensor_batch: Optional[dict] = None,
+370|    batch: Optional[dict] = None,
+371|    **kwargs,
+372|) -> tuple[torch.Tensor, torch.Tensor]:
+373|    """
+374|    GDPO: Group reward-Decoupled Normalization Policy Optimization.
+375|
+376|    Instead of summing all reward dimensions first (like GRPO), GDPO normalizes
+377|    each reward dimension independently within each group before aggregation.
+378|    This prevents a dominant reward signal from drowning out weaker ones.
+379|
+380|    Mathematical formulation:
+381|        Step 1 – Group-wise decoupled normalization (via GRPO per dimension):
+382|            For each reward dimension k, within each group g:
+383|            A_k = (r_k - μ_group(r_k)) / (σ_group(r_k) + ε)
+384|
+385|        Step 2 – Weighted aggregation:
+386|            A_sum = Σ_k w_k · A_k
+387|
+388|        Step 3 – Batch-level normalization (via masked_whiten):
+389|            A_final = whiten(A_sum, response_mask)
+390|
+391|    Args:
+392|        token_level_rewards: (bs, response_length) – standard token-level rewards.
+393|            Used as fallback when per-dimension rewards are not provided.
+394|        response_mask: (bs, response_length)
+395|        index: (bs,) – group id per sample (from ``uid``).
+396|        epsilon: Numerical stability constant.
+397|        norm_adv_by_std_in_grpo: Whether to normalize by std in GRPO.
+398|        config: Algorithm configuration (optional).
+399|        non_tensor_batch: Non-tensor batch data containing per-dimension reward scores.
+400|        batch: Batch data containing prompts, attention_mask, etc.
+401|
+402|    Note:
+403|        Ref GDPO (https://arxiv.org/abs/2601.05242).
+404|
+405|    Returns:
+406|        advantages: (bs, response_length)
+407|        returns: (bs, response_length) – same as advantages (outcome-only).
+408|    """
+409|    score_list = None
+410|    reward_weights = None
+411|
+412|    if config is not None and non_tensor_batch is not None and batch is not None:
+413|        gdpo_reward_keys = config.get("gdpo_reward_keys", None)
+414|        assert gdpo_reward_keys, (
+415|            "GDPO requires 'algorithm.gdpo_reward_keys' listing the individual reward "
+416|            "component keys returned by compute_score (e.g. ['format_reward', 'accuracy_reward'])."
+417|        )
+418|        device = token_level_rewards.device
+419|        prompt_length = batch["prompts"].size(1)
+420|        valid_response_length = batch["attention_mask"][:, prompt_length:].sum(dim=1) - 1
+421|
+422|        score_list = []
+423|        for key in gdpo_reward_keys:
+424|            assert key in non_tensor_batch, (
+425|                f"GDPO reward key '{key}' not found in non_tensor_batch. "
+426|                f"Available keys: {list(non_tensor_batch.keys())}. "
+427|                f"Make sure your compute_score returns a dict containing '{key}'."
+428|            )
+429|            comp = non_tensor_batch[key]
+430|            rm_score = torch.tensor(np.asarray(comp, dtype=np.float32), device=device)
+431|            rm_scores = torch.zeros_like(response_mask, dtype=torch.float32)
+432|            rm_scores[torch.arange(rm_scores.size(0), device=device), valid_response_length] = rm_score
+433|            score_list.append(rm_scores)
+434|
+435|        gdpo_weights = config.get("gdpo_reward_weights", None)
+436|        if gdpo_weights is not None:
+437|            reward_weights = list(gdpo_weights)
+438|
+439|    if score_list is None:
+440|        score_list = [token_level_rewards]
+441|
+442|    num_scores = len(score_list)
+443|
+444|    if reward_weights is not None:
+445|        weights = torch.tensor(reward_weights, dtype=torch.float32, device=token_level_rewards.device)
+446|    else:
+447|        weights = torch.ones(num_scores, dtype=torch.float32, device=token_level_rewards.device)
+448|
+449|    new_advantage = None
+450|
+(more lines below)

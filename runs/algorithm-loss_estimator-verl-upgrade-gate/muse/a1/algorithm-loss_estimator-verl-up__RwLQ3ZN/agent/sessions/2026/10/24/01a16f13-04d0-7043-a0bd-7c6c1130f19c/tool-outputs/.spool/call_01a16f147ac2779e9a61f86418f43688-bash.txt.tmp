@@ -1,0 +1,74 @@
+/opt/verl/verl/experimental/agent_loop/agent_loop.py
+/opt/verl/verl/experimental/fully_async_policy/fully_async_rollouter.py
+/opt/verl/verl/experimental/fully_async_policy/fully_async_trainer.py
+/opt/verl/verl/experimental/separation/engine_workers.py
+/opt/verl/verl/experimental/teacher_loop/teacher_manager.py
+/opt/verl/verl/experimental/teacher_loop/teacher_model.py
+/opt/verl/verl/trainer/distillation/fsdp/losses.py
+/opt/verl/verl/trainer/distillation/losses.py
+/opt/verl/verl/trainer/distillation/megatron/losses.py
+/opt/verl/verl/trainer/main_ppo_v0.py
+/opt/verl/verl/trainer/ppo/ray_trainer.py
+/opt/verl/verl/trainer/ppo/utils.py
+/opt/verl/verl/trainer/ppo/v1/trainer_base.py
+/opt/verl/verl/workers/config/__init__.py
+/opt/verl/verl/workers/config/distillation.py
+/opt/verl/verl/workers/engine/fsdp/transformer_impl.py
+/opt/verl/verl/workers/engine/megatron/transformer_impl.py
+/opt/verl/verl/workers/engine/veomni/transformer_impl.py
+/opt/verl/verl/workers/engine_workers.py
+/opt/verl/verl/workers/rollout/sglang_rollout/async_sglang_server.py
+187:def compute_advantage(
+1667:                        batch = compute_advantage(
+78:def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
+87:        kl_penalty (str, optional): Type of KL penalty to apply. Defaults to "kl".
+95:    token_level_scores = data.batch["token_level_scores"]
+99:    # When apply_kl_penalty, algorithm.use_kl_in_reward=True, so the reference model has been enabled.
+100:    kld = core_algos.kl_penalty(
+101:        data.batch["old_log_probs"], data.batch["ref_log_prob"], kl_penalty=kl_penalty
+106:    token_level_rewards = token_level_scores - beta * kld
+113:    data.batch["token_level_rewards"] = token_level_rewards
+115:    metrics = {"actor/reward_kl_penalty": current_kl, "actor/reward_kl_penalty_coeff": beta}
+187:def compute_advantage(
+221:            token_level_rewards=data.batch["token_level_rewards"],
+241:            token_level_rewards=data.batch["token_level_rewards"],
+252:            "token_level_rewards": data.batch["token_level_rewards"],
+272:            # old_log_probs needed for path-variance proxy: w_t = 1 - 2*exp(old_log_probs) + sum_pi_squared
+273:            adv_kwargs["old_log_probs"] = data.batch["old_log_probs"]
+364:        if self.config.algorithm.use_kl_in_reward:
+527:            scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+1290:    def _compute_old_log_prob(self, batch: DataProto):
+1311:        old_log_prob_mfu = tu.get(output, "metrics")["mfu"]
+1318:        result = {"old_log_probs": log_probs.float(), "entropys": entropy.float()}
+1323:        old_log_prob = tu.get_tensordict(result)
+1324:        old_log_prob = DataProto.from_tensordict(old_log_prob)
+1325:        return old_log_prob, old_log_prob_mfu
+1571:                    # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
+1572:                    # - Decoupled mode: Recomputes old_log_probs as proximal anchor (3 policies: π_rollout, π_old, π_θ)
+1574:                    rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+1575:                    bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+1576:                    if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
+1577:                        from verl.trainer.ppo.rollout_corr_helper import apply_bypass_mode
+1579:                        apply_bypass_mode(
+1584:                    else:  # Recompute old_log_probs
+1585:                        with marked_timer("old_log_prob", timing_raw, color="blue"):
+1586:                            old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+1587:                            entropys = old_log_prob.batch["entropys"]
+1596:                            old_log_prob_metrics = {
+1598:                                "perf/mfu/actor_infer": old_log_prob_mfu,
+1600:                            metrics.update(old_log_prob_metrics)
+1601:                            old_log_prob.batch.pop("entropys")
+1602:                            if "routed_experts" in batch.batch and "routed_experts" in old_log_prob.batch:
+1610:                            batch = batch.union(old_log_prob)
+1617:                    assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
+1633:                        batch.batch["token_level_scores"] = reward_tensor
+1638:                        # compute rewards. apply_kl_penalty if available
+1639:                        if self.config.algorithm.use_kl_in_reward:
+1640:                            batch, kl_metrics = apply_kl_penalty(
+1641:                                batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty
+1645:                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+1649:                        # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
+1653:                            and not bypass_recomputing_logprobs  # Only in decoupled mode
+1655:                            from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+1658:                            batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, rollout_corr_config)
+1667:                        batch = compute_advantage(

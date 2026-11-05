@@ -1,0 +1,267 @@
+edited
+changed lines: lines 1451-1456
+--- original
++++ updated
+@@
+-    stats = {"ref_requests": len(ref.get("requests") or []),
+-             "cand_requests": len(cand.get("requests") or []),
+-             "request_pairs": n_req_pairs,
+-             "scenarios": len(doc["scenarios"]),
+-             "ref_versions": ref.get("versions"), "cand_versions": cand.get("versions")}
+-    return diffs, notes, stats
++    stats = {"ref_requests": len(ref.get("requests") or []),
++             "cand_requests": len(cand.get("requests") or []),
++             "request_pairs": n_req_pairs,
++             "scenarios": len(doc["scenarios"]),
++             "ref_versions": ref.get("versions"), "cand_versions": cand.get("versions")}
++    return diffs, notes, stats
++
++
++def _strip_outcome_noise(obj):
++    if isinstance(obj, dict):
++        return {k: _strip_outcome_noise(v) for k, v in obj.items() if k != "detail"}
++    if isinstance(obj, list):
++        return [_strip_outcome_noise(v) for v in obj]
++    return obj
++
++
++# ---------------- live stage ----------------
++
++def _log_snapshot(log_dir):
++    snap = {}
++    for p in Path(log_dir).rglob("*.log"):
++        try:
++            snap[str(p)] = p.stat().st_size
++        except OSError:
++            pass
++    return snap
++
++
++def _read_new_log_events(log_dir, snap):
++    events = []
++    for p in sorted(Path(log_dir).rglob("*.log")):
++        try:
++            size = p.stat().st_size
++        except OSError:
++            continue
++        start = snap.get(str(p), 0)
++        if size < start:
++            start = 0
++        try:
++            with open(p, "rb") as f:
++                f.seek(start)
++                data = f.read().decode("utf-8", "replace")
++        except OSError:
++            continue
++        for line in data.splitlines():
++            k = line.find("{")
++            if k < 0:
++                continue
++            try:
++                ev = json.loads(line[k:])
++            except Exception:
++                continue
++            if ev.get("event") == "request.received":
++                obj = ev.get("obj") or {}
++                events.append({"rid": ev.get("rid"), "file": str(p),
++                               "input_ids": obj.get("input_ids"),
++                               "sampling": obj.get("sampling_params"),
++                               "text_present": obj.get("text") is not None})
++    return events
++
++
++def live_forward(scen_path, ref_path, cand_path, engine_urls, log_dir, timeout_sec=1500):
++    """Send every replay request to the matching SGLang server, in pair order.
++
++    Generation is capped at 1 token (prompt tokenization and all other sampled
++    fields are recorded by SGLang unchanged); verdicts on max_new_tokens use
++    the replayed bodies themselves. Returns ({ref:i/cand:i: reading}, [hashes
++    in send order], notes)."""
++    import time
++    import urllib.request
++    doc = json.loads(Path(scen_path).read_text())
++    ref = json.loads(Path(ref_path).read_text())
++    cand = json.loads(Path(cand_path).read_text())
++    launch_of = {}
++    scen_launch = {}
++    for scen in doc["scenarios"]:
++        if scen.get("launch"):
++            scen_launch[scen["id"]] = scen["launch"]
++    rg, _ = _group_requests(ref, doc)
++    cg, _ = _group_requests(cand, doc)
++    plan = []  # (key, url, body_dict)
++    for sid in sorted(set(rg) | set(cg)):
++        launch = scen_launch.get(sid)
++        server = doc["launches"].get(launch, {}).get("server") if launch else None
++        url = engine_urls.get(server) if server else None
++        rs, cs = rg.get(sid) or [], cg.get(sid) or []
++        for j in range(max(len(rs), len(cs))):
++            if j < len(rs):
++                plan.append((f"ref:{rs[j][0]}", url, _body_json(rs[j][1].get("body") or "")))
++            if j < len(cs):
++                plan.append((f"cand:{cs[j][0]}", url, _body_json(cs[j][1].get("body") or "")))
++    valid = [p for p in plan if p[1] and isinstance(p[2], dict)]
++    snap = _log_snapshot(log_dir)
++    notes, sent_keys = [], []
++    deadline = time.time() + timeout_sec
++    for n, (key, url, body) in enumerate(valid):
++        if time.time() > deadline:
++            notes.append(f"live: forwarding stopped at {n}/{len(valid)} (deadline)")
++            break
++        b = dict(body)
++        b["max_tokens"] = 1
++        b.pop("max_completion_tokens", None)
++        b["stream"] = False
++        req = urllib.request.Request(
++            url.rstrip("/") + "/chat/completions",
++            data=json.dumps(b).encode(), headers={"Content-Type": "application/json"}, method="POST")
++        try:
++            with urllib.request.urlopen(req, timeout=600) as resp:
++                resp.read()
++        except Exception as e:  # noqa: BLE001
++            notes.append(f"live: {key} forward failed: {type(e).__name__}: {e}")
++        sent_keys.append(key)
++        if (n + 1) % 100 == 0:
++            print(f"gate-live: forwarded {n + 1}/{len(valid)}", file=sys.stderr, flush=True)
++    # let request logging flush
++    import time as _t
++    _t.sleep(2)
++    events = _read_new_log_events(log_dir, snap)
++    readings, hashes = {}, []
++    usable = [e for e in events if isinstance(e.get("input_ids"), list)]
++    if len(usable) < len(sent_keys):
++        notes.append(f"live: only {len(usable)} tokenized log events for {len(sent_keys)} sent requests")
++    for key, ev in zip(sent_keys, usable):
++        ids = ev["input_ids"]
++        h = hashlib.sha256(",".join(map(str, ids)).encode()).hexdigest()
++        sampling = ev.get("sampling") if isinstance(ev.get("sampling"), dict) else None
++        readings[key] = {"prompt_ids_sha256": h, "prompt_len": len(ids), "sampling": sampling}
++        hashes.append(h)
++    return readings, hashes, notes
++
++
++def orchestrate(cand_venv):
++    import subprocess
++    import tempfile
++    gate_py = str(Path(__file__).resolve())
++    ref_py = "/opt/venvs/client/bin/python"
++    cand_py = str(Path(cand_venv) / "bin" / "python")
++    env = dict(os.environ)
++    env.update({"LITELLM_LOCAL_MODEL_COST_MAP": "True", "TOKENIZERS_PARALLELISM": "false",
++                "PYTHONHASHSEED": "0", "TZ": "UTC"})
++    for k in list(env):
++        if k.startswith("HARBOR_") or k.startswith("EVAL_"):
++            env.pop(k, None)
++    tmp = Path(tempfile.mkdtemp(prefix="gate-"))
++    scen = tmp / "scenarios.json"
++
++    def _run(cmd, timeout, label):
++        with open(tmp / f"{label}.log", "wb") as lf:
++            try:
++                r = subprocess.run(cmd, stdout=lf, stderr=lf, timeout=timeout, env=env, cwd="/tmp")
++            except subprocess.TimeoutExpired:
++                return None, f"{label} timed out after {timeout}s"
++        if r.returncode != 0:
++            tail = (tmp / f"{label}.log").read_bytes()[-2000:].decode("utf-8", "replace")
++            return None, f"{label} failed (exit {r.returncode}): {tail}"
++        return r, None
++
++    _, e = _run([ref_py, gate_py, "build", str(scen)], 300, "build")
++    if e:
++        return 1, [f"gate internal error: {e}"]
++    _, e = _run([ref_py, gate_py, "run", str(scen), str(tmp / "ref.json"), str(tmp / "wref")], 600, "run-ref")
++    if e:
++        return 1, [f"gate internal error: {e}"]
++    r, e = _run([cand_py, gate_py, "run", str(scen), str(tmp / "cand.json"), str(tmp / "wcand")], 600, "run-cand")
++    if e:
++        return 1, [f"candidate stack could not execute the replay: {e}"]
++    # strip harness traceback noise before comparing
++    for name in ("ref.json", "cand.json"):
++        p = tmp / name
++        d = json.loads(p.read_text())
++        d["outcomes"] = _strip_outcome_noise(d.get("outcomes") or {})
++        p.write_text(json.dumps(d))
++    live_urls, log_dir = os.environ.get("ENGINE_URLS"), os.environ.get("ENGINE_LOG_DIR")
++    gate_report = os.environ.get("GATE_REPORT")
++    rendered = None
++    if live_urls and log_dir:
++        try:
++            urls = json.loads(live_urls) if isinstance(live_urls, str) else {}
++        except Exception:
++            return 1, ["live stage: ENGINE_URLS is not valid JSON"]
++        readings, hashes, lnotes = live_forward(
++            str(scen), str(tmp / "ref.json"), str(tmp / "cand.json"), urls, log_dir)
++        diffs, notes, stats = compare_runs(str(scen), str(tmp / "ref.json"), str(tmp / "cand.json"), live=readings)
++        diffs[:0] = [n for n in lnotes if "forward failed" in n or "stopped" in n]
++        notes += lnotes
++        if gate_report:
++            Path(gate_report).write_text(json.dumps({"prompt_ids_sha256": hashes}))
++            notes.append(f"live: wrote {len(hashes)} prompt hashes to GATE_REPORT")
++    else:
++        doc = json.loads(scen.read_text())
++        idx = []
++        for label, fname in (("ref", "ref.json"), ("cand", "cand.json")):
++            d = json.loads((tmp / fname).read_text())
++            _, launch_of = _group_requests(d, doc)
++            for i, rq in enumerate(d.get("requests") or []):
++                launch = launch_of.get(rq.get("scenario"))
++                server = doc["launches"].get(launch, {}).get("server") if launch else None
++                body = _body_json(rq.get("body") or "")
++                if server and isinstance(body, dict):
++                    idx.append({"key": f"{label}:{i}", "server": server, "body": body})
++        (tmp / "to_render.json").write_text(json.dumps(idx))
++        engine_py = os.environ.get("ENGINE_PYTHON", "/opt/venvs/engine/bin/python")
++        rendered = str(tmp / "rendered.json")
++        _, e = _run([engine_py, gate_py, "render", str(scen), str(tmp / "to_render.json"), rendered],
++                    600, "render")
++        if e:
++            rendered = None
++            notes = [f"offline rendering unavailable, judged without prompt rendering: {e}"]
++            diffs, xnotes, stats = compare_runs(str(scen), str(tmp / "ref.json"), str(tmp / "cand.json"))
++            notes += xnotes
++        else:
++            diffs, notes, stats = compare_runs(str(scen), str(tmp / "ref.json"), str(tmp / "cand.json"),
++                                                rendered_path=rendered)
++        if gate_report and rendered:
++            rend = json.loads(Path(rendered).read_text())
++            hashes = [rend[k]["sha256"] for k in sorted(rend, key=lambda s: int(s.split(":")[1]))
++                      if k.startswith("cand:") and "sha256" in rend[k]]
++            Path(gate_report).write_text(json.dumps({"prompt_ids_sha256": hashes}))
++    verdict = 0 if not diffs else 1
++    lines = []
++    cv, rv = stats.get("cand_versions") or {}, stats.get("ref_versions") or {}
++    head = (f"{'ACCEPT' if verdict == 0 else 'REJECT'}: candidate harbor={cv.get('harbor')} "
++            f"litellm={cv.get('litellm')} vs reference harbor={rv.get('harbor')} litellm={rv.get('litellm')}; "
++            f"{stats['scenarios']} scenarios, ref {stats['ref_requests']} requests, "
++            f"cand {stats['cand_requests']} requests")
++    lines.append(head)
++    for nline in notes:
++        lines.append("note: " + nline)
++    if diffs:
++        lines.append(f"{len(diffs)} difference(s) (first 60):")
++        lines += ["- " + d for d in diffs[:60]]
++    lines.append(f"(work dir: {tmp})")
++    return verdict, lines
++
++
++def main(argv):
++    if len(argv) >= 2 and argv[1] == "build":
++        build_scenarios(argv[2])
++        return 0
++    if len(argv) >= 2 and argv[1] == "run":
++        os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
++        run_scenarios(argv[2], argv[3], argv[4])
++        return 0
++    if len(argv) >= 2 and argv[1] == "render":
++        render_requests(argv[2], argv[3], argv[4])
++        return 0
++    if len(argv) >= 2 and argv[1] == "check":
++        code, lines = orchestrate(argv[2])
++        print("\n".join(lines))
++        return code
++    print("usage: gate.py build|run|render|check <venv>", file=sys.stderr)
++    return 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main(sys.argv))

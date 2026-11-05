@@ -1,0 +1,87 @@
+68:    EnvironmentStartTimeoutError,
+534:        await self._setup_agent_environment()
+992:                env.start(force_build=False),
+1661:    async def _setup_agent_environment(self) -> None:
+1672:                self.agent_environment.start(
+1678:            raise EnvironmentStartTimeoutError(
+        """Make the artifacts subtree writable for the in-container agent user."""
+        current = self._main_artifacts_mount_dir
+        while True:
+            current.chmod(0o777)
+            if current == self.paths.artifacts_dir:
+                break
+            current = current.parent
+
+    def _init_artifact_handler(self) -> None:
+        self._validate_artifact_configuration()
+        self._artifact_handler = ArtifactHandler(
+            artifacts=[*self.task.config.artifacts, *self.config.artifacts],
+            logger=self.logger,
+        )
+
+    def _validate_artifact_configuration(self) -> None:
+        """Validate merged artifact sets and provider support for sidecar work."""
+        convention_source = self.agent_env_paths.artifacts_dir.as_posix()
+        base_entries = [*self.task.config.artifacts, *self.config.artifacts]
+
+        validate_artifact_entries(base_entries, convention_source=convention_source)
+        for step in self.task.config.steps or []:
+            validate_artifact_entries(
+                [*base_entries, *step.artifacts],
+                convention_source=convention_source,
+            )
+
+        referenced = self._referenced_sidecar_services()
+        if not referenced:
+            return
+
+        if not self.agent_environment.capabilities.docker_compose:
+            raise ValueError(
+                "Task references compose sidecar services "
+                f"{sorted(referenced)!r} (via artifact entries or verifier "
+                "collect hooks), but the "
+                f"'{self.agent_environment.type()}' environment does not "
+                "support Docker Compose. Use a compose-capable provider."
+            )
+
+        has_compose_definition = (
+            self.task.paths.environment_dir / "docker-compose.yaml"
+        ).exists() or bool(self.config.environment.extra_docker_compose)
+        if not has_compose_definition:
+            raise ValueError(
+                "Task references compose sidecar services "
+                f"{sorted(referenced)!r} (via artifact entries or verifier "
+                "collect hooks), but neither the task's environment/ directory "
+                "nor the job config defines a docker-compose file, so those "
+                "services cannot exist."
+            )
+
+    def _referenced_sidecar_services(self) -> set[str]:
+        """All non-main services referenced by artifacts or collect hooks."""
+        entries = [
+            *self.task.config.artifacts,
+            *self.config.artifacts,
+            *(
+                artifact
+                for step in self.task.config.steps or []
+                for artifact in step.artifacts
+            ),
+        ]
+        services = sidecar_services(entries)
+        for hook in self._all_collect_hooks():
+            if hook.service != MAIN_SERVICE_NAME:
+                services.add(hook.service)
+        return services
+
+    def _all_collect_hooks(self) -> list[VerifierCollectConfig]:
+        hooks = list(self.task.config.verifier.collect)
+        for step in self.task.config.steps or []:
+            hooks.extend(step.verifier.collect)
+        return hooks
+
+    def _collect_hooks_for(
+        self, step_cfg: StepConfig | None
+    ) -> list[VerifierCollectConfig]:
+        """Effective collect hooks for one collection pass."""
+        hooks = list(self.task.config.verifier.collect)
+        if step_cfg is not None:

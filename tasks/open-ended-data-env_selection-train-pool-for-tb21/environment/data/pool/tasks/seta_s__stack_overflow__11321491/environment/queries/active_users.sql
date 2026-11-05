@@ -1,0 +1,1 @@
+SELECT u.id AS 'uid', u.name AS 'username' FROM user u WHERE 'uid' IN (SELECT user_id FROM `order` WHERE status = 'active') ORDER BY 'uid'

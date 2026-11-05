@@ -1,0 +1,158 @@
+/app:
+dumps
+recipes
+sql_agent
+
+/app/dumps:
+README.md
+sql_bypass_is
+sql_dapo
+sql_drgrpo
+sql_grpo_compact
+sql_grpo_kl
+sql_gspo
+sql_opd_teacher
+sql_ppo
+sql_rpp
+
+/app/dumps/sql_bypass_is:
+step_00947.pt
+step_00948.pt
+
+/app/dumps/sql_dapo:
+step_02210.pt
+step_02211.pt
+
+/app/dumps/sql_drgrpo:
+step_00860.pt
+step_00861.pt
+
+/app/dumps/sql_grpo_compact:
+step_01180.pt
+step_01181.pt
+step_01182.pt
+
+/app/dumps/sql_grpo_kl:
+step_01290.pt
+step_01291.pt
+
+/app/dumps/sql_gspo:
+step_00415.pt
+step_00416.pt
+
+/app/dumps/sql_opd_teacher:
+step_00318.pt
+step_00319.pt
+
+/app/dumps/sql_ppo:
+step_01502.pt
+step_01503.pt
+
+/app/dumps/sql_rpp:
+step_00733.pt
+step_00734.pt
+
+/app/recipes:
+common.sh
+sql_bypass_is.sh
+sql_dapo.sh
+sql_drgrpo.sh
+sql_grpo_compact.sh
+sql_grpo_kl.sh
+sql_gspo.sh
+sql_opd_teacher.sh
+sql_ppo.sh
+sql_rpp.sh
+
+/app/sql_agent:
+reward.py
+---
+total 706
+drwxr-xr-x 1 root root    546 Sep 24 10:41 .
+drwxr-xr-x 1 root root     79 Oct 24 17:02 ..
+-rw-r--r-- 1 root root    675 Sep 24 10:41 .dockerignore
+-rw-r--r-- 1 root root    556 Sep 24 10:41 .git-blame-ignore-revs
+-rw-r--r-- 1 root root   1394 Sep 24 10:41 .gitignore
+-rw-r--r-- 1 root root     91 Sep 24 10:41 .gitmodules
+-rw-r--r-- 1 root root   3106 Sep 24 10:41 .pre-commit-config.yaml
+-rw-r--r-- 1 root root    333 Sep 24 10:41 .readthedocs.yaml
+-rw-r--r-- 1 root root   4053 Sep 24 10:41 CONTRIBUTING.md
+-rw-r--r-- 1 root root  11358 Sep 24 10:41 LICENSE
+-rw-r--r-- 1 root root     57 Sep 24 10:41 Notice.txt
+-rw-r--r-- 1 root root  39437 Sep 24 10:41 README.md
+drwxr-xr-x 1 root root    526 Sep 24 10:41 docker
+-rwxr-xr-x 1 root root  42209 Sep 24 10:41 manage_envs.py
+-rw-r--r-- 1 root root  20969 Sep 24 10:41 pyproject.toml
+-rw-r--r-- 1 root root    402 Sep 24 10:41 requirements-npu.txt
+-rw-r--r-- 1 root root     61 Sep 24 10:41 requirements-test.txt
+-rw-r--r-- 1 root root    617 Sep 24 10:41 requirements.txt
+drwxr-xr-x 1 root root    565 Sep 24 10:41 scripts
+-rw-r--r-- 1 root root   3447 Sep 24 10:41 setup.py
+-rw-r--r-- 1 root root 583705 Sep 24 10:41 uv.lock
+drwxr-xr-x 1 root root    375 Sep 24 10:41 verl
+drwxr-xr-x 1 root root    151 Sep 24 10:41 verl.egg-info
+---
+lrwxrwxrwx 1 root root 25 Sep 24 10:44 /opt/venv/bin/python -> /usr/local/bin/python3.12
+lrwxrwxrwx 1 root root  6 Sep 24 10:44 /opt/venv/bin/python3 -> python
+lrwxrwxrwx 1 root root  6 Sep 24 10:44 /opt/venv/bin/python3.12 -> python
+# Recorded trainer steps
+
+One file per training step, `<recipe>/step_<global_step>.pt` (`torch.load(path, weights_only=False)`), written by
+our step-dump hook right after the trainer finished scoring the batch (before the update);
+the scores (`old_log_probs`, `ref_log_prob`, `values`) come from verl's own forward pass. Rows are in the order the agent loop returned them.
+
+    {"meta": {"recipe": ..., "step": ..., "n": 4, "n_prompts": 16},
+     "samples": [ {row}, ... ]}
+
+Each row (one training sequence):
+
+| key | type | |
+|---|---|---|
+| `uid` | str | prompt group id (the `uid` verl groups GRPO statistics by) |
+| `session`, `index` | str, int | agent-loop session within the group and output index within the session. The compacting agent loop can return several outputs per session (index 0, 1, ...); only the last one carries the episode reward |
+| `prompt_ids` | int32 [P] | prompt tokens (no padding) |
+| `response_ids` | int32 [R] | everything after the prompt: assistant turns and tool outputs (no padding) |
+| `response_mask` | int8 [R] | 1 on tokens the policy generated, 0 on tool-output / chat-template tokens |
+| `rollout_log_probs` | f32 [R] | sampler (SGLang) logprobs; 0 on masked tokens |
+| `old_log_probs` | f32 [R] | trainer logprobs of the response tokens at that step (actor forward before the update) |
+| `ref_log_prob` | f32 [R] | reference-model logprobs |
+| `values` | f32 [R] | critic values (PPO run only; other recipes have whatever the critic head would give, unused) |
+| `teacher_logprobs` | f32 [P+R] | teacher logprob of the *next* token at every position of prompt+response (OPD run) |
+| `reward` | float | episode reward from `/app/sql_agent/reward.py` (verl places it on the last response token) |
+| `status` | str | `completed`, `truncated` (hit the response-length limit) or `compacted` |
+| `num_tool_calls` | int | number of tool outputs in the response |
+
+Steps were recorded on the 2 x H100 runs launched with the scripts in `/app/recipes`.
+===
+# Shared launch settings for the SQL-agent runs (sourced by every recipe).
+# 2 x H100 per run (one node), Qwen3.5-2B policy, multi-turn SQL agent with the execute_sql tool.
+MODEL=${MODEL:-/models/Qwen3.5-2B}
+COMMON_ARGS=(
+    data.train_files=/data/sql_agent/train.parquet
+    data.val_files=/data/sql_agent/val.parquet
+    data.train_batch_size=16
+    data.max_prompt_length=1536
+    data.max_response_length=8192
+    actor_rollout_ref.model.path=$MODEL
+    actor_rollout_ref.model.use_remove_padding=True
+    actor_rollout_ref.rollout.name=sglang
+    actor_rollout_ref.rollout.n=4
+    actor_rollout_ref.rollout.temperature=1.0
+    actor_rollout_ref.rollout.calculate_log_probs=True
+    actor_rollout_ref.rollout.multi_turn.enable=True
+    actor_rollout_ref.rollout.multi_turn.max_assistant_turns=16
+    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=24576
+    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=24576
+    actor_rollout_ref.actor.optim.lr=1e-6
+    actor_rollout_ref.actor.ppo_mini_batch_size=4
+    actor_rollout_ref.actor.use_dynamic_bsz=True
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=16384
+    actor_rollout_ref.actor.strategy=fsdp2
+    reward.custom_reward_function.path=/app/sql_agent/reward.py
+    trainer.n_gpus_per_node=2
+    trainer.nnodes=1
+    trainer.logger='["console","wandb"]'
+    trainer.project_name=sql-agent-rl
+)

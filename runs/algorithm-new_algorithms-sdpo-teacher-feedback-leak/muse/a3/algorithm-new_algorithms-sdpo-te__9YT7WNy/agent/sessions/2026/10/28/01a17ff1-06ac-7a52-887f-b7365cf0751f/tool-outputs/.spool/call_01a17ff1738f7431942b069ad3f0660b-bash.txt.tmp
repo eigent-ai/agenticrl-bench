@@ -1,0 +1,49 @@
+333:        self.tokenizer.truncation_side = config.actor_rollout_ref.actor.get("self_distillation", {}).get("reprompt_truncation", "error")
+611:    def _collect_feedback(
+612:        include_environment_feedback: bool,
+617:        Collect environment feedback from reward_extra_infos_dict.
+620:            include_environment_feedback: Whether to include environment feedback
+625:            List of feedback strings (or None for entries without feedback)
+627:        feedback_list: list[Any] = [None] * batch_size
+628:        if include_environment_feedback and reward_extra_infos_dict is not None:
+629:            raw_feedback = reward_extra_infos_dict.get("feedback", [])
+630:            for i in range(min(len(raw_feedback), batch_size)):
+631:                # Only include non-empty feedback strings
+632:                if raw_feedback[i] and isinstance(raw_feedback[i], str) and raw_feedback[i].strip():
+633:                    feedback_list[i] = raw_feedback[i]
+634:        return feedback_list
+656:        dont_reprompt_on_self_success: bool = False,
+661:        if dont_reprompt_on_self_success:
+672:    def _maybe_build_self_distillation_batch(
+690:        # Extract feedback if available and include_environment_feedback is enabled
+691:        feedback_list = self._collect_feedback(
+692:            include_environment_feedback=self_distillation_cfg.include_environment_feedback,
+704:                self_distillation_cfg.dont_reprompt_on_self_success,
+713:            has_feedback = feedback_list[i] is not None
+714:            feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
+716:            # If feedback_only_without_solution is True, only use feedback when no solution exists
+717:            use_feedback = has_feedback and (not feedback_only_without_solution or not has_solution)
+726:            # build feedback section
+727:            feedback_section = ""
+728:            if use_feedback:
+729:                feedback_section = self_distillation_cfg.feedback_template.format(
+730:                    feedback_raw=feedback_list[i]
+733:            # combine solution and feedback sections
+734:            if use_feedback or has_solution:
+735:                reprompt_text = self_distillation_cfg.reprompt_template.format(
+738:                    feedback=feedback_section,
+741:                reprompt_text = prompt_texts[i]
+744:                {"role": "user", "content": reprompt_text},
+758:            max_length=self_distillation_cfg.max_reprompt_len,
+766:        # Compute which samples actually use feedback (accounting for environment_feedback_only_without_solution)
+767:        feedback_only_without_solution = self_distillation_cfg.get("environment_feedback_only_without_solution", False)
+768:        feedback_used = [
+769:            feedback_list[i] is not None and (not feedback_only_without_solution or solution_strs[i] is None)
+773:        # self_distillation_mask is True if sample has a solution OR feedback is used (i.e., will get a reprompted message)
+775:            [solution_strs[i] is not None or feedback_used[i] for i in range(batch_size)],
+781:        num_with_feedback_available = sum(1 for f in feedback_list if f is not None)
+782:        num_with_feedback_used = sum(1 for f in feedback_used if f)
+787:            "self_distillation/feedback_available_fraction": num_with_feedback_available / batch_size,
+788:            "self_distillation/feedback_used_fraction": num_with_feedback_used / batch_size,
+789:            "self_distillation/reprompt_sample_fraction": self_distillation_mask.float().mean().item(),
+1787:                        self_distillation_data = self._maybe_build_self_distillation_batch(batch, reward_tensor, reward_extra_infos_dict)

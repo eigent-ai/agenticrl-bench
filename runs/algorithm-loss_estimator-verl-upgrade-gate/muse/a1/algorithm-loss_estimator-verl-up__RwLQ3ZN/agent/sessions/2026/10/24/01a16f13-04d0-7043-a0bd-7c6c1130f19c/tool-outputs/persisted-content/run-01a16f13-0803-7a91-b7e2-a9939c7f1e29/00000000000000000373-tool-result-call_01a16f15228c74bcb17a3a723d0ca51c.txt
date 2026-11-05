@@ -1,0 +1,218 @@
+Read text file `/opt/verl/verl/trainer/ppo/v1/utils.py`.
+1|# Copyright 2024 Bytedance Ltd. and/or its affiliates
+2|#
+3|# Licensed under the Apache License, Version 2.0 (the "License");
+4|# you may not use this file except in compliance with the License.
+5|# You may obtain a copy of the License at
+6|#
+7|#     http://www.apache.org/licenses/LICENSE-2.0
+8|#
+9|# Unless required by applicable law or agreed to in writing, software
+10|# distributed under the License is distributed on an "AS IS" BASIS,
+11|# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+12|# See the License for the specific language governing permissions and
+13|# limitations under the License.
+14|from collections import Counter, defaultdict
+15|from typing import Any
+16|
+17|import numpy as np
+18|import torch
+19|
+20|from verl.protocol import DataProto
+21|from verl.trainer.ppo import core_algos
+22|from verl.trainer.ppo.ray_trainer import compute_advantage
+23|from verl.trainer.ppo.v1.replay_buffer import DAPO_FILTERED_REWARD_COUNTS_KEY
+24|
+25|
+26|class MetricsAggregator:
+27|    """
+28|    Combine per-iteration training metrics collected within a single ``parameter_sync_step`` cycle.
+29|    Adapted from ``verl.experimental.fully_async_policy.detach_utils.MetricsAggregator`.
+30|    """
+31|
+32|    def __init__(self):
+33|        self.metric_values: dict[str, list[float]] = defaultdict(list)
+34|        self.metric_weights: dict[str, list[int]] = defaultdict(list)
+35|        self.dict_metrics: dict[str, Counter] = defaultdict(Counter)
+36|        self.step_count = 0
+37|        self.aggregation_rules = self._init_aggregation_rules()
+38|
+39|    def _init_aggregation_rules(self) -> dict[str, list[str]]:
+40|        return {
+41|            "sum": [
+42|                "training/off_policy/evicted_samples",
+43|                "validation/off_policy/evicted_samples",
+44|                "training/filter_groups/evicted_samples",
+45|                "validation/filter_groups/evicted_samples",
+46|                "training/filter_groups/discarded_surplus_samples",
+47|                "validation/filter_groups/discarded_surplus_samples",
+48|                "training/rollout_failure/evicted_samples",
+49|                "validation/rollout_failure/evicted_samples",
+50|            ],
+51|            "last": [
+52|                "training/global_step",
+53|                "training/rollout_probs_diff_valid",
+54|            ],
+55|        }
+56|
+57|    def add_step_metrics(self, metrics: dict[str, Any], sample_count: int = 0):
+58|        """Record one iteration's metrics."""
+59|        self.step_count += 1
+60|        for key, value in metrics.items():
+61|            if isinstance(value, bool):
+62|                continue
+63|            if key == DAPO_FILTERED_REWARD_COUNTS_KEY and isinstance(value, dict):
+64|                self.dict_metrics[key].update(value)
+65|                continue
+66|            if isinstance(value, int | float | np.number):
+67|                self.metric_values[key].append(float(value))
+68|                self.metric_weights[key].append(self._get_metric_weight(key, metrics, sample_count))
+69|            elif isinstance(value, torch.Tensor) and value.numel() == 1:
+70|                self.metric_values[key].append(float(value.item()))
+71|                self.metric_weights[key].append(self._get_metric_weight(key, metrics, sample_count))
+72|
+73|    def _get_metric_weight(self, metric_name: str, metrics: dict[str, Any], sample_count: int) -> int:
+74|        """Return the sample weight used when reducing per-iteration average metrics."""
+75|        if metric_name.endswith("/off_policy/evicted_samples_staleness/mean"):
+76|            prefix = metric_name.rsplit("_staleness/mean", 1)[0]
+77|            evicted_samples = metrics.get(prefix, sample_count)
+78|            if isinstance(evicted_samples, torch.Tensor):
+79|                return int(evicted_samples.item()) if evicted_samples.numel() == 1 else sample_count
+80|            if isinstance(evicted_samples, int | float | np.number):
+81|                return int(evicted_samples)
+82|        return sample_count
+83|
+84|    def _get_aggregation_type(self, metric_name: str) -> str:
+85|        for agg_type, metric_list in self.aggregation_rules.items():
+86|            if metric_name in metric_list:
+87|                return agg_type
+88|
+89|        metric_lower = metric_name.lower()
+90|        if metric_lower.endswith("/lr") or metric_lower.endswith("_lr") or metric_lower == "lr":
+91|            return "last"
+92|        if "timing_s/" in metric_lower or "timing_per_token_ms/" in metric_lower:
+93|            return "time_sum"
+94|        if any(keyword in metric_lower for keyword in ["max", "maximum"]):
+95|            return "max"
+96|        if any(keyword in metric_lower for keyword in ["min", "minimum"]):
+97|            return "min"
+98|        if any(keyword in metric_lower for keyword in ["sum", "total"]):
+99|            return "sum"
+100|        if any(keyword in metric_lower for keyword in ["weighted_avg", "mean", "avg", "average"]):
+101|            return "weighted_avg"
+102|        return "weighted_avg"
+103|
+104|    def _aggregate_single_metric(self, metric_name: str, values: list[float]) -> float:
+105|        if not values:
+106|            return 0.0
+107|
+108|        agg_type = self._get_aggregation_type(metric_name)
+109|        if agg_type == "last":
+110|            return values[-1]
+111|        if agg_type == "weighted_avg":
+112|            weights = self.metric_weights[metric_name]
+113|            if len(values) != len(weights) or sum(weights) == 0:
+114|                return sum(values) / len(values)
+115|            weighted_sum = sum(v * c for v, c in zip(values, weights, strict=False))
+116|            return weighted_sum / sum(weights)
+117|        if agg_type in ("sum", "time_sum"):
+118|            return sum(values)
+119|        if agg_type == "max":
+120|            return max(values)
+121|        if agg_type == "min":
+122|            return min(values)
+123|        return sum(values) / len(values)
+124|
+125|    def get_aggregated_metrics(self) -> dict[str, Any]:
+126|        if self.step_count == 0:
+127|            return {}
+128|        aggregated = {name: self._aggregate_single_metric(name, values) for name, values in self.metric_values.items()}
+129|        for name, counter in self.dict_metrics.items():
+130|            if counter:
+131|                aggregated[name] = dict(counter)
+132|        return self._special_metrics_aggregate(aggregated)
+133|
+134|    def _special_metrics_aggregate(self, aggregated: dict[str, Any]) -> dict[str, Any]:
+135|        """Recompute derived metrics that cannot be reduced from their per-iteration values."""
+136|        if {"global_seqlen/minmax_diff", "global_seqlen/max", "global_seqlen/min"}.issubset(aggregated):
+137|            aggregated["global_seqlen/minmax_diff"] = aggregated["global_seqlen/max"] - aggregated["global_seqlen/min"]
+138|
+139|        return aggregated
+140|
+141|    def reset(self):
+142|        self.metric_values.clear()
+143|        self.metric_weights.clear()
+144|        self.dict_metrics.clear()
+145|        self.step_count = 0
+146|
+147|
+148|def compute_advantage_for_multi_trajectories(
+149|    data: DataProto,
+150|    batch_keys: list[str],
+151|    adv_estimator,
+152|    gamma: float = 1.0,
+153|    lam: float = 1.0,
+154|    num_repeat: int = 1,
+155|    norm_adv_by_std_in_grpo: bool = True,
+156|    config: Any = None,
+157|) -> DataProto:
+158|    """Compute GRPO advantages from each session's final output. For non-GRPO
+159|    estimators, such as GAE, are delegated to the original compute_advantage() unchanged.
+160|
+161|    For GRPO, only the final output in each ``{uid}_{session_id}`` group participates
+162|    in advantage computation, and the result is broadcast to the other outputs in
+163|    the same session. Sessions whose AgentLoop returns ``None`` simply do not appear
+164|    in ``batch_keys``. Non-GRPO estimators, such as GAE, are delegated to the
+165|    original ``compute_advantage()`` unchanged.
+166|    """
+167|    if adv_estimator != core_algos.AdvantageEstimator.GRPO:
+168|        return compute_advantage(
+169|            data,
+170|            adv_estimator=adv_estimator,
+171|            gamma=gamma,
+172|            lam=lam,
+173|            num_repeat=num_repeat,
+174|            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+175|            config=config,
+176|        )
+177|
+178|    # final session of each agent loop: {uid}_{session_id} => (index, row_index)
+179|    final_sessions: dict[str, tuple[int, int]] = {}
+180|    row_session_keys = []
+181|    for i, key in enumerate(batch_keys):
+182|        fields = key.rsplit("_", 2)
+183|        assert len(fields) == 3, f"Unexpected key format: {key}"
+184|        uid, session_id, index = fields[0], fields[1], int(fields[2])
+185|        session_key = f"{uid}_{session_id}"
+186|        row_session_keys.append(session_key)
+187|        if session_key not in final_sessions or final_sessions[session_key][0] < index:
+188|            final_sessions[session_key] = (index, i)
+189|
+190|    # final session indices in batch data
+191|    final_indices = []
+192|    session_key_to_local_index = {}
+193|    for session_key, (_, row_index) in final_sessions.items():
+194|        final_indices.append(row_index)
+195|        session_key_to_local_index[session_key] = len(final_indices) - 1
+196|    row_to_local_index = [session_key_to_local_index[session_key] for session_key in row_session_keys]
+197|
+198|    # select final sessions from batch data for group relative advantage computation
+199|    final_data = compute_advantage(
+200|        data.select_idxs(final_indices),
+201|        adv_estimator=adv_estimator,
+202|        gamma=gamma,
+203|        lam=lam,
+204|        num_repeat=num_repeat,
+205|        norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+206|        config=config,
+207|    )
+208|    first_nnz_indices = final_data.batch["response_mask"].argmax(dim=1)
+209|    final_scores = final_data.batch["advantages"][torch.arange(len(final_data)), first_nnz_indices]
+210|
+211|    # scatter final scores to all rows in batch data
+212|    scores = final_scores[row_to_local_index]
+213|    scores = scores.unsqueeze(-1) * data.batch["response_mask"]
+214|
+215|    data.batch["advantages"] = scores
+216|    data.batch["returns"] = scores
+217|    return data

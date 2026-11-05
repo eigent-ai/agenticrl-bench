@@ -1,0 +1,2 @@
+-- Find exact (name, email) duplicate groups
+-- Output the duplicate groups with their counts

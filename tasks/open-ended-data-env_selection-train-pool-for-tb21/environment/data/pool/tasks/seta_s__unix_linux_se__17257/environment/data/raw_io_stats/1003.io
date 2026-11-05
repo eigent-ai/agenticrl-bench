@@ -1,0 +1,9 @@
+rchar: 1073741824
+wchar: 536870912
+syscr: 262144
+syscw: 131072
+read_bytes: 858993459
+write_bytes: 429496730
+async_read_bytes: 171798692
+async_write_bytes: 85899346
+cancelled_write_bytes: 0

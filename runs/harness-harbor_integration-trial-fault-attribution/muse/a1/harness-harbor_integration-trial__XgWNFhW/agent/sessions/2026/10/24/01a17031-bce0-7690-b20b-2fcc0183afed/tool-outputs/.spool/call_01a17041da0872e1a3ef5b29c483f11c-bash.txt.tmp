@@ -1,0 +1,31 @@
+0
+9:from ipaddress import ip_address, ip_network
+37:class NetworkMode(str, Enum):
+40:    NO_NETWORK = "no-network"
+46:    """Type of an already-validated network allowlist entry."""
+68:    """Resolved runtime network policy for one execution role."""
+70:    network_mode: NetworkMode = NetworkMode.PUBLIC
+75:        if self.network_mode != NetworkMode.ALLOWLIST and self.allowed_hosts:
+77:                "allowed_hosts is only valid when network_mode='allowlist'."
+101:def _normalize_ip_network(host: str) -> str | None:
+105:        network = ip_network(host, strict=True)
+108:    return network.compressed
+111:def classify_network_allowlist_entry(entry: str) -> NetworkAllowlistEntryType:
+117:        # is a bug upstream, so let ip_network raise rather than misclassify.
+118:        network = ip_network(entry, strict=True)
+119:        if network.version == 4:
+145:            normalized_network = _normalize_ip_network(host)
+146:            if normalized_network is None:
+148:            normalized.append(normalized_network)
+196:def _validate_network_policy_fields(
+197:    network_mode: NetworkMode | None,
+200:    if network_mode is None:
+203:                "allowed_hosts is only valid when network_mode='allowlist'."
+207:        network_mode=network_mode,
+222:    network_mode: NetworkMode | None = Field(
+230:        "wildcard patterns reachable when network_mode='allowlist'.",
+234:    def validate_network_policy_fields(self) -> "PhaseNetworkPolicyConfig":
+235:        _validate_network_policy_fields(self.network_mode, self.allowed_hosts)
+239:        if self.network_mode is None:
+242:            network_mode=self.network_mode,
+250:    network_mode: NetworkMode = Field(

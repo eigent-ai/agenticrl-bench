@@ -1,0 +1,53 @@
+#!/bin/bash
+#
+# logfmt — simple log formatting tool
+# Usage: logfmt -o <outfile|-> <logfile1> [logfile2] ...
+# Reads each log file, prepends a timestamp prefix, writes to -o target.
+# Use "-" as the output file to write to stdout.
+#
+
+OUTPUT=""
+INPUTS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o)
+            OUTPUT="$2"
+            shift 2
+            ;;
+        *)
+            INPUTS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [ -z "$OUTPUT" ]; then
+    echo "logfmt: error: -o <file> is required" >&2
+    exit 1
+fi
+
+if [ ${#INPUTS[@]} -eq 0 ]; then
+    echo "logfmt: error: no input files specified" >&2
+    exit 1
+fi
+
+format_logs() {
+    for f in "${INPUTS[@]}"; do
+        if [ ! -f "$f" ]; then
+            echo "logfmt: warning: $f not found, skipping" >&2
+            continue
+        fi
+        local basename
+        basename="$(basename "$f" .log)"
+        while IFS= read -r line; do
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$basename] $line"
+        done < "$f"
+    done
+}
+
+if [ "$OUTPUT" = "-" ]; then
+    format_logs
+else
+    format_logs > "$OUTPUT"
+fi
