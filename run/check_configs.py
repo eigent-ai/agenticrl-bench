@@ -75,9 +75,12 @@ WHY = {
     "meta hosts": "environment.extra_allowed_hosts: the 3 Meta hosts, added to the shared list after the first runs",
     "nested hosts": "nested-sandbox hosts that task.toml listed when the runs were made and the launch adds since v0",
     "proxy model name": "agents[].model_name: an API proxy's prefix (<proxy>/<model>)",
-    "muse effort": "reasoning_effort: recorded ultra; the Muse CLI fell back to xhigh in every released Muse run",
     "grok wait": "background_wait_sec: unset (Harbor default 600 s) in the first Grok Build runs, 27000 s after",
+    "grok subagents": "grok_config: subagent_model_inheritance, set in the Grok Build re-runs and by these scripts",
+    "claude version": "version: the Claude Code CLI version, pinned by these scripts; the first runs installed it unpinned",
 }
+GROK_CONFIG = {"features": {"subagent_model_inheritance": True}}
+CLAUDE_VERSION = {"cc": "2.1.310", "ccf": "2.1.321"}
 
 
 def mask_env(env: dict) -> dict:
@@ -116,6 +119,8 @@ def agent_key(cfg: dict, hint: str | None) -> str:
         return name
     if "antigravity" in name:
         return "agyc" if "carbon" in model else "agy"
+    if "claude_code" in name and "fable" in model:
+        return "ccf"
     for frag, key in (("claude_code", "cc"), ("codex", "codex"), ("grok_build", "grok"), ("muse", "muse")):
         if frag in name:
             return key
@@ -161,8 +166,10 @@ def diff(rec: dict, ours: dict, task: str, agent: str) -> tuple[list[str], list[
             bad.append(f"agents[].model_name: recorded {r.get('model_name')} printed {o.get('model_name')}")
     r.pop("model_name", None), o.pop("model_name", None)
     rk, ok = dict(r.pop("kwargs", {}) or {}), dict(o.pop("kwargs", {}) or {})
-    if agent == "muse" and rk.get("reasoning_effort") == "ultra" and ok.get("reasoning_effort") == "xhigh":
-        kinds.append("muse effort"); rk.pop("reasoning_effort"); ok.pop("reasoning_effort")
+    if agent in CLAUDE_VERSION and "version" not in rk and ok.get("version") == CLAUDE_VERSION[agent]:
+        kinds.append("claude version"); ok.pop("version")
+    if agent == "grok" and "grok_config" not in rk and ok.get("grok_config") == GROK_CONFIG:
+        kinds.append("grok subagents"); ok.pop("grok_config")
     if agent == "grok" and "background_wait_sec" not in rk and ok.get("background_wait_sec") == 27000:
         kinds.append("grok wait"); ok.pop("background_wait_sec")
     if rk != ok:
