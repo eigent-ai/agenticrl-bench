@@ -2,15 +2,13 @@
 
     python3 -I check_configs.py [--release DIR] [--extra-records DIR ...] [--verbose]
 
-For every recorded job config.json it finds, it runs the class script of that task with --print-config (cached per
-task and agent; nothing is launched, no credential is read) and diffs the two JobConfigs, apart from job_name,
-jobs_dir and the task path (Harbor records a task as "tasks" or as a one-task "datasets" folder).
-
-- Oracle and no-op validation runs (validation/<task>/{oracle,nop}, validation/rerun-20261110): must be identical.
-- Released model runs (runs/, open_ended/runs/, and --extra-records folders of raw units): every difference must be
-  one of the explained kinds below; anything else is UNEXPECTED. The released runs used private adapters around
-  Harbor's built-in agents (subscription, gateway or Vertex logins); a public run uses the built-in agent with an API
-  key, so those fields differ by construction.
+For every recorded job config.json it finds (runs/<task>/<agent>/a<k>/config.json, and --extra-records folders of
+raw units), it runs the class script of that task with --print-config (cached per task and agent; nothing is
+launched, no credential is read) and diffs the two JobConfigs, apart from job_name, jobs_dir and the task path
+(Harbor records a task as "tasks" or as a one-task "datasets" folder). Every difference must be one of the explained
+kinds below; anything else is UNEXPECTED. The released runs used private adapters around Harbor's built-in agents
+(subscription, gateway or Vertex logins); a public run uses the built-in agent with an API key, so those fields
+differ by construction. The printed agent env must be exactly the agent's API key template (API_KEY below).
 
 Agent environment values are never printed: a value shows as ${NAME} (a template) or <literal>.
 Exit 0 if there is nothing unexpected.
@@ -69,12 +67,15 @@ BUILTIN = {"claude_code": "claude-code", "codex": "codex", "antigravity": "antig
            "muse": "muse-code"}
 WHY = {
     "agent adapter": "agents[].name: a private adapter (<module>:<Class>) around this built-in agent",
-    "agent login": "agents[].env: the private adapter's own login variables, or the key as a literal; a public run passes ${KEY}",
+    "agent login": "agents[].env: the private adapter's own login variables, or the key as a literal; a public run "
+                   "passes only the agent's API key as ${NAME}",
     "agent hosts": "agents[].extra_allowed_hosts: the private gateway/proxy/Vertex hosts instead of the provider's API",
     "gateway host": "environment.extra_allowed_hosts: the private model gateway, not needed by a public run",
     "meta hosts": "environment.extra_allowed_hosts: the 3 Meta hosts, added to the shared list after the first runs",
     "nested hosts": "nested-sandbox hosts that task.toml listed when the runs were made and the launch adds since v1",
     "proxy model name": "agents[].model_name: an API proxy's prefix (<proxy>/<model>)",
+    "vertex model name": "agents[].model_name: Gemini 4 Carbon runs published with the Vertex AI adapter, which run/ no "
+                         "longer offers, under Vertex's model id; the Gemini API's id ends in -eap",
     "grok wait": "background_wait_sec: unset (Harbor default 600 s) in the first Grok Build runs, 27000 s after",
     "grok subagents": "grok_config: subagent_model_inheritance, set in the Grok Build re-runs and by these scripts",
     "claude version": "version: the Claude Code CLI version, pinned by these scripts; the first runs installed it unpinned",
@@ -83,6 +84,11 @@ WHY = {
 }
 GROK_CONFIG = {"features": {"subagent_model_inheritance": True}}
 CLAUDE_VERSION = {"cc": "2.1.310", "ccf": "2.1.321"}
+# The model API key each agent's public run passes as its one agents[].env entry, NAME=${NAME}. The released runs
+# mostly logged in through private adapters, so their records do not show it for every agent; this is the expected
+# value the printed config is held to.
+API_KEY = {"cc": "ANTHROPIC_API_KEY", "ccf": "ANTHROPIC_API_KEY", "codex": "OPENAI_API_KEY", "grok": "XAI_API_KEY",
+           "muse": "META_API_KEY", "agy": "GEMINI_API_KEY", "agyc": "GEMINI_API_KEY"}
 
 
 def mask_env(env: dict) -> dict:
@@ -103,7 +109,7 @@ def normalize(cfg: dict) -> dict:
     return cfg
 
 
-def printed(release: Path, task_dir: Path, cls: str, agent: str, cache: dict) -> dict:
+def printed(task_dir: Path, cls: str, agent: str, cache: dict) -> dict:
     key = (task_dir.name, agent)
     if key not in cache:
         out = subprocess.run(["bash", str(RUN_DIR / SCRIPT[cls]), str(task_dir), "/nonexistent/jobs", "--agent",
@@ -152,7 +158,8 @@ def diff(rec: dict, ours: dict, task: str, agent: str) -> tuple[list[str], list[
                 bad.append(f"{k}: recorded {json.dumps(rec.get(k))} printed {json.dumps(ours.get(k))}")
     # the agent
     r, o = dict(ra[0]), dict(oa[0])
-    adapter = ":" in r.get("name", "")  # a private adapter <module>:<Class>
+    rname = r.get("name", "")
+    adapter = ":" in rname  # a private adapter <module>:<Class>
     if r.get("name") != o.get("name"):
         frag = next((f for f in BUILTIN if f in r.get("name", "")), None)
         if ":" in r.get("name", "") and frag and BUILTIN[frag] == o.get("name"):
@@ -164,6 +171,8 @@ def diff(rec: dict, ours: dict, task: str, agent: str) -> tuple[list[str], list[
         rm = str(r.get("model_name", ""))
         if adapter and "/" in rm and rm.split("/", 1)[1] == o.get("model_name"):
             kinds.append("proxy model name")
+        elif rname.startswith("antigravity_adc:") and rm + "-eap" == o.get("model_name"):
+            kinds.append("vertex model name")
         else:
             bad.append(f"agents[].model_name: recorded {r.get('model_name')} printed {o.get('model_name')}")
     r.pop("model_name", None), o.pop("model_name", None)
@@ -179,9 +188,13 @@ def diff(rec: dict, ours: dict, task: str, agent: str) -> tuple[list[str], list[
     if rk != ok:
         bad.append(f"agents[].kwargs: recorded {rk} printed {ok}")
     renv, oenv = r.pop("env", {}) or {}, o.pop("env", {}) or {}
-    if renv != oenv:
-        # the adapter's own login variables (or the key as a literal) vs the one ${KEY} template of a public run
-        if adapter and len(oenv) <= 1 and all(v.startswith("${") for v in oenv.values()):
+    key = API_KEY.get(agent)
+    want = {key: f"${{{key}}}"} if key else {}
+    if oenv != want:
+        bad.append(f"agents[].env: printed {oenv}, expected {want}")
+    elif renv != oenv:
+        # the adapter's own login variables (or the key as a literal) vs the one ${NAME} template of a public run
+        if adapter:
             kinds.append("agent login")
         else:
             bad.append(f"agents[].env: recorded {renv} printed {oenv}")
@@ -207,45 +220,21 @@ def main() -> int:
     ap.add_argument("--verbose", action="store_true")
     a = ap.parse_args()
     rel = Path(a.release)
-    task_dirs = {p.name: p for root in (rel / "tasks", rel / "open_ended" / "tasks") if root.is_dir()
-                 for p in root.iterdir() if (p / "task.toml").exists()}
+    task_dirs = {p.name: p for p in (rel / "tasks").iterdir() if (p / "task.toml").exists()}
     cache, unexpected = {}, 0
-
-    # 1. oracle and no-op validation runs: exact
-    exact = sorted((rel / "validation").glob("*/*/config.json")) + sorted(
-        (rel / "validation" / "rerun-20261110" / "runs").glob("*/jobs/*/config.json"))
-    print("== oracle and no-op validation runs (must be identical)")
-    for p in exact:
-        rec = json.loads(p.read_text())
-        task = next((t for t in task_dirs if t in str(p)), None)
-        if task is None:
-            rpath = (rec.get("tasks") or rec.get("datasets"))[0]["path"]
-            task = Path(rpath).name
-        agent = rec["agents"][0]["name"]
-        ours = printed(rel, task_dirs[task], taskinfo.task_class(taskinfo.load(task_dirs[task])), agent, cache)
-        same = normalize(rec) == normalize(ours)
-        unexpected += not same
-        print(f"  {'identical' if same else 'DIFFERENT'}  {agent:6s} {p.relative_to(rel)}")
-        if not same:
-            r, o = normalize(rec), normalize(ours)
-            for k in sorted(set(r) | set(o)):
-                if r.get(k) != o.get(k):
-                    print(f"      {k}: recorded {json.dumps(r.get(k))}\n      {' ' * len(k)}  printed  {json.dumps(o.get(k))}")
-
-    # 2. released model runs
-    records = [(p, p.relative_to(rel).parts[-4], p.relative_to(rel).parts[-3])
-               for p in sorted((rel / "runs").glob("*/*/a*/config.json"))
-               + sorted((rel / "open_ended" / "runs").glob("*/*/a*/config.json"))]
+    records = [(p, p.parts[-4], p.parts[-3]) for p in sorted((rel / "runs").glob("*/*/a*/config.json"))]
     for x in a.extra_records:
         for p in sorted(Path(x).glob("*/jobs/*/config.json")):
             parts = p.relative_to(x).parts[0].split("__")  # <prefix>__<task>__<agent>__a<k>
             records.append((p, parts[1], parts[2]))
+    if not records:
+        sys.exit(f"no recorded job configs in {rel / 'runs'} (--release: a checkout with runs/ and tasks/)")
     stats = defaultdict(lambda: [0, 0, Counter(), []])
     for p, task, hint in records:
         rec = json.loads(p.read_text())
         agent = agent_key(rec, hint)
         cls = taskinfo.task_class(taskinfo.load(task_dirs[task]))
-        ours = printed(rel, task_dirs[task], cls, agent, cache)
+        ours = printed(task_dirs[task], cls, agent, cache)
         kinds, bad = diff(normalize(rec), normalize(ours), task, agent)
         s = stats[(cls, agent)]
         s[0] += 1
@@ -253,7 +242,7 @@ def main() -> int:
         s[2].update(kinds)
         if bad:
             s[3].append((p, bad))
-    print("\n== released model runs: every difference explained?")
+    print("== released model runs: every difference explained?")
     print(f"  {'class':11s} {'agent':6s} {'runs':>5s} {'identical':>9s} {'unexpected':>10s}  explained differences (runs)")
     order = {"verifiable": 0, "broker": 1, "open-ended": 2}
     for (cls, agent), (n, same, kinds, bad) in sorted(stats.items(), key=lambda kv: (order[kv[0][0]], kv[0][1])):
