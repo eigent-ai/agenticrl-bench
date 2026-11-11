@@ -1,0 +1,2 @@
+- [Agent-RL tool-call reader](agent-rl-tool-call-reader.md) — state of the 2026-11-11 tool-call fix and the user's constraints for loop changes
+- [Live box tooling](live-box-tooling.md) — live batch / dev engine facts: tree hash, no determinism, sandbox access
