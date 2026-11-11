@@ -78,6 +78,8 @@ WHY = {
     "grok wait": "background_wait_sec: unset (Harbor default 600 s) in the first Grok Build runs, 27000 s after",
     "grok subagents": "grok_config: subagent_model_inheritance, set in the Grok Build re-runs and by these scripts",
     "claude version": "version: the Claude Code CLI version, pinned by these scripts; the first runs installed it unpinned",
+    "muse effort": "reasoning_effort: the Muse Code runs recorded ultra, which their CLIs (1.4.13, 1.4.14) do not offer "
+                   "and ran as xhigh (agent/muse-code.stderr.log); these scripts pass xhigh",
 }
 GROK_CONFIG = {"features": {"subagent_model_inheritance": True}}
 CLAUDE_VERSION = {"cc": "2.1.310", "ccf": "2.1.321"}
@@ -172,6 +174,8 @@ def diff(rec: dict, ours: dict, task: str, agent: str) -> tuple[list[str], list[
         kinds.append("grok subagents"); ok.pop("grok_config")
     if agent == "grok" and "background_wait_sec" not in rk and ok.get("background_wait_sec") == 27000:
         kinds.append("grok wait"); ok.pop("background_wait_sec")
+    if agent == "muse" and rk.get("reasoning_effort") == "ultra" and ok.get("reasoning_effort") == "xhigh":
+        kinds.append("muse effort"); rk.pop("reasoning_effort"); ok.pop("reasoning_effort")
     if rk != ok:
         bad.append(f"agents[].kwargs: recorded {rk} printed {ok}")
     renv, oenv = r.pop("env", {}) or {}, o.pop("env", {}) or {}

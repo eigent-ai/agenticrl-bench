@@ -159,7 +159,7 @@ The published settings, used when you give only `--agent`:
 | Claude Code, Fable 5.2 | `ccf` | `claude-fable-5-2` | `reasoning_effort=max version=2.1.321` | `--ae ANTHROPIC_API_KEY` | `api.anthropic.com claude.ai` |
 | Codex | `codex` | `gpt-6-astra` | `reasoning_effort=max` | `--ae OPENAI_API_KEY`, or a ChatGPT login: `CODEX_AUTH_JSON_PATH=<auth.json>` (`--key CODEX_AUTH_JSON_PATH`) | `api.openai.com chatgpt.com auth.openai.com` |
 | Antigravity, Gemini 4 Argon | `antigravity-cli` (`agy`) | `google/gemini-4-argon` | `reasoning_effort=high` | Vertex AI: `AGY_ADC_AUTH=true GOOGLE_APPLICATION_CREDENTIALS=<service-account key>` in the `harbor` process environment | `aiplatform.googleapis.com oauth2.googleapis.com antigravity-cli-auto-updater-974169037036.us-central1.run.app` |
-| Antigravity, Gemini 4 Carbon | `agyc` | `google/gemini-4-carbon` | `reasoning_effort=high` | `--ae GEMINI_API_KEY`; the later re-runs: Vertex AI as Argon | API key: `generativelanguage.googleapis.com antigravity-cli-auto-updater-974169037036.us-central1.run.app`; Vertex AI: as Argon |
+| Antigravity, Gemini 4 Carbon | `agyc` | `google/gemini-4-carbon` | `reasoning_effort=high` | Vertex AI, as Argon | as Argon |
 | Grok Build | `grok-build` | `grok-4.7` | `reasoning_effort=xhigh background_wait_sec=27000` (open-ended: `50000`) `grok_config='{"features": {"subagent_model_inheritance": true}}'` | `--ae XAI_API_KEY` | `api.x.ai cli-chat-proxy.grok.com auth.x.ai accounts.x.ai` |
 | Muse Code | `muse-code` | `meta/muse-wonder-full-1.0` | `reasoning_effort=xhigh` | `--ae META_API_KEY` | `api.meta.ai dev.meta.ai` |
 
@@ -355,8 +355,8 @@ and the task path:
 - the published model runs (`../runs/`, `../open_ended/runs/`): every difference must be of a listed, explained
   kind (the private adapter's name, login variables and hosts; the private model gateway in the box's list; the
   Meta hosts that the first runs did not list yet; an API proxy's model prefix; the first runs' unpinned Claude Code
-  version; the first Grok Build runs' unset `background_wait_sec` and `grok_config`; the nested-sandbox hosts that
-  moved from `task.toml` to the launch).
+  version; the first Grok Build runs' unset `background_wait_sec` and `grok_config`; the Muse Code runs' recorded
+  effort, which their CLIs ran as `xhigh`; the nested-sandbox hosts that moved from `task.toml` to the launch).
   Anything else is printed as UNEXPECTED and the exit code is 1.
 
 Agent environment values are never printed. A copy of the scripts with one host removed from the harness list and
