@@ -1,0 +1,685 @@
+     1	import asyncio
+     2	import logging
+     3	from collections.abc import Iterator
+     4	from contextlib import contextmanager
+     5	from pathlib import Path
+     6	from typing import Any
+     7	
+     8	from miles.backends.training_utils.types import TrainStepOutcome, TrainStepOutput
+     9	from miles.ray.rollout.inference_controller import UpdatableEngines
+    10	from miles.ray.specs.train import compute_trainer_num_cells, compute_trainer_pool_id
+    11	from miles.ray.train.cell import TrainerCell
+    12	from miles.ray.train.cell_monitor import create_trainer_cell_health_checker
+    13	from miles.utils import object_store
+    14	from miles.utils.async_utils import AsyncioGatherUtils, gather_and_raise_first
+    15	from miles.utils.audit_utils.event_analyzer import analyzer as event_analyzer
+    16	from miles.utils.audit_utils.event_logger.logger import get_event_logger, is_event_logger_initialized
+    17	from miles.utils.audit_utils.event_logger.models import (
+    18	    CellReconfigureEvent,
+    19	    TrainGroupStepEndEvent,
+    20	    WitnessAllocateIdEvent,
+    21	)
+    22	from miles.utils.audit_utils.process_identity import TrainerControllerProcessIdentity
+    23	from miles.utils.audit_utils.witness.allocator import WitnessIdAllocator, read_persisted_witness_counter
+    24	from miles.utils.data import RolloutDataPack, remove_train_output_refs
+    25	from miles.utils.ft_utils.api_server.models import CellStatus
+    26	from miles.utils.ft_utils.health_checker import ActivenessTracker, NoopHealthChecker, SimpleHealthCheckerConfig
+    27	from miles.utils.ft_utils.indep_dp import IndepDPInfo, create_tcp_store
+    28	from miles.utils.init_once import InitOnce, init_once
+    29	from miles.utils.logging_utils import configure_logger
+    30	from miles.utils.retry_utils import NonRetryableError, retry, retry_until_deadline
+    31	from miles.utils.test_utils.ft_test_actions import FTTestActionControllerExecutor
+    32	from miles.utils.tracking_utils.structured_log import log_structured
+    33	from miles.utils.workers.cell_operations.base import BaseCellOperations
+    34	from miles.utils.workers.rpc.common.wire_types import Pickled
+    35	from miles.utils.workers.types import DeploymentIdentity
+    36	from miles.utils.workers.worker_provider.base import BaseWorkerProvider, CellInfo, StopWatchFn
+    37	from miles.utils.workers.worker_provider.utils import apply_cell_observation
+    38	
+    39	logger = logging.getLogger(__name__)
+    40	
+    41	
+    42	_RETRY_MAX_ATTEMPTS = 30
+    43	_CELLS_READY_TIMEOUT_SECONDS = 3600.0
+    44	
+    45	
+    46	def compute_trainer_health_checker_config(args, *, expected_num_cells: int) -> SimpleHealthCheckerConfig | None:
+    47	    if expected_num_cells == 1:
+    48	        return None
+    49	    return SimpleHealthCheckerConfig.from_args(args, prefix="trainer_heartbeat_checker")
+    50	
+    51	
+    52	class TrainerController:
+    53	    def __init__(
+    54	        self,
+    55	        *,
+    56	        deployment_identity: DeploymentIdentity,
+    57	        cell_provider: BaseWorkerProvider,
+    58	        cell_operations: BaseCellOperations,
+    59	        trainer_id: str,
+    60	        role: str,
+    61	        with_ref: bool,
+    62	        with_opd_teacher: bool = False,
+    63	    ) -> None:
+    64	        self._init_once = InitOnce(type(self).__name__)
+    65	        self._deployment_identity = deployment_identity
+    66	        self._trainer_id = trainer_id
+    67	        self._role = role
+    68	        self._with_ref = with_ref
+    69	        self._with_opd_teacher = with_opd_teacher
+    70	        self._pool_id = compute_trainer_pool_id(trainer_id)
+    71	        self._provider = cell_provider
+    72	        self._cell_operations = cell_operations
+    73	        self._watcher_disposer: StopWatchFn | None = None
+    74	
+    75	        self._indep_dp_quorum_id = 0
+    76	        self._indep_dp_store: Any | None = None
+    77	        self._indep_dp_store_addr: str | None = None
+    78	
+    79	        self._health_checker_activeness = ActivenessTracker(active=True)
+    80	
+    81	        self._cells_by_id: dict[str, TrainerCell] = {}
+    82	
+    83	    @property
+    84	    def pool_id(self) -> str:
+    85	        return self._pool_id
+    86	
+    87	    @property
+    88	    def expected_num_cells(self) -> int:
+    89	        return self._expected_num_cells
+    90	
+    91	    @property
+    92	    def _expected_num_cells(self) -> int:
+    93	        return compute_trainer_num_cells(self.args, role=self._role)
+    94	
+    95	    @property
+    96	    def _cells(self) -> list[TrainerCell]:
+    97	        return sorted(self._cells_by_id.values(), key=lambda cell: cell.cell_index)
+    98	
+    99	    def has_errored_cell(self) -> bool:
+   100	        return any(cell.is_errored for cell in self._cells)
+   101	
+   102	    @property
+   103	    def cell_ids(self) -> list[str]:
+   104	        return [cell.cell_id for cell in self._cells]
+   105	
+   106	    async def _wait_expected_num_cells(self, timeout: float = _CELLS_READY_TIMEOUT_SECONDS) -> None:
+   107	        async def _check(_remaining: float) -> None:
+   108	            expected = self._expected_num_cells
+   109	            if len(self._cells_by_id) < expected:
+   110	                raise TimeoutError(f"only {len(self._cells_by_id)} of {expected} trainer cells observed")
+   111	
+   112	        await retry_until_deadline(
+   113	            _check,
+   114	            total_seconds=timeout,
+   115	            retry_on=TimeoutError,
+   116	            initial_delay=1.0,
+   117	            max_delay=5.0,
+   118	            log_fields=dict(tag="ft", spec=self._pool_id),
+   119	        )
+   120	
+   121	    async def _reconcile(self, cell_id: str, observed: CellInfo | None) -> None:
+   122	        actual = self._cells_by_id.get(cell_id)
+   123	        await apply_cell_observation(
+   124	            cell_id=cell_id,
+   125	            observed=observed,
+   126	            actual_workers_hash=actual.workers_hash if actual is not None else None,
+   127	            add=self._add_cell,
+   128	            remove=self._remove_cell,
+   129	        )
+   130	
+   131	    async def _add_cell(self, cell_id: str, observed: CellInfo) -> None:
+   132	        self._cells_by_id[cell_id] = self._create_cell(
+   133	            cell_id, cell_index=observed.meta["cell_index"], workers_hash=observed.workers_hash
+   134	        )
+   135	
+   136	    async def _remove_cell(self, cell_id: str) -> None:
+   137	        cell = self._cells_by_id.pop(cell_id)
+   138	        cell.health_checker.stop()
+   139	
+   140	    def _create_cell(self, cell_id: str, *, cell_index: int, workers_hash: str) -> TrainerCell:
+   141	        cell = TrainerCell(
+   142	            args=self.args,
+   143	            role=self._role,
+   144	            with_ref=self._with_ref,
+   145	            with_opd_teacher=self._with_opd_teacher,
+   146	            cell_id=cell_id,
+   147	            cell_index=cell_index,
+   148	            workers_hash=workers_hash,
+   149	            health_checker=NoopHealthChecker(),
+   150	            provider=self._provider,
+   151	        )
+   152	
+   153	        if self._health_checker_config is not None:
+   154	            cell.health_checker = create_trainer_cell_health_checker(
+   155	                cell=cell,
+   156	                config=self._health_checker_config,
+   157	                get_activeness=self._health_checker_activeness.get,
+   158	            )
+   159	
+   160	        return cell
+   161	
+   162	    async def dispose(self) -> None:
+   163	        if (disposer := self._watcher_disposer) is not None:
+   164	            await disposer()
+   165	            self._watcher_disposer = None
+   166	
+   167	    # ------------------------ API :: train ------------------------
+   168	
+   169	    async def train(
+   170	        self,
+   171	        rollout_id: int,
+   172	        rollout_data_pack: RolloutDataPack,
+   173	        external_data: list[TrainStepOutput] | None = None,
+   174	    ) -> list[TrainStepOutput]:
+   175	        """Do one rollout training"""
+   176	
+   177	        assert (
+   178	            external_data is None or len(self._cells) == 1
+   179	        ), "external_data is only supported for a single cell, i.e. without independent DP"
+   180	
+   181	        await asyncio.to_thread(event_analyzer.run_analysis_from_args, self.args)
+   182	
+   183	        async def _fn(attempt: int) -> list[TrainStepOutput]:
+   184	            witness_info = self._allocate_witness_info(
+   185	                rollout_id=rollout_id,
+   186	                attempt=attempt,
+   187	                sample_indices=rollout_data_pack.sample_indices,
+   188	            )
+   189	
+   190	            log_structured(logger.info, tag="ft", op="train", phase="start", rollout=rollout_id, attempt=attempt)
+   191	            await self._refresh_cells(rollout_id=rollout_id)
+   192	            snapshot_alive_cells, results = await self._gather_all_alive_and_catch(
+   193	                lambda cell: cell.train(
+   194	                    rollout_id=rollout_id,
+   195	                    rollout_data_ref=rollout_data_pack.data_ref,
+   196	                    witness_info=witness_info,
+   197	                    attempt=attempt,
+   198	                    external_data=external_data,
+   199	                ),
+   200	                debug_name="execute_all_alive_and_catch#train",
+   201	                check_recoverable=False,
+   202	            )
+   203	            worker_results = [
+   204	                worker_result
+   205	                for cell_results in results
+   206	                if not isinstance(cell_results, BaseException)
+   207	                for worker_result in cell_results
+   208	            ]
+   209	
+   210	            try:
+   211	                self._check_train_one_attempt(snapshot_alive_cells, results)
+   212	            except Exception:
+   213	                remove_train_output_refs(worker_results)
+   214	                raise
+   215	
+   216	            self._log_step_end_event(
+   217	                rollout_id=rollout_id,
+   218	                snapshot_alive_cells=snapshot_alive_cells,
+   219	                results=results,
+   220	            )
+   221	
+   222	            return worker_results
+   223	
+   224	        worker_results = await retry(_fn, max_attempts=_RETRY_MAX_ATTEMPTS)
+   225	
+   226	        await self._test_action_executor.run_after_step(rollout_id=rollout_id)
+   227	
+   228	        return worker_results
+   229	
+   230	    def _allocate_witness_info(self, *, rollout_id: int, attempt: int, sample_indices):
+   231	        if self._witness_allocator is None:
+   232	            return None
+   233	
+   234	        witness_info = self._witness_allocator.allocate(num_ids=len(sample_indices))
+   235	
+   236	        if is_event_logger_initialized():
+   237	            get_event_logger().log(
+   238	                WitnessAllocateIdEvent,
+   239	                dict(
+   240	                    rollout_id=rollout_id,
+   241	                    attempt=attempt,
+   242	                    witness_id_to_sample_index=dict(zip(witness_info.witness_ids, sample_indices, strict=True)),
+   243	                    counter_after=self._witness_allocator.counter,
+   244	                ),
+   245	            )
+   246	
+   247	        return witness_info
+   248	
+   249	    def _log_step_end_event(self, *, rollout_id: int, snapshot_alive_cells: list, results: list):
+   250	        if is_event_logger_initialized():
+   251	            cell_outcomes = {
+   252	                cell.cell_index: (
+   253	                    "error" if isinstance(cell_results, BaseException) else [r.outcome for r in cell_results]
+   254	                )
+   255	                for cell, cell_results in zip(snapshot_alive_cells, results, strict=True)
+   256	            }
+   257	            get_event_logger().log(
+   258	                TrainGroupStepEndEvent,
+   259	                dict(rollout_id=rollout_id, cell_outcomes=cell_outcomes),
+   260	            )
+   261	
+   262	    def _check_train_one_attempt(self, snapshot_alive_cells, results):
+   263	        outcomes = TrainerController._compute_attempt_outcomes(snapshot_alive_cells, results)
+   264	        if not outcomes["normal"] and not outcomes["discarded"]:
+   265	            cause = _first_exception(results)
+   266	            error = self._make_all_cells_failed_error("All cells failed in this training attempt", cause=cause)
+   267	            log_structured(
+   268	                logger.error,
+   269	                tag="ft",
+   270	                op="check",
+   271	                **outcomes,
+   272	                decision="give_up" if isinstance(error, NonRetryableError) else "retry",
+   273	                reason="all alive cells failed",
+   274	            )
+   275	            raise error from cause
+   276	
+   277	        # NOTE: If some cells errors + all other cells claim normal, we do *not* retry
+   278	        #       This may happen when some cells fails *after* exchanging gradients w/ others
+   279	        if outcomes["discarded"]:
+   280	            log_structured(
+   281	                logger.warning,
+   282	                tag="ft",
+   283	                op="check",
+   284	                **outcomes,
+   285	                decision="retry" if self._is_recoverable() else "give_up",
+   286	                reason="discarded_should_retry",
+   287	            )
+   288	            raise ValueError("Exists DISCARDED_SHOULD_RETRY, thus need retry")
+   289	
+   290	        log_structured(
+   291	            logger.info,
+   292	            tag="ft",
+   293	            op="check",
+   294	            **outcomes,
+   295	            decision="no_retry",
+   296	            reason="survivors normal, gradients valid",
+   297	        )
+   298	
+   299	    @staticmethod
+   300	    def _compute_attempt_outcomes(snapshot_alive_cells, results) -> dict[str, list[int]]:
+   301	        paired = list(zip(snapshot_alive_cells, results, strict=True))
+   302	        errored = [c.cell_index for c, r in paired if isinstance(r, BaseException)]
+   303	        discarded = [
+   304	            c.cell_index
+   305	            for c, r in paired
+   306	            if not isinstance(r, BaseException)
+   307	            and any(o.outcome == TrainStepOutcome.DISCARDED_SHOULD_RETRY for o in r)
+   308	        ]
+   309	        normal = [c.cell_index for c, r in paired if c.cell_index not in errored and c.cell_index not in discarded]
+   310	        return {"errored": errored, "discarded": discarded, "normal": normal}
+   311	
+   312	    # ------------------------ API :: others ------------------------
+   313	
+   314	    @init_once
+   315	    async def init(self, args: Pickled) -> list[Any]:
+   316	        """
+   317	        Observe the controller's cells, then allocate GPU resources and initialize
+   318	        model, optimzier, local ckpt, etc.
+   319	        """
+   320	        self.args = args
+   321	        configure_logger(
+   322	            args, source=TrainerControllerProcessIdentity(trainer_id=self._trainer_id, model_id=args.trainer_model_id)
+   323	        )
+   324	        object_store.init_instance(args, contribute_segment=False)
+   325	
+   326	        if self._expected_num_cells > 1:
+   327	            self._indep_dp_store, self._indep_dp_store_addr = create_tcp_store()
+   328	
+   329	        self._health_checker_config = compute_trainer_health_checker_config(
+   330	            args, expected_num_cells=self._expected_num_cells
+   331	        )
+   332	
+   333	        self._witness_allocator: WitnessIdAllocator | None = (
+   334	            WitnessIdAllocator(buffer_size=args.witness_buffer_size) if args.enable_witness else None
+   335	        )
+   336	        if self._witness_allocator is not None and args.save_debug_event_data is not None:
+   337	            self._witness_allocator.resume(read_persisted_witness_counter(Path(args.save_debug_event_data)))
+   338	
+   339	        self._test_action_executor = FTTestActionControllerExecutor.from_args(
+   340	            args, controller=self, cell_operations=self._cell_operations
+   341	        )
+   342	
+   343	        self._watcher_disposer = await self._provider.watch_cells(self._reconcile)
+   344	        await self._wait_expected_num_cells()
+   345	
+   346	        cell_results = await asyncio.gather(
+   347	            *[
+   348	                cell.init(
+   349	                    indep_dp_info=self._compute_indep_dp_info(
+   350	                        cell_index=cell.cell_index,
+   351	                        # all cells will be alive for this first initialization
+   352	                        alive_cell_indices=list(range(len(self._cells))),
+   353	                    ),
+   354	                    indep_dp_store_addr=self._indep_dp_store_addr,
+   355	                )
+   356	                for cell in self._cells
+   357	            ]
+   358	        )
+   359	        return [item for sublist in cell_results for item in sublist]
+   360	
+   361	    async def is_initialized(self) -> bool:
+   362	        return self._init_once.is_initialized()
+   363	
+   364	    async def load_state(self) -> list[Any]:
+   365	        assert self._init_once.is_initialized()
+   366	
+   367	        await self._wait_expected_num_cells(timeout=_CELLS_READY_TIMEOUT_SECONDS)
+   368	
+   369	        not_alive = [cell.cell_id for cell in self._cells if not cell.is_alive]
+   370	        assert not not_alive, f"a reload does not support cells that are not alive: {not_alive}"
+   371	
+   372	        cell_results = await gather_and_raise_first([cell.load_state() for cell in self._cells])
+   373	        return [item for sublist in cell_results for item in sublist]
+   374	
+   375	    async def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
+   376	        """Save actor model. Only cell 0 saves to avoid file write conflicts."""
+   377	        # Catch with vanilla retry: cells w/ exceptions are auto marked errored, thus retry will find the next one
+   378	        await retry(
+   379	            lambda _: self._execute_first_alive("save_model", rollout_id=rollout_id, force_sync=force_sync),
+   380	            max_attempts=_RETRY_MAX_ATTEMPTS,
+   381	        )
+   382	
+   383	    async def export_hf(self, rollout_id: int, path: str) -> None:
+   384	        """Export current weights as an HF checkpoint. Only cell 0 exports to avoid file write conflicts."""
+   385	        await retry(
+   386	            lambda _: self._execute_first_alive("export_hf", rollout_id=rollout_id, path=path),
+   387	            max_attempts=_RETRY_MAX_ATTEMPTS,
+   388	        )
+   389	
+   390	    async def update_weights(self, info: UpdatableEngines, rollout_id: int | None = None) -> int | None:
+   391	        """Broadcast weights to rollout engines and answer the version they now serve."""
+   392	        log_structured(logger.info, tag="ft", op="update_weights", phase="start", rollout=rollout_id)
+   393	        # TODO: allow using all cells to update weights (instead of first alive cell)
+   394	        # Catch with vanilla retry: cells w/ exceptions are auto marked errored, thus retry will find the next one
+   395	        weight_versions = await retry(
+   396	            lambda _: self._execute_first_alive("update_weights", info=info),
+   397	            max_attempts=_RETRY_MAX_ATTEMPTS,
+   398	        )
+   399	        return weight_versions[0]
+   400	
+   401	    async def get_deployment_identity(self) -> DeploymentIdentity:
+   402	        return self._deployment_identity
+   403	
+   404	    async def onload(self) -> None:
+   405	        # Catch *without* retry: cells w/ exceptions are auto marked errored, and will not be used
+   406	        await self._execute_all_alive_and_catch("wake_up")
+   407	        self._health_checker_activeness.bump_active(True)
+   408	
+   409	    @contextmanager
+   410	    def _paused_health_checkers(self) -> Iterator[None]:
+   411	        self._health_checker_activeness.bump_active(False)
+   412	        try:
+   413	            yield
+   414	        finally:
+   415	            self._health_checker_activeness.bump_active(True)
+   416	
+   417	    async def offload(self) -> None:
+   418	        self._health_checker_activeness.bump_active(False)
+   419	        # Catch *without* retry: cells w/ exceptions are auto marked errored, and will not be used
+   420	        await self._execute_all_alive_and_catch("sleep")
+   421	
+   422	    async def clear_memory(self) -> None:
+   423	        # Catch *without* retry: cells w/ exceptions are auto marked errored, and will not be used
+   424	        await self._execute_all_alive_and_catch("clear_memory")
+   425	
+   426	    async def offload_grad_buffer(self) -> None:
+   427	        # Catch *without* retry: cells w/ exceptions are auto marked errored, and will not be used
+   428	        await self._execute_all_alive_and_catch("offload_grad_buffer")
+   429	
+   430	    # ------------------------ API :: multi-LoRA slot commands ------------------------
+   431	
+   432	    async def _execute_slots(self, fn_name: str, **kwargs) -> list:
+   433	        (cell,) = self._cells
+   434	        assert cell.is_alive, "the Tinker trainer cell is unavailable"
+   435	        return await cell.execute(fn_name, **kwargs)
+   436	
+   437	    async def forward_backward(self, batch_id: int, data_ref: object_store.StoreObjectRef) -> list:
+   438	        return await self._execute_slots("forward_backward", batch_id=batch_id, rollout_data_ref=data_ref)
+   439	
+   440	    async def optim_step(self, adam_params_by_slot: dict[int, dict]) -> list:
+   441	        return await self._execute_slots("optim_step", adam_params_by_slot=adam_params_by_slot)
+   442	
+   443	    async def forward_only(self, batch_id: int, data_ref: object_store.StoreObjectRef) -> list:
+   444	        return await self._execute_slots("forward_only", batch_id=batch_id, rollout_data_ref=data_ref)
+   445	
+   446	    async def load_slot(
+   447	        self, slot: int, rank: int, alpha: float, ckpt_path: str | None = None, load_optimizer: bool = True
+   448	    ) -> list:
+   449	        return await self._execute_slots(
+   450	            "load_slot", slot=slot, rank=rank, alpha=alpha, ckpt_path=ckpt_path, load_optimizer=load_optimizer
+   451	        )
+   452	
+   453	    async def save_slot(self, slot: int, path: str, metadata: dict | None = None) -> list:
+   454	        return await self._execute_slots("save_slot", slot=slot, path=path, metadata=metadata)
+   455	
+   456	    async def export_slot(self, slot: int, rank: int, alpha: float, path: str, metadata: dict | None = None) -> list:
+   457	        return await self._execute_slots(
+   458	            "export_slot", slot=slot, rank=rank, alpha=alpha, path=path, metadata=metadata
+   459	        )
+   460	
+   461	    async def unload_slot(self, slot: int) -> list:
+   462	        return await self._execute_slots("unload_slot", slot=slot)
+   463	
+   464	    async def get_train_parallel_config(self) -> dict[str, Any]:
+   465	        return (await self._execute_first_alive("get_train_parallel_config"))[0]
+   466	
+   467	    async def get_cell_statuses(self) -> dict[str, CellStatus]:
+   468	        return {cell_id: cell.cell_status() for cell_id, cell in list(self._cells_by_id.items())}
+   469	
+   470	    # ------------------------ utils to forward calls to cells ------------------------
+   471	
+   472	    def _is_recoverable(self) -> bool:
+   473	        return any(cell.is_alive for cell in self._cells)
+   474	
+   475	    def _make_all_cells_failed_error(self, message: str, *, cause: BaseException | None = None) -> Exception:
+   476	        if isinstance(cause, NonRetryableError):
+   477	            return NonRetryableError(message)
+   478	        return RuntimeError(message) if self._is_recoverable() else NonRetryableError(message)
+   479	
+   480	    def _raise_if_no_cell_can_recover(self, *, debug_name: str, cause: BaseException | None) -> None:
+   481	        if self._is_recoverable():
+   482	            return
+   483	        raise self._make_all_cells_failed_error(f"All cells failed during {debug_name}", cause=cause) from cause
+   484	
+   485	    async def _execute_all_alive_and_catch(self, fn_name: str, *, check_recoverable: bool = True, **kwargs):
+   486	        return await self._gather_all_alive_and_catch(
+   487	            lambda cell: cell.execute(fn_name, **kwargs),
+   488	            debug_name=f"execute_all_alive_and_catch#{fn_name}",
+   489	            check_recoverable=check_recoverable,
+   490	        )
+   491	
+   492	    async def _gather_all_alive_and_catch(self, compute_coroutine, *, debug_name: str, check_recoverable: bool = True):
+   493	        snapshot_alive_cells = [c for c in self._cells if c.is_alive]
+   494	        if not snapshot_alive_cells:
+   495	            raise NonRetryableError("No alive cells")
+   496	        # NOTE: no timeout here. If a cell hangs, the external FT controller
+   497	        # detects stale heartbeat via cell_status() and suspends the cell through
+   498	        # the worker manager, which unblocks this gather with ActorDiedError.
+   499	        outputs = await asyncio.gather(
+   500	            *[compute_coroutine(cell) for cell in snapshot_alive_cells],
+   501	            return_exceptions=True,
+   502	        )
+   503	        AsyncioGatherUtils.log_error(outputs, debug_name=debug_name)
+   504	        if check_recoverable:
+   505	            self._raise_if_no_cell_can_recover(debug_name=debug_name, cause=_first_exception(outputs))
+   506	        return snapshot_alive_cells, outputs
+   507	
+   508	    async def _execute_first_alive(self, fn_name: str, **kwargs):
+   509	        alive_cells = [c for c in self._cells if c.is_alive]
+   510	        if not alive_cells:
+   511	            raise NonRetryableError("No alive cells, therefore cannot heal anymore")
+   512	        try:
+   513	            return await alive_cells[0].execute(fn_name, **kwargs)
+   514	        except Exception as cause:
+   515	            self._raise_if_no_cell_can_recover(debug_name=f"execute_first_alive#{fn_name}", cause=cause)
+   516	            raise
+   517	
+   518	    # ------------------------ internals for stop/start ------------------------
+   519	
+   520	    async def _refresh_cells(self, *, rollout_id: int) -> None:
+   521	        snapshotted_healing_indices = [c.cell_index for c in self._cells if c.is_uninitialized]
+   522	        snapshotted_alive_indices = [c.cell_index for c in self._cells if c.is_alive]
+   523	        will_alive_indices = sorted(list(set(snapshotted_healing_indices + snapshotted_alive_indices)))
+   524	        all_states = [(c.cell_index, c.state_name) for c in self._cells]
+   525	        log_structured(
+   526	            logger.info,
+   527	            tag="ft",
+   528	            op="refresh",
+   529	            phase="start",
+   530	            rollout=rollout_id,
+   531	            alive=snapshotted_alive_indices,
+   532	            healing=snapshotted_healing_indices,
+   533	            all_states=all_states,
+   534	            quorum=self._indep_dp_quorum_id,
+   535	        )
+   536	        if not snapshotted_alive_indices:
+   537	            raise NonRetryableError("Cannot recover when all cells are dead")
+   538	
+   539	        # Step 0: Determine whether need to reconfigure
+   540	        exists_alive_cell_changed_config = any(
+   541	            cell.indep_dp_info.alive_cell_indices != will_alive_indices
+   542	            for cell in self._cells
+   543	            if cell.cell_index in snapshotted_alive_indices
+   544	        )
+   545	        exists_healing_cell = len(snapshotted_healing_indices) != 0
+   546	        needs_reconfigure = exists_healing_cell or exists_alive_cell_changed_config
+   547	        if not needs_reconfigure:
+   548	            log_structured(
+   549	                logger.info,
+   550	                tag="ft",
+   551	                op="refresh",
+   552	                phase="decision",
+   553	                rollout=rollout_id,
+   554	                needs_reconfigure=False,
+   555	                reason="alive_config_unchanged,no_healing",
+   556	                quorum=self._indep_dp_quorum_id,
+   557	            )
+   558	            return
+   559	        reason = "+".join(
+   560	            r
+   561	            for r, on in [
+   562	                ("healing_cell", exists_healing_cell),
+   563	                ("alive_config_changed", exists_alive_cell_changed_config),
+   564	            ]
+   565	            if on
+   566	        )
+   567	        log_structured(
+   568	            logger.info,
+   569	            tag="ft",
+   570	            op="refresh",
+   571	            phase="decision",
+   572	            rollout=rollout_id,
+   573	            needs_reconfigure=True,
+   574	            reason=reason,
+   575	            will_alive=will_alive_indices,
+   576	            quorum_from=self._indep_dp_quorum_id,
+   577	            quorum_to=self._indep_dp_quorum_id + 1,
+   578	        )
+   579	
+   580	        # Step 1: Bump states
+   581	        self._indep_dp_quorum_id += 1
+   582	
+   583	        # Step 2: Cooperatively prepare
+   584	        src_cell_index = snapshotted_alive_indices[0]  # TODO make it balanced, and support multi-src-to-one-dst
+   585	        src_alive_rank = will_alive_indices.index(src_cell_index)
+   586	        ckpt_dst_alive_ranks = [will_alive_indices.index(x) for x in snapshotted_healing_indices]
+   587	
+   588	        with self._paused_health_checkers():
+   589	            coop_prepare_outputs = await asyncio.gather(
+   590	                *[
+   591	                    (
+   592	                        c.prepare_indep_dp_mode_alive(
+   593	                            indep_dp_info=self._compute_indep_dp_info(
+   594	                                c.cell_index, alive_cell_indices=will_alive_indices
+   595	                            ),
+   596	                            indep_dp_store_addr=self._indep_dp_store_addr,
+   597	                            send_ckpt_dst_ranks=ckpt_dst_alive_ranks if c.cell_index == src_cell_index else [],
+   598	                        )
+   599	                        if c.cell_index in snapshotted_alive_indices
+   600	                        else c.prepare_indep_dp_mode_healing(
+   601	                            indep_dp_info=self._compute_indep_dp_info(
+   602	                                c.cell_index, alive_cell_indices=will_alive_indices
+   603	                            ),
+   604	                            indep_dp_store_addr=self._indep_dp_store_addr,
+   605	                            recv_ckpt_src_rank=src_alive_rank if c.cell_index in snapshotted_healing_indices else None,
+   606	                        )
+   607	                    )
+   608	                    for c in self._cells
+   609	                    if c.cell_index in will_alive_indices
+   610	                ],
+   611	                return_exceptions=True,
+   612	            )
+   613	        # No need to do anything else - cells with exceptions will auto mark itself as errored
+   614	        AsyncioGatherUtils.log_error(coop_prepare_outputs, debug_name="refresh_cells#cooperatively_prepare")
+   615	
+   616	        if not AsyncioGatherUtils.has_error(coop_prepare_outputs):
+   617	            assert [c.cell_index for c in self._cells if c.is_alive] == will_alive_indices
+   618	            log_structured(
+   619	                logger.info,
+   620	                tag="ft",
+   621	                op="refresh",
+   622	                phase="end",
+   623	                rollout=rollout_id,
+   624	                quorum=self._indep_dp_quorum_id,
+   625	                alive=will_alive_indices,
+   626	                healed=snapshotted_healing_indices,
+   627	                reconfigured=True,
+   628	            )
+   629	            self._log_reconfigure_event(
+   630	                rollout_id=rollout_id,
+   631	                src_cell_index=src_cell_index if snapshotted_healing_indices else None,
+   632	                healed_cell_indices=snapshotted_healing_indices,
+   633	                alive_cell_indices_after=will_alive_indices,
+   634	            )
+   635	        else:
+   636	            log_structured(
+   637	                logger.error,
+   638	                tag="ft",
+   639	                op="refresh",
+   640	                phase="end",
+   641	                rollout=rollout_id,
+   642	                reconfigured=False,
+   643	                quorum=self._indep_dp_quorum_id,
+   644	                reason="cooperative_prepare_raised",
+   645	            )
+   646	
+   647	    def _log_reconfigure_event(
+   648	        self,
+   649	        *,
+   650	        rollout_id: int,
+   651	        src_cell_index: int | None,
+   652	        healed_cell_indices: list[int],
+   653	        alive_cell_indices_after: list[int],
+   654	    ) -> None:
+   655	        if is_event_logger_initialized():
+   656	            get_event_logger().log(
+   657	                CellReconfigureEvent,
+   658	                dict(
+   659	                    rollout_id=rollout_id,
+   660	                    quorum_id=self._indep_dp_quorum_id,
+   661	                    src_cell_index=src_cell_index,
+   662	                    healed_cell_indices=healed_cell_indices,
+   663	                    alive_cell_indices_after=alive_cell_indices_after,
+   664	                ),
+   665	            )
+   666	
+   667	    def _compute_indep_dp_info(self, cell_index: int, alive_cell_indices: list[int]) -> IndepDPInfo:
+   668	        return IndepDPInfo(
+   669	            cell_index=cell_index,
+   670	            num_cells=len(self._cells),
+   671	            alive_rank=alive_cell_indices.index(cell_index),
+   672	            alive_size=len(alive_cell_indices),
+   673	            quorum_id=self._indep_dp_quorum_id,
+   674	            alive_cell_indices=alive_cell_indices,
+   675	        )
+   676	
+   677	    # ------------------------ misc states and utils ------------------------
+   678	
+   679	    @property
+   680	    def num_cells(self) -> int:
+   681	        return len(self._cells)
+   682	
+   683	
+   684	def _first_exception(results) -> BaseException | None:
+   685	    return next((result for result in results if isinstance(result, BaseException)), None)

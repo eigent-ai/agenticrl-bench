@@ -1,0 +1,68 @@
+Read text file `/root/miles/miles/backends/megatron_utils/actor.py`.
+(679 line(s) above)
+680|                    data_iterator=data_iterator,
+681|                    num_microbatches=num_microbatches,
+682|                    rollout_data=rollout_data,
+683|                    data_key=m.data_key,
+684|                    replay_list=m.replays,
+685|                    register_replay_list_func=m.register_replay_list_func,
+686|                    if_sp_region=m.if_sp_region,
+687|                    indices_are_token_positions=m.replay_indices_are_token_positions,
+688|                )
+689|
+690|        with inverse_timer("train_wait"), timer("train"):
+691|            if self.args.compute_advantages_and_returns:
+692|                if "ref" in self.weights_backuper.backup_tags:
+693|                    self._set_replay_stage("fallthrough")
+694|                    self._switch_model("ref")
+695|                    rollout_data.update(
+696|                        self._compute_log_prob(
+697|                            data_iterator,
+698|                            num_microbatches,
+699|                            rollout_id=rollout_id,
+700|                            store_prefix="ref_",
+701|                        )
+702|                    )
+703|                # Forward teacher model to get teacher_log_probs for Megatron-based OPD
+704|                if "teacher" in self.weights_backuper.backup_tags:
+705|                    self._set_replay_stage("fallthrough")
+706|                    self._switch_model("teacher")
+707|                    rollout_data.update(
+708|                        self._compute_log_prob(
+709|                            data_iterator,
+710|                            num_microbatches,
+711|                            rollout_id=rollout_id,
+712|                            store_prefix="teacher_",
+713|                        )
+714|                    )
+715|                self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
+716|                if not skip_actor_forward_only and (
+717|                    not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics
+718|                ):
+719|                    for m in all_replay_managers:
+720|                        if m.enabled:
+721|                            if self._use_rollout_replay(m):
+722|                                m.stage = "replay_forward"
+723|                            else:
+724|                                m.stage = "record"
+725|                    rollout_data.update(
+726|                        self._compute_log_prob(
+727|                            data_iterator,
+728|                            num_microbatches,
+729|                            rollout_id=rollout_id,
+730|                            store_prefix="",
+731|                        )
+732|                    )
+733|                    for m in all_replay_managers:
+734|                        if self._use_rollout_replay(m):
+735|                            m.clear_all_forward()
+736|
+737|                if self.args.use_critic:
+738|                    if external_data is not None and get_parallel_state().is_pp_last_stage:
+739|                        values_ref = external_data.values
+740|                        assert values_ref is not None, (
+741|                            "actor and critic share the same parallel topology, so the critic rank "
+742|                            "paired with a pp-last-stage actor rank must have shipped 'values'"
+743|                        )
+744|                        with object_store.get_instance().get(values_ref) as shipped:
+(more lines below)

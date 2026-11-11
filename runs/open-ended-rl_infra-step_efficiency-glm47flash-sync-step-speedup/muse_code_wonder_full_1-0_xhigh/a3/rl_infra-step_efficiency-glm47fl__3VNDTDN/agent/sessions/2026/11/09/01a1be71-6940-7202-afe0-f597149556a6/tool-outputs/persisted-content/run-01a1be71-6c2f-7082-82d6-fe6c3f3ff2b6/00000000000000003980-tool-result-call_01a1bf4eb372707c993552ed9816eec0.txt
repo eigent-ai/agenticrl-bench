@@ -1,0 +1,63 @@
+edited
+changed lines: line 189
+--- original
++++ updated
+@@
+-    def _maybe_collect_indexer_topk(self, req: Req):
++    # Header row (first 8 int32 of the flattened payload):
++    #   [magic, fmt, start_row, conv_key_hash31, turn, rows, num_layers, topk]
++    # fmt 1: payload rows are int32 (rows, layers, topk).
++    # fmt 2: payload rows are uint8 expert ids packed 4-per-int32 along topk
++    #        (requires topk == 4), i.e. int32 (rows, layers, 1).
++    _ROUTED_DELTA_MAGIC = 0x4F454452
++
++    def _collect_routed_experts_delta(self, req: Req, capturer) -> bool:
++        cp = getattr(getattr(req, "sampling_params", None), "custom_params", None)
++        if not isinstance(cp, dict) or cp.get("oe_ep") is None:
++            return False
++        key = str(cp["oe_ep"])
++        try:
++            turn = int(cp.get("oe_turn") or 0)
++        except (TypeError, ValueError):
++            turn = 0
++        state = getattr(self, "_routed_delta_state", None)
++        if state is None:
++            state = self._routed_delta_state = {}
++        if turn == 0:
++            state.pop(key, None)
++        seqlen = len(req.origin_input_ids) + len(req.output_ids_through_stop)
++        rows_total = max(0, seqlen - 1)
++        start = state.get(key, 0)
++        if start > rows_total:
++            state.pop(key, None)
++            return False
++        t = capturer.get_topk(
++            req_pool_idx=req.kv.req_pool_idx,
++            seqlen=seqlen,
++            req_to_token_pool=self.req_to_token_pool,
++            start_len=start,
++        )
++        if t is None or t.dim() != 3 or t.shape[0] != rows_total - start:
++            state.pop(key, None)
++            return False
++        rows, layers, topk = (int(x) for x in t.shape)
++        fmt, payload = 1, t
++        if rows > 0 and topk == 4 and int(t.min()) >= 0 and int(t.max()) <= 255:
++            u = t.to(torch.int32)
++            payload = (u[..., 0] | (u[..., 1] << 8) | (u[..., 2] << 16) | (u[..., 3] << 24)).unsqueeze(-1)
++            fmt = 2
++        header = torch.zeros((1, payload.shape[1], payload.shape[2]), dtype=torch.int32)
++        hv = header.view(-1)
++        hv[0] = self._ROUTED_DELTA_MAGIC
++        hv[1] = fmt
++        hv[2] = start
++        hv[3] = zlib.crc32(key.encode()) & 0x7FFFFFFF
++        hv[4] = turn
++        hv[5] = rows
++        hv[6] = layers
++        hv[7] = topk
++        req.routed_experts = torch.cat([header, payload], dim=0)
++        state[key] = rows_total
++        return True
++
++    def _maybe_collect_indexer_topk(self, req: Req):

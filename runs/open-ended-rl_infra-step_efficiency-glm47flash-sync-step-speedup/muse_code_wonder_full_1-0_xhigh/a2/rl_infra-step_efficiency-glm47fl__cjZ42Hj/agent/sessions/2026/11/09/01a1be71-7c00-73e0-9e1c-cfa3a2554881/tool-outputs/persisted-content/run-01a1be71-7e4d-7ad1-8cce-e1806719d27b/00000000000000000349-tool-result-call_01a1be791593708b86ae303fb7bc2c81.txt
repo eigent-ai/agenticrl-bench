@@ -1,0 +1,103 @@
+Read text file `/sgl-workspace/sglang/python/sglang/srt/managers/scheduler_components/batch_result_processor.py`.
+(119 line(s) above)
+120|            self.token_to_kv_pool_allocator.free_group_begin()
+121|        for req in batch.reqs:
+122|            req.time_stats.set_decode_prebuilt_finish_time()
+123|            req.update_finish_state()
+124|            if req.finished():
+125|                req.time_stats.set_quick_finish_time()
+126|                if get_memory().enable_hisparse:
+127|                    self.hisparse_coordinator.request_finished(req)
+128|                release_kv_cache(req, self.tree_cache)
+129|
+130|        # Note: Logprobs should be handled on the prefill engine.
+131|        self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
+132|        if use_free_group:
+133|            self.token_to_kv_pool_allocator.free_group_end()
+134|
+135|    def _maybe_collect_routed_experts(self, req: Req):
+136|        """Collect routed experts for a finished request.
+137|
+138|        Returns immediately if `return_routed_experts` was not set on the
+139|        request, so non-opted-in reqs don't pay the host-gather cost.
+140|
+141|        Honors the caller's absolute start so the response covers
+142|        `[start_len, seqlen - 1)`. The default start_len is 0, which returns
+143|        the full sequence.
+144|
+145|        Logs a soft warning if the resulting tensor's row count differs from
+146|        the expected `seqlen - 1 - start_len`, to catch silent regressions.
+147|        """
+148|        if not req.return_routed_experts:
+149|            return
+150|        capturer = get_global_experts_capturer()
+151|        if capturer is None:
+152|            return
+153|        start_len = req.routed_experts_start_len
+154|        seqlen = len(req.origin_input_ids) + len(req.output_ids_through_stop)
+155|        req.routed_experts = capturer.get_topk(
+156|            req_pool_idx=req.kv.req_pool_idx,
+157|            seqlen=seqlen,
+158|            req_to_token_pool=self.req_to_token_pool,
+159|            start_len=start_len,
+160|        )
+161|
+162|        expected_rows = max(0, seqlen - 1 - start_len)
+163|        if (
+164|            req.routed_experts is not None
+165|            and req.routed_experts.shape[0] != expected_rows
+166|        ):
+167|            logger.warning(
+168|                "routed_experts row-count mismatch for req %s: got %d, expected %d "
+169|                "(seqlen=%d, raw_seqlen=%d, cached_tokens=%d, start_len=%s). "
+170|                "This indicates a silent bug.",
+171|                req.rid,
+172|                req.routed_experts.shape[0],
+173|                expected_rows,
+174|                seqlen,
+175|                req.seqlen,
+176|                req.cached_tokens,
+177|                req.routed_experts_start_len,
+178|            )
+179|
+180|    def _maybe_collect_indexer_topk(self, req: Req):
+181|        capturer = get_global_indexer_capturer()
+182|        if capturer is None:
+183|            return
+184|        seqlen = len(req.origin_input_ids) + len(req.output_ids_through_stop)
+185|        req.indexer_topk = capturer.get_topk(
+186|            req_pool_idx=req.kv.req_pool_idx,
+187|            seqlen=seqlen,
+188|            req_to_token_pool=self.req_to_token_pool,
+189|        )
+190|
+191|    def _maybe_collect_customized_info(
+192|        self,
+193|        i: int,
+194|        req: Req,
+195|        logits_output: LogitsProcessorOutput,
+196|    ):
+197|        if logits_output is not None and logits_output.customized_info is not None:
+198|            if req.customized_info is None:
+199|                req.customized_info = {}
+200|            for k, v in logits_output.customized_info.items():
+201|                if k not in req.customized_info:
+202|                    req.customized_info[k] = []
+203|                # Copy the element so it doesn't retain the entire batch
+204|                # tensor/array via a view reference.
+205|                elem = v[i]
+206|                if isinstance(elem, torch.Tensor):
+207|                    elem = elem.clone()
+208|                elif hasattr(elem, "copy") and callable(elem.copy):
+209|                    elem = elem.copy()
+210|                req.customized_info[k].append(elem)
+211|
+212|    @staticmethod
+213|    def _visible_output_len(req: Req) -> int:
+214|        return req.finished_len if req.finished_len is not None else len(req.output_ids)
+215|
+216|    @classmethod
+217|    def snapshot_auxiliary_output_starts(
+218|        cls,
+219|        batch: ScheduleBatch,
+(more lines below)

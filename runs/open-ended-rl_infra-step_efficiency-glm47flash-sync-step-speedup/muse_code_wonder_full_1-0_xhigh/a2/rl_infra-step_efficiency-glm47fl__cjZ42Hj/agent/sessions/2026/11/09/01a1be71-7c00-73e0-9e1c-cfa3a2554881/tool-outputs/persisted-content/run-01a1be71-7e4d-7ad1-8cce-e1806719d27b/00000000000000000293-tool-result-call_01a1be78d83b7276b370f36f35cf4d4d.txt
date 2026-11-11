@@ -1,0 +1,178 @@
+Read text file `/sgl-workspace/sglang/python/sglang/srt/state_capturer/routed_experts.py`.
+1|from typing import Any, Optional
+2|
+3|import numpy as np
+4|import pybase64
+5|import torch
+6|
+7|from sglang.srt.configs.model_config import ModelConfig
+8|from sglang.srt.layers.dp_attention import (
+9|    attn_tp_all_gather_into_tensor,
+10|    get_dp_local_slice_cpu,
+11|    is_dp_attention_enabled,
+12|)
+13|from sglang.srt.layers.moe import get_moe_a2a_backend
+14|from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+15|from sglang.srt.runtime_context import (
+16|    get_exec,
+17|    get_parallel,
+18|    get_resources,
+19|    get_schedule,
+20|)
+21|from sglang.srt.state_capturer.base import BaseTopkCapturer
+22|
+23|
+24|def _is_scattered_a2a_backend() -> bool:
+25|    """Return whether routed tokens are scattered across attention-TP ranks."""
+26|    backend = get_moe_a2a_backend()
+27|    return backend.is_deepep() or backend.is_deepep_v2()
+28|
+29|
+30|class RoutedExpertsCapturer(BaseTopkCapturer):
+31|    """Capturer for routed experts with host buffer.
+32|
+33|    Routed experts share a global device buffer across DP ranks (indexed by
+34|    dp_rank), so `_get_local_slice` overrides the default to apply DP-rank-aware
+35|    slicing. The device cache also holds extra columns for any fused shared
+36|    experts; the host cache and user-facing return drop them via the
+37|    [:topk_size] truncation.
+38|    """
+39|
+40|    @staticmethod
+41|    def create(
+42|        *,
+43|        model: torch.nn.Module,
+44|        model_config: ModelConfig,
+45|        num_tokens: int,
+46|        max_running_requests: int,
+47|        device: str,
+48|    ) -> Optional["RoutedExpertsCapturer"]:
+49|        if not get_exec().features.enable_return_routed_experts:
+50|            return None
+51|        # The model's own attribute is the baked decision (0 when its gate
+52|        # disabled fusion); the ACTIVE flag can be holding another runner's.
+53|        num_fused_shared_experts = getattr(model, "num_fused_shared_experts", 0)
+54|        return RoutedExpertsCapturer(
+55|            model_config,
+56|            num_tokens=num_tokens,
+57|            max_running_requests=max_running_requests,
+58|            num_fused_shared_experts=num_fused_shared_experts,
+59|            device=device,
+60|        )
+61|
+62|    def __init__(
+63|        self,
+64|        model_config: ModelConfig,
+65|        num_tokens: int,
+66|        max_running_requests: int,
+67|        num_fused_shared_experts: int,
+68|        device: str,
+69|    ):
+70|        self.num_fused_shared_experts = num_fused_shared_experts
+71|        topk_size = model_config.hf_text_config.num_experts_per_tok
+72|        num_layers = model_config.hf_text_config.num_hidden_layers
+73|
+74|        # Scale by dp_size so the buffer covers the full DP-concatenated batch.
+75|        # _get_local_slice indexes into [attention_dp_rank * cuda_graph_batch, ...)
+76|        # and otherwise overflows on dp_rank > 0 when max_running_requests >
+77|        # chunked_prefill_size.
+78|        # FIXME: spec decoding's num_verify_tokens is still not accounted for.
+79|        max_batch_size = max(
+80|            get_schedule().chunked_prefill_size * get_parallel().dp_size,
+81|            max_running_requests * get_parallel().dp_size,
+82|        )
+83|
+84|        super().__init__(
+85|            num_tokens=num_tokens,
+86|            max_batch_size=max_batch_size,
+87|            num_layers=num_layers,
+88|            topk_size=topk_size,
+89|            device=device,
+90|            name="routed_experts",
+91|            device_topk_size=topk_size + num_fused_shared_experts,
+92|        )
+93|
+94|        # Rebuild the full token batch before routed-expert readback.
+95|        if _is_scattered_a2a_backend():
+96|            attn_tp_size = (
+97|                get_parallel().attn_tp_size if is_dp_attention_enabled() else 1
+98|            )
+99|            self.gather_buffer = torch.empty(
+100|                (
+101|                    self.device_cache.buffer.shape[0] * attn_tp_size,
+102|                    self.device_cache.buffer.shape[2],
+103|                ),
+104|                dtype=torch.int32,
+105|                device=device,
+106|            )
+107|
+108|    def capture(self, layer_id: int, topk_indices: torch.Tensor):
+109|        if _is_scattered_a2a_backend():
+110|            local_topk = topk_indices
+111|            topk_indices = self.gather_buffer[
+112|                : local_topk.size(0) * get_parallel().attn_tp_size
+113|            ]
+114|            attn_tp_all_gather_into_tensor(topk_indices, local_topk)
+115|        super().capture(layer_id, topk_indices)
+116|
+117|    def _get_local_slice(
+118|        self,
+119|        forward_batch: ForwardBatch,
+120|        can_run_graph: bool,
+121|        cuda_graph_batch: Optional[int],
+122|    ) -> torch.Tensor:
+123|        # Gathered rows start at buffer offset zero on every DP rank.
+124|        if is_dp_attention_enabled() and not _is_scattered_a2a_backend():
+125|            # GPU->CPU sync would break overlap; operate on CPU directly.
+126|            local_start_pos, local_num_tokens = get_dp_local_slice_cpu(
+127|                forward_batch, can_run_graph, cuda_graph_batch
+128|            )
+129|            local_end_pos = local_start_pos + local_num_tokens
+130|        else:
+131|            local_start_pos, local_end_pos = 0, forward_batch.out_cache_loc.shape[0]
+132|        return self.device_cache.buffer[
+133|            local_start_pos:local_end_pos, :, : self.topk_size
+134|        ]
+135|
+136|
+137|def get_global_experts_capturer() -> Optional[RoutedExpertsCapturer]:
+138|
+139|    return get_resources().experts_capturer
+140|
+141|
+142|def set_global_experts_capturer(capturer: Optional[RoutedExpertsCapturer]):
+143|
+144|    get_resources().experts_capturer = capturer
+145|
+146|
+147|def destroy_global_experts_capturer():
+148|    if (capturer := get_resources().experts_capturer) is not None:
+149|        capturer.destroy()
+150|    get_resources().experts_capturer = None
+151|
+152|
+153|def extract_routed_experts_from_meta_info(data):
+154|    # To solve the performance issue, we return the experts_ids in base64
+155|    # We left this function for user to change it back to normal int32
+156|    # See detokenizer_manager::_extract_routed_experts
+157|    routed_experts_base64 = data["meta_info"].get("routed_experts", None)
+158|    routed_experts = np.frombuffer(
+159|        pybase64.b64decode(routed_experts_base64.encode("utf-8")), dtype=np.int32
+160|    )
+161|    return routed_experts
+162|
+163|
+164|def disable_routed_experts_capture_for_draft(model: Any) -> None:
+165|    """Opt every draft MoE ``TopK`` out of routed-experts (R3) capture.
+166|
+167|    Capture is target-only; a draft ``TopK`` must never write the target's
+168|    process-global buffer. ``HashTopK`` has no ``topk_config`` and never
+169|    captures, so it is left untouched.
+170|    """
+171|    # Lazy import: ``layers.moe.topk`` imports ``get_global_experts_capturer``
+172|    # from this module, so a top-level import here would be circular.
+173|    from sglang.srt.layers.moe.topk import TopK
+174|
+175|    for module in model.modules():
+176|        if isinstance(module, TopK):
+177|            module.topk_config.allow_routed_experts_capture = False

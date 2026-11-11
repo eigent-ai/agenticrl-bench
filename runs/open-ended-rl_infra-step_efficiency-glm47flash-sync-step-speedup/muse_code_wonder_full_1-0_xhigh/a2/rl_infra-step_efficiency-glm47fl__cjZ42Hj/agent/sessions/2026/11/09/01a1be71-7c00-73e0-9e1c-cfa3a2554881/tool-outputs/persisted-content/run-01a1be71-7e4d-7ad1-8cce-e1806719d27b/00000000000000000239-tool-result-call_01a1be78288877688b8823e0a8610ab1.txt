@@ -1,0 +1,81 @@
+Read text file `/root/miles/miles/rollout/generate_utils/generate_endpoint_utils.py`.
+(99 line(s) above)
+100|    if x := output["meta_info"].get("output_token_logprobs"):
+101|        new_response_tokens = [item[1] for item in x]
+102|        new_response_log_probs = [item[0] for item in x]
+103|    else:
+104|        new_response_tokens, new_response_log_probs = [], []
+105|
+106|    if payload.get("return_sampling_mask", False):
+107|        new_response_log_probs = append_sampling_metadata(
+108|            sample,
+109|            new_response_tokens,
+110|            output["meta_info"],
+111|            sampling_logprobs_mode=payload.get("sampling_logprobs_mode", "selected"),
+112|        )
+113|
+114|    # Update sample with tokens directly - avoiding re-tokenization
+115|    sample.tokens = sample.tokens + new_response_tokens
+116|    sample.response_length += len(new_response_tokens)
+117|    sample.response += output["text"]
+118|
+119|    if sample.rollout_log_probs is None:
+120|        sample.rollout_log_probs = []
+121|    sample.rollout_log_probs += new_response_log_probs
+122|    if payload.get("top_logprobs_num") or payload.get("sampling_logprobs_mode") == "support":
+123|        append_rollout_topk_logprobs(
+124|            sample,
+125|            output["meta_info"],
+126|            args.rollout_top_logprobs_num,
+127|            sampling_logprobs_mode=payload.get("sampling_logprobs_mode", "selected"),
+128|        )
+129|
+130|    if update_loss_mask:
+131|        if sample.loss_mask is None:
+132|            sample.loss_mask = []
+133|        sample.loss_mask += [1] * len(new_response_tokens)
+134|
+135|    # TODO handle multi-turn cases (may need concat instead of assignment)
+136|    sample.rollout_routed_experts = get_routed_experts_from_response(args, output, len(sample.tokens) - 1)
+137|    sample.rollout_indexer_topk = get_indexer_topk_from_response(args, output, sample)
+138|
+139|    # TODO may unify (currently there are both methods inside Sample and separate functions)
+140|    sample.update_from_meta_info(args, output["meta_info"])
+141|
+142|
+143|def _decode_topk_buffer(info: str, num_tokens: int, num_layers: int, topk: int) -> np.ndarray:
+144|    x = np.frombuffer(pybase64.b64decode(info.encode("ascii")), dtype=np.int32)
+145|    if num_tokens <= 0:
+146|        return np.empty((0, num_layers, max(0, topk)), dtype=np.int32)
+147|    if topk == -1:  # indexer: topk dim recovered from buffer length
+148|        topk = len(x) // (num_tokens * num_layers)
+149|    return x.reshape(num_tokens, num_layers, topk)
+150|
+151|
+152|def get_routed_experts_from_response(args, output, num_tokens: int):
+153|    info = output["meta_info"].get("routed_experts")
+154|    if info is None:
+155|        return None
+156|    routed_experts = _decode_topk_buffer(info, num_tokens, args.num_layers, -1)
+157|    assert routed_experts.size == 0 or routed_experts.any(), (
+158|        "routed_experts payload is all zeros: the sglang engine did not capture routed experts "
+159|        "(topk-bypassing --moe-runner-backend such as flashinfer_trtllm?)."
+160|    )
+161|    return routed_experts
+162|
+163|
+164|def get_indexer_topk_from_response(args, output, sample):
+165|    info = output["meta_info"].get("indexer_topk")
+166|    if info is None:
+167|        return None
+168|    num_layers = output["meta_info"].get("indexer_topk_num_layers")
+169|    assert num_layers is not None, (
+170|        "Server returned indexer_topk without indexer_topk_num_layers; "
+171|        "sglang-miles must include the layer count in meta_info."
+172|    )
+173|    expected_num_streams = getattr(args, "rollout_indexer_topk_num_streams", None)
+174|    assert expected_num_streams is None or num_layers == expected_num_streams, (
+175|        f"Server returned indexer_topk with {num_layers} streams but the model has "
+176|        f"{expected_num_streams} indexer layers; replaying it would map streams to the wrong layers."
+177|    )
+178|    return _decode_topk_buffer(info, len(sample.tokens) - 1, num_layers, -1)

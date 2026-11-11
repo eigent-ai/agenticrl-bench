@@ -1,0 +1,280 @@
+Read text file `/sgl-workspace/sglang/python/sglang/srt/arg_groups/fields/schedule.py`.
+1|"""Config fields of the ``schedule`` namespace."""
+2|
+3|from __future__ import annotations
+4|
+5|from typing import (
+6|    List,
+7|    Optional,
+8|)
+9|
+10|import msgspec
+11|
+12|from sglang.srt.arg_groups.arg_utils import (
+13|    A,
+14|    Arg,
+15|)
+16|from sglang.srt.utils.common import human_readable_int
+17|
+18|
+19|class Schedule(msgspec.Struct):
+20|    """Namespace ``schedule``."""
+21|
+22|    _NS_PATH = "schedule"
+23|
+24|    # -------------------------------------------------------------------------
+25|    # Memory and scheduling
+26|    # -------------------------------------------------------------------------
+27|    mem_fraction_static: A[
+28|        Optional[float],
+29|        "The fraction of the memory used for static allocation (model weights and KV cache memory pool). Use a smaller value if you see out-of-memory errors.",
+30|    ] = None
+31|    max_running_requests: A[
+32|        Optional[int],
+33|        "The maximum number of running requests.",
+34|    ] = None
+35|    max_queued_requests: A[
+36|        Optional[int],
+37|        "The maximum number of queued requests. This option is ignored when using disaggregation-mode.",
+38|    ] = None
+39|    max_total_tokens: A[
+40|        Optional[int],
+41|        Arg(
+42|            help=(
+43|                "The maximum number of tokens in the memory pool. If not "
+44|                "specified, it will be automatically calculated based on the "
+45|                "memory usage fraction. This option is typically used for "
+46|                "development and debugging purposes."
+47|                + f"\n\n{human_readable_int.__doc__}"
+48|            ),
+49|            type_parser=human_readable_int,
+50|        ),
+51|    ] = None
+52|    chunked_prefill_size: A[
+53|        Optional[int],
+54|        "The maximum number of tokens in a chunk for the chunked prefill. Setting this to -1 means disabling chunked prefill.",
+55|    ] = None
+56|    prefill_decode_interval: A[
+57|        Optional[int],
+58|        Arg(
+59|            help="The number of decode rounds to run after a prefill batch before scheduling the next prefill. By default, this is disabled except for profiled Qwen3-VL serving configurations on Hopper. In data-parallel attention mode, the interval is synchronized across all DP ranks. Set to 0 to disable.",
+60|            resolvable=True,
+61|        ),
+62|    ] = None
+63|    enable_dynamic_chunking: A[
+64|        bool,
+65|        "Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",
+66|    ] = False
+67|    max_prefill_tokens: A[
+68|        int,
+69|        Arg(
+70|            help=(
+71|                "The maximum number of tokens in a prefill batch. The real bound "
+72|                "will be the maximum of this value and the model's maximum "
+73|                "context length." + f"\n\n{human_readable_int.__doc__}"
+74|            ),
+75|            type_parser=human_readable_int,
+76|        ),
+77|    ] = 16384
+78|    prefill_max_requests: A[
+79|        Optional[int],
+80|        "The maximum number of requests in a prefill batch. If not specified, there is no limit.",
+81|    ] = None
+82|    schedule_policy: A[
+83|        str,
+84|        Arg(
+85|            help="The scheduling policy of the requests.",
+86|            choices=[
+87|                "lpm",
+88|                "random",
+89|                "fcfs",
+90|                "dfs-weight",
+91|                "lof",
+92|                "priority",
+93|                "routing-key",
+94|                "hrrn",
+95|                "shortest-prefill-first",
+96|            ],
+97|        ),
+98|    ] = "fcfs"
+99|    enable_priority_scheduling: A[
+100|        bool,
+101|        "Enable priority scheduling. Requests with higher priority integer values will be scheduled first by default.",
+102|    ] = False
+103|    disable_priority_preemption: A[
+104|        bool,
+105|        "Disable priority scheduling preemption.",
+106|    ] = False
+107|    default_priority_value: A[
+108|        Optional[int], "Default priority for requests without explicit priority."
+109|    ] = None
+110|    abort_on_priority_when_disabled: A[
+111|        bool,
+112|        "If set, abort requests that specify a priority when priority scheduling is disabled.",
+113|    ] = False
+114|    schedule_low_priority_values_first: A[
+115|        bool,
+116|        "If specified with --enable-priority-scheduling, the scheduler will schedule requests with lower priority integer values first.",
+117|    ] = False
+118|    priority_scheduling_preemption_threshold: A[
+119|        int,
+120|        "Minimum difference in priorities for an incoming request to have to preempt running request(s).",
+121|    ] = 10
+122|    retraction_policy: A[
+123|        str,
+124|        Arg(
+125|            help=(
+126|                "The decode retraction policy to use when the KV cache is full. "
+127|                "'length' preserves the existing behavior and retracts short-output, "
+128|                "long-input requests first. 'priority' retracts lower-priority "
+129|                "requests first, using the same priority direction as priority "
+130|                "scheduling."
+131|            ),
+132|            choices=["length", "priority"],
+133|        ),
+134|    ] = "length"
+135|    schedule_conservativeness: A[
+136|        float,
+137|        "How conservative the schedule policy is. A larger value means more conservative scheduling. Use a larger value if you see requests being retracted frequently.",
+138|    ] = 1.0
+139|    page_size: A[
+140|        Optional[int], Arg(help="The number of tokens in a page.", resolvable=True)
+141|    ] = None
+142|    c128_page_size: A[
+143|        int,
+144|        "The physical page size of the NPU DSV4 C128 KV cache. Must be a positive multiple of 16.",
+145|    ] = 16
+146|    swa_full_tokens_ratio: A[
+147|        Optional[float],
+148|        Arg(
+149|            help=(
+150|                "The ratio of SWA layer KV tokens / full layer KV tokens, regardless "
+151|                "of the number of swa:full layers. It should be between 0 and 1. "
+152|                "E.g. 0.5 means if each swa layer has 50 tokens, then each full "
+153|                "layer has 100 tokens."
+154|            ),
+155|            resolvable=True,
+156|            fallback=0.8,
+157|        ),
+158|    ] = None
+159|    # Recorded by the cache hook; the effective field answers the fallback when unset.
+160|    _swa_full_tokens_ratio_explicitly_set: A[
+161|        Optional[bool],
+162|        Arg(no_cli=True),
+163|    ] = None
+164|    swa_prefix_tails: A[
+165|        Optional[int],
+166|        Arg(
+167|            help=(
+168|                "When the SWA KV pool is sized from the request cap (DeepSeek-V4 "
+169|                "family), how many radix-cached prefix tails it keeps room for. "
+170|                "Each tail is one sliding window plus one page. Default: 4 x "
+171|                "max_running_requests per attention-DP rank, 0 when the radix "
+172|                "cache is disabled."
+173|            ),
+174|        ),
+175|    ] = None
+176|    disable_hybrid_swa_memory: A[
+177|        bool, Arg(help="Disable the hybrid SWA memory pool.", resolvable=True)
+178|    ] = False
+179|    prefill_only_disable_kv_cache: A[
+180|        bool,
+181|        "Skip the physical KV cache allocation for embedding-mode prefill-only workloads. Currently only valid with --is-embedding, --chunked-prefill-size=-1, --disable-radix-cache, an FA prefill backend, and non-FP4 KV cache so the fa_skip_kv_cache path is active (no layer reads or writes the cache). Other prefill-only workloads such as scoring/MIS may benefit from this later once their attention paths stop using paged KV. Scheduler admission accounting is unchanged; per-layer K/V tensors are sized to (page_size, head_num, head_dim) placeholders so GPU memory is not wasted.",
+182|    ] = False
+183|    disable_chunked_prefix_cache: A[
+184|        bool,
+185|        "Disable chunked prefix cache feature for deepseek, which should save overhead for short sequences.",
+186|    ] = False
+187|    disable_overlap_schedule: A[
+188|        bool,
+189|        Arg(
+190|            help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker.",
+191|            resolvable=True,
+192|        ),
+193|    ] = False
+194|    num_continuous_decode_steps: A[
+195|        int,
+196|        "Run multiple continuous decoding steps to reduce scheduling overhead. This can potentially increase throughput but may also increase time-to-first-token latency. The default value is 1, meaning only run one decoding step at a time.",
+197|    ] = 1
+198|    scheduler_recv_interval: A[
+199|        int,
+200|        "The interval to poll requests in scheduler. Can be set to >1 to reduce the overhead of this.",
+201|    ] = 1
+202|    enable_mixed_chunk: A[
+203|        bool,
+204|        "Enabling mixing prefill and decode in a batch when using chunked prefill.",
+205|    ] = False
+206|
+207|    # -------------------------------------------------------------------------
+208|    # Mamba cache and linear attn
+209|    # -------------------------------------------------------------------------
+210|    max_mamba_cache_size: A[
+211|        Optional[int],
+212|        "The maximum size of the mamba cache.",
+213|    ] = None
+214|    mamba_full_memory_ratio: A[
+215|        Optional[float],
+216|        Arg(
+217|            help="The ratio of mamba state memory to full kv cache memory.",
+218|            resolvable=True,
+219|            fallback=0.9,
+220|        ),
+221|    ] = None
+222|
+223|    # -------------------------------------------------------------------------
+224|    # Prefill delayer
+225|    # -------------------------------------------------------------------------
+226|    enable_prefill_delayer: A[
+227|        bool, "Enable prefill delayer for DP attention to reduce idle time."
+228|    ] = False
+229|    prefill_delayer_max_delay_passes: A[
+230|        int,
+231|        "Maximum forward passes to delay prefill.",
+232|    ] = 30
+233|    prefill_delayer_token_usage_low_watermark: A[
+234|        Optional[float], "Token usage low watermark for prefill delayer."
+235|    ] = None
+236|    prefill_delayer_forward_passes_buckets: A[
+237|        Optional[List[float]],
+238|        "Custom buckets for prefill delayer forward passes histogram. 0 and max_delay_passes-1 will be auto-added.",
+239|    ] = None
+240|    prefill_delayer_wait_seconds_buckets: A[
+241|        Optional[List[float]],
+242|        "Custom buckets for prefill delayer wait seconds histogram. 0 will be auto-added.",
+243|    ] = None
+244|    prefill_delayer_queue_min_ratio: A[
+245|        Optional[float],
+246|        (
+247|            "Opt-in to the adaptive queue-based delay trigger (independent of the "
+248|            "slot-based one). Delays prefill until the waiting queue reaches "
+249|            "min(running_req * ratio, prefill_max_requests), falling back to the "
+250|            "observed max_prefill_bs when no request limit is set. Unset (default) "
+251|            "keeps the original slot-only behavior. Typical: 0.1 ~ 0.5."
+252|        ),
+253|    ] = None
+254|    prefill_delayer_max_delay_ms: A[
+255|        Optional[float],
+256|        (
+257|            "Wall-clock cap (ms) on a single queue-trigger delay; once exceeded, "
+258|            "prefill is force-released to bound worst-case TTFT. Only consulted "
+259|            "when --prefill-delayer-queue-min-ratio is set. Typical: 1000 ~ "
+260|            "5000; defaults to 5000 if unset."
+261|        ),
+262|    ] = None
+263|
+264|    # -------------------------------------------------------------------------
+265|    # Min free slots delay (prefill refill batching)
+266|    # -------------------------------------------------------------------------
+267|    min_free_slots_delay: A[
+268|        Optional[int],
+269|        (
+270|            "Hold new prefills until at least N running-request slots have freed "
+271|            "up, so they are admitted in one batch instead of one at a time. "
+272|            "Useful when each admission is disproportionately expensive, e.g. "
+273|            "speculative decoding with a separate draft prefill pass. An "
+274|            "explicit value always wins, capped by max-running-requests "
+275|            "(1 disables). When unset, DFlash workloads auto-enable the "
+276|            "formula; other workloads stay disabled. Not supported with "
+277|            "pipeline parallelism."
+278|        ),
+279|    ] = None

@@ -1,0 +1,10 @@
+{
+  "chunk_id": "exec-176-1",
+  "exit_code": 1,
+  "terminal_status": "failed",
+  "terminal_reason": "process exited with status 1",
+  "output": "                    }\n        else:\n            # Block-wise quant: BLOCK_SIZE_K must be divisible by block_shape[1]\n            config = {\n                \"BLOCK_SIZE_M\": 64,\n                \"BLOCK_SIZE_N\": block_shape[0],\n                \"BLOCK_SIZE_K\": block_shape[1],\n                \"GROUP_SIZE_M\": 32,\n                \"num_warps\": 4,\n                \"num_stages\": 2 if _is_hip else 3,\n            }\n    else:\n        config = {\n            \"BLOCK_SIZE_M\": 64,\n            \"BLOCK_SIZE_N\": 64,\n            \"BLOCK_SIZE_K\": 32,\n            \"GROUP_SIZE_M\": 8,\n        }\n        # A heuristic: fused marlin works faster with this config for small M\n        if M <= E or (is_marlin and M <= 32):\n            config = {\n                \"BLOCK_SIZE_M\": 16,\n                \"BLOCK_SIZE_N\": 32,\n                \"BLOCK_SIZE_K\": 64,\n                \"GROUP_SIZE_M\": 1,\n            }\n    return config\n\n\ndef try_get_optimal_moe_config(\n    w1_shape: Tuple[int, ...],\n    w2_shape: Tuple[int, ...],\n    top_k: int,\n    dtype: Optional[str],\n    M: int,\n    is_marlin: bool = False,\n    block_shape: Optional[List[int]] = None,\n    per_channel_quant: bool = False,\n    return_down_config: bool = False,\n):\n    from sglang.srt.layers.moe.moe_runner.triton_utils import get_config\n\n    down_config = None\n    max_block_m = None\n    override_config = get_config()\n    if override_config:\n        config = override_config\n    else:\n        # First try to load optimal config from the file\n        E, _, N = w2_shape\n        block_n = block_shape[0] if block_shape else 0\n        block_k = block_shape[1] if block_shape else 0\n        configs = get_moe_configs(\n            E,\n            N,\n            dtype,\n",
+  "original_output_bytes": 1695,
+  "original_output_tokens": 424,
+  "truncated": false
+}

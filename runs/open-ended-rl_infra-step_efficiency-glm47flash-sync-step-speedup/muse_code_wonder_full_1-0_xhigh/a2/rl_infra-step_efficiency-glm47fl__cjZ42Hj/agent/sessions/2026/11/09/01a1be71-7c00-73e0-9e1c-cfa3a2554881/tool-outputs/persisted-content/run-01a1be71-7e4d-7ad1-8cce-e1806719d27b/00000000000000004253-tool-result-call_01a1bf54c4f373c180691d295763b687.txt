@@ -1,0 +1,37 @@
+edited
+changed lines: lines 789-804
+--- original
++++ updated
+@@
+-        if skip_actor_forward_only and not self.args.use_rollout_logprobs:
+-            # Reassemble the trainer log-probs captured during the training forward (same
+-            # weights the skipped forward-only pass would have used) in sample order, so
+-            # dumps/consumers of rollout_data["log_probs"] see the genuine values.
+-            from miles.backends.training_utils.loss.hub.losses import skip_forward_logprob_collector
+-
+-            if skip_forward_logprob_collector:
+-                micro_batch_indices = rollout_data.get("micro_batch_indices") or []
+-                flat = [idx for mb in micro_batch_indices for idx in mb]
+-                if len(flat) == sum(len(x) for x in skip_forward_logprob_collector):
+-                    assembled: list = [None] * len(flat)
+-                    for mb, idxs in enumerate(micro_batch_indices):
+-                        for j, sidx in enumerate(idxs):
+-                            assembled[sidx] = skip_forward_logprob_collector[mb][j]
+-                    rollout_data["log_probs"] = assembled
+-                skip_forward_logprob_collector.clear()
++        if skip_actor_forward_only and not self.args.use_rollout_logprobs:
++            # Reassemble the trainer log-probs captured during the training forward (same
++            # weights the skipped forward-only pass would have used) in sample order, so
++            # dumps/consumers of rollout_data["log_probs"] see the genuine values.
++            from miles.backends.training_utils.loss.hub.losses import (
++                assemble_skip_forward_log_probs,
++                skip_forward_logprob_collector,
++            )
++
++            if skip_forward_logprob_collector:
++                assembled = assemble_skip_forward_log_probs(
++                    skip_forward_logprob_collector, rollout_data.get("micro_batch_indices") or []
++                )
++                if assembled is not None:
++                    rollout_data["log_probs"] = assembled
++                skip_forward_logprob_collector.clear()

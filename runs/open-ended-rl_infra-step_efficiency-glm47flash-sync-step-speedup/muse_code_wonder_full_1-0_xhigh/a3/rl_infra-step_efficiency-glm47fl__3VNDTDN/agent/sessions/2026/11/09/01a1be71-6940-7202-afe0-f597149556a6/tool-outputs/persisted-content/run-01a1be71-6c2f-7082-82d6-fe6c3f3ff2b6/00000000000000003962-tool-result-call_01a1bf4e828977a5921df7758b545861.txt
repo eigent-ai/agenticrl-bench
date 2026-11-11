@@ -1,0 +1,56 @@
+edited
+changed lines: lines 135-155
+--- original
++++ updated
+@@
+-    def _maybe_collect_routed_experts(self, req: Req):
+-        """Collect routed experts for a finished request.
+-
+-        Returns immediately if `return_routed_experts` was not set on the
+-        request, so non-opted-in reqs don't pay the host-gather cost.
+-
+-        Honors the caller's absolute start so the response covers
+-        `[start_len, seqlen - 1)`. The default start_len is 0, which returns
+-        the full sequence.
+-
+-        Logs a soft warning if the resulting tensor's row count differs from
+-        the expected `seqlen - 1 - start_len`, to catch silent regressions.
+-        """
+-        if not req.return_routed_experts:
+-            return
+-        capturer = get_global_experts_capturer()
+-        if capturer is None:
+-            return
+-        start_len = req.routed_experts_start_len
+-        seqlen = len(req.origin_input_ids) + len(req.output_ids_through_stop)
+-        req.routed_experts = capturer.get_topk(
++    def _maybe_collect_routed_experts(self, req: Req):
++        """Collect routed experts for a finished request.
++
++        Returns immediately if `return_routed_experts` was not set on the
++        request, so non-opted-in reqs don't pay the host-gather cost.
++
++        Honors the caller's absolute start so the response covers
++        `[start_len, seqlen - 1)`. The default start_len is 0, which returns
++        the full sequence.
++
++        Logs a soft warning if the resulting tensor's row count differs from
++        the expected `seqlen - 1 - start_len`, to catch silent regressions.
++
++        Delta protocol: a multi-turn client that passes a stable
++        conversation id in ``sampling_params.custom_params["oe_ep"]`` (and
++        ``oe_turn``) receives only the rows not yet sent for that
++        conversation, prefixed with one header row (see
++        ``_collect_routed_experts_delta``). Any other caller gets the
++        legacy full-sequence payload unchanged.
++        """
++        if not req.return_routed_experts:
++            return
++        capturer = get_global_experts_capturer()
++        if capturer is None:
++            return
++        if req.routed_experts_start_len == 0 and self._collect_routed_experts_delta(req, capturer):
++            return
++        start_len = req.routed_experts_start_len
++        seqlen = len(req.origin_input_ids) + len(req.output_ids_through_stop)
++        req.routed_experts = capturer.get_topk(

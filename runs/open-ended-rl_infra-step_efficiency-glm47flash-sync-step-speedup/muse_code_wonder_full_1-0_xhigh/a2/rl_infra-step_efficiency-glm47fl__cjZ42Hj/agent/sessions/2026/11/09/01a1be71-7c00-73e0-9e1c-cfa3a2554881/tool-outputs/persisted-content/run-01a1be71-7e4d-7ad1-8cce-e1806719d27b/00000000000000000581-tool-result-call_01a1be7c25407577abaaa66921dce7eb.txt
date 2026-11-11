@@ -1,0 +1,176 @@
+Read text file `/root/miles/train.py`.
+1|import asyncio
+2|import logging
+3|import os
+4|
+5|from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
+6|
+7|from miles.ray.placement_group import (
+8|    create_rollout_components,
+9|    create_training_models,
+10|    maybe_start_api_server,
+11|    update_weights,
+12|)
+13|from miles.ray.rollout.eval_dispatch import EvalDispatcher
+14|from miles.utils.arguments import parse_args
+15|from miles.utils.async_utils import Disposer, with_disposer
+16|from miles.utils.data import remove_rollout_data_refs, remove_train_output_refs
+17|from miles.utils.ft_utils.mini_ft_controller import maybe_start_mini_ft_controller
+18|from miles.utils.lora.utils import lora_rollout_enabled
+19|from miles.utils.misc import should_run_periodic_action
+20|from miles.utils.orchestration_utils import init_orchestration_script
+21|
+22|logger = logging.getLogger(__name__)
+23|
+24|
+25|async def train(args, *, disposer: Disposer):
+26|    assert not args.fully_async, "--fully-async requires the async driver: run train_async.py"
+27|    _worker_manager = init_orchestration_script(args, disposer=disposer)
+28|
+29|    if args.colocate_memory_peak_device == "gpu":
+30|        assert (
+31|            args.offload_train and args.offload_rollout
+32|        ), "--colocate-memory-peak-device gpu requires --offload-train and --offload-rollout"
+33|        assert not args.use_critic, "--colocate-memory-peak-device gpu is not wired for the critic path"
+34|
+35|    # create the rollout manager, with sglang engines inside.
+36|    # need to initialize rollout manager first to calculate num_rollout
+37|    inference_controller, rollout_executor, num_rollout_per_epoch = await create_rollout_components(args)
+38|    disposer.add(inference_controller, rollout_executor)
+39|
+40|    # create the actor and critic models
+41|    actor_model, critic_model = await create_training_models(args, rollout_executor)
+42|    disposer.add(critic_model, actor_model)
+43|
+44|    maybe_start_api_server(args, trainer_models={"actor": actor_model}, inference_controller=inference_controller)
+45|    maybe_start_mini_ft_controller(args)
+46|
+47|    # always update weight first so that sglang has the loaded weights from training.
+48|    await update_weights(args, actor_model, rollout_executor, inference_controller)
+49|
+50|    if args.check_weight_update_equal:
+51|        await inference_controller.check_weights(
+52|            action="compare",
+53|            allow_quant_error=args.check_weight_update_allow_quant_error,
+54|            selector=args.check_weight_update_selector,
+55|            skip_list=args.check_weight_update_skip_list,
+56|        )
+57|
+58|    if args.offload_rollout:
+59|        await inference_controller.onload_kv()
+60|
+61|    eval_dispatcher = EvalDispatcher(args, actor_model, rollout_executor)
+62|    disposer.add(eval_dispatcher.drain)
+63|
+64|    # special case for eval-only
+65|    if args.num_rollout == 0 and args.eval_interval is not None:
+66|        await inference_controller.prepare_eval()
+67|        await eval_dispatcher.dispatch(0, hf_dir=args.hf_checkpoint)
+68|
+69|    async def offload_train():
+70|        if args.use_critic:
+71|            return
+72|        if args.offload_train:
+73|            await actor_model.offload()
+74|        else:
+75|            await actor_model.clear_memory()
+76|
+77|    async def save(rollout_id, force_sync=False):
+78|        force_sync = force_sync or rollout_id == args.num_rollout - 1
+79|
+80|        async def save_training_model(model):
+81|            if args.use_critic and args.offload_train:
+82|                await model.onload()
+83|            await model.save_model(rollout_id, force_sync=force_sync)
+84|            if args.use_critic and args.offload_train:
+85|                await model.offload()
+86|
+87|        if (not args.use_critic) or (rollout_id >= args.num_critic_only_steps):
+88|            await save_training_model(actor_model)
+89|        if args.use_critic:
+90|            await save_training_model(critic_model)
+91|        await rollout_executor.save(rollout_id)
+92|
+93|    if args.num_rollout > args.start_rollout_id and args.eval_interval is not None and not args.skip_eval_before_train:
+94|        await inference_controller.prepare_eval()
+95|        if args.start_rollout_id == 0:
+96|            await eval_dispatcher.dispatch(0, hf_dir=args.hf_checkpoint)
+97|        else:
+98|            await eval_dispatcher.dispatch(args.start_rollout_id - 1)
+99|
+100|    # train loop.
+101|    # note that for async training, one can change the position of the sync operation(ray.get).
+102|    for rollout_id in range(args.start_rollout_id, args.num_rollout):
+103|        await inference_controller.prepare_rollout(rollout_id)
+104|        rollout_data_pack = await rollout_executor.get(rollout_id)
+105|
+106|        if args.offload_rollout:
+107|            if args.colocate_memory_peak_device == "gpu":
+108|                await inference_controller.offload_kv()
+109|                await actor_model.onload()
+110|                await inference_controller.offload_weights()
+111|            else:
+112|                offload_tags = [GPU_MEMORY_TYPE_CUDA_GRAPH]
+113|                if "kv_cache" in args.offload_rollout_level:
+114|                    offload_tags.append(GPU_MEMORY_TYPE_KV_CACHE)
+115|                if "weight" in args.offload_rollout_level:
+116|                    offload_tags.append(GPU_MEMORY_TYPE_WEIGHTS)
+117|                await inference_controller.offload(tags=offload_tags)
+118|
+119|        if args.use_critic:
+120|            values = await critic_model.train(rollout_id, rollout_data_pack)
+121|            if args.offload_train:
+122|                await critic_model.offload()
+123|            if rollout_id >= args.num_critic_only_steps:
+124|                await actor_model.train(rollout_id, rollout_data_pack, external_data=values)
+125|                if args.offload_train:
+126|                    await actor_model.offload()
+127|            remove_train_output_refs(values)
+128|        else:
+129|            await actor_model.train(rollout_id, rollout_data_pack)
+130|        remove_rollout_data_refs(args, rollout_data_pack)
+131|
+132|        external_save = args.save_trigger_sentinel is not None and os.path.exists(args.save_trigger_sentinel)
+133|        if external_save or should_run_periodic_action(
+134|            rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
+135|        ):
+136|            await save(rollout_id, force_sync=external_save)
+137|            if external_save:
+138|                os.remove(args.save_trigger_sentinel)
+139|
+140|        # One predicate for both blocks: the handoff below exists to feed this eval on the last rollout.
+141|        eval_due = should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch, args.num_rollout)
+142|        if rollout_id + 1 < args.num_rollout or eval_due:
+143|            if args.colocate_memory_peak_device == "gpu":
+144|                await actor_model.clear_memory()
+145|                if lora_rollout_enabled(args):
+146|                    await actor_model.offload_grad_buffer()
+147|                await inference_controller.onload_weights()
+148|                await offload_train()
+149|            else:
+150|                await offload_train()
+151|                if args.offload_rollout:
+152|                    await inference_controller.onload_weights()
+153|            await update_weights(args, actor_model, rollout_executor, inference_controller, rollout_id=rollout_id)
+154|            if args.offload_rollout:
+155|                await inference_controller.onload_kv()
+156|
+157|        if eval_due:
+158|            await inference_controller.prepare_eval()
+159|            await eval_dispatcher.dispatch(rollout_id, force=rollout_id == args.num_rollout - 1)
+160|
+161|        if (
+162|            args.debug_exit_after_rollout is not None
+163|            and (rollout_id - args.start_rollout_id + 1) >= args.debug_exit_after_rollout
+164|        ):
+165|            logger.info(
+166|                "debug_exit_after_rollout=%d reached at rollout_id=%d, exiting",
+167|                args.debug_exit_after_rollout,
+168|                rollout_id,
+169|            )
+170|            break
+171|
+172|
+173|if __name__ == "__main__":
+174|    args = parse_args()
+175|    asyncio.run(with_disposer(train, args))

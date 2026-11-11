@@ -1,0 +1,81 @@
+edited
+changed lines: lines 152-161
+--- original
++++ updated
+@@
+-def get_routed_experts_from_response(args, output, num_tokens: int):
+-    info = output["meta_info"].get("routed_experts")
+-    if info is None:
+-        return None
+-    routed_experts = _decode_topk_buffer(info, num_tokens, args.num_layers, -1)
+-    assert routed_experts.size == 0 or routed_experts.any(), (
+-        "routed_experts payload is all zeros: the sglang engine did not capture routed experts "
+-        "(topk-bypassing --moe-runner-backend such as flashinfer_trtllm?)."
+-    )
+-    return routed_experts
++# --- Delta routed-experts (R3) transfer -------------------------------------------------
++# Multi-turn custom-generate callers re-request the growing prefix every turn; the stock
++# response re-sends routed experts for the *whole* sequence each turn. When the HTTP layer
++# (miles.utils.http_utils.post) tags a request/response pair with a session id, it asks the
++# engine for only the rows past `routed_experts_start_len` and we stitch the delta onto the
++# rows accumulated from earlier turns of the same session, returning the identical full
++# array the stock path would have produced.
++_R3_DELTA_CACHE: dict[str, np.ndarray] = {}
++_R3_DELTA_CACHE_MAX = 256
++
++
++def r3_delta_start_len(session: str, turn) -> int:
++    """Rows of routed experts this process already holds for `session` (0 at turn 0)."""
++    try:
++        t = int(turn)
++    except (TypeError, ValueError):
++        t = -1
++    if t <= 0:
++        _R3_DELTA_CACHE.pop(session, None)
++        return 0
++    arr = _R3_DELTA_CACHE.get(session)
++    return int(arr.shape[0]) if arr is not None else 0
++
++
++def _r3_delta_store(session: str, arr: np.ndarray) -> None:
++    if session not in _R3_DELTA_CACHE and len(_R3_DELTA_CACHE) >= _R3_DELTA_CACHE_MAX:
++        # Evict oldest sessions; an evicted session simply re-fetches from row 0 next turn.
++        for old in list(_R3_DELTA_CACHE)[: len(_R3_DELTA_CACHE) - _R3_DELTA_CACHE_MAX + 1]:
++            _R3_DELTA_CACHE.pop(old, None)
++    _R3_DELTA_CACHE[session] = arr
++
++
++def get_routed_experts_from_response(args, output, num_tokens: int):
++    info = output["meta_info"].get("routed_experts")
++    if info is None:
++        return None
++    session = output["meta_info"].get("_r3_session")
++    if session is None:
++        routed_experts = _decode_topk_buffer(info, num_tokens, args.num_layers, -1)
++    else:
++        start = int(output["meta_info"].get("_r3_start") or 0)
++        delta_rows = num_tokens - start
++        assert delta_rows >= 0, f"delta R3: start {start} beyond total rows {num_tokens}"
++        delta = (
++            _decode_topk_buffer(info, delta_rows, args.num_layers, -1)
++            if delta_rows > 0
++            else np.empty((0, args.num_layers, 0), dtype=np.int32)
++        )
++        if start == 0:
++            routed_experts = delta
++        else:
++            prev = _R3_DELTA_CACHE.get(session)
++            assert prev is not None and prev.shape[0] >= start, (
++                f"delta R3: no accumulated rows for session {session!r} "
++                f"(have {0 if prev is None else prev.shape[0]}, need {start})"
++            )
++            routed_experts = np.concatenate([prev[:start], delta], axis=0) if delta_rows > 0 else prev[:start]
++        assert routed_experts.shape[0] == num_tokens, (
++            f"delta R3: assembled {routed_experts.shape[0]} rows, expected {num_tokens}"
++        )
++        _r3_delta_store(session, routed_experts)
++    assert routed_experts.size == 0 or routed_experts.any(), (
++        "routed_experts payload is all zeros: the sglang engine did not capture routed experts "
++        "(topk-bypassing --moe-runner-backend such as flashinfer_trtllm?)."
++    )
++    return routed_experts

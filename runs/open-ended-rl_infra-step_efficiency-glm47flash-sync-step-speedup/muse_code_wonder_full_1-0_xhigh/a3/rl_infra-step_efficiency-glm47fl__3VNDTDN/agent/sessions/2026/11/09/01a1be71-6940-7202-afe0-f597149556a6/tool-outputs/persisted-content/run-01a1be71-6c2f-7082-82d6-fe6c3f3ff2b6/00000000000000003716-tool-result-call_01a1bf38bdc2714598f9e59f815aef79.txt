@@ -1,0 +1,67 @@
+edited
+changed lines: lines 731-744
+--- original
++++ updated
+@@
+-    def maybe_external_dp_rank_routing(self, req: Req):
+-        if req.routed_dp_rank is not None:
+-            rank = req.routed_dp_rank
+-            if (
+-                rank < 0
+-                or rank >= len(self.workers)
+-                or rank not in self._active_workers
+-                or self.workers[rank] is None
+-            ):
+-                raise ValueError(f"DP rank {rank} is not active.")
+-            logger.debug(f"Direct routing to DP rank {rank}")
+-            sock_send(self.workers[rank], req)
+-            return True
+-        return False
++    def maybe_external_dp_rank_routing(self, req: Req):
++        if req.routed_dp_rank is not None:
++            rank = req.routed_dp_rank
++            if (
++                rank < 0
++                or rank >= len(self.workers)
++                or rank not in self._active_workers
++                or self.workers[rank] is None
++            ):
++                raise ValueError(f"DP rank {rank} is not active.")
++            logger.debug(f"Direct routing to DP rank {rank}")
++            sock_send(self.workers[rank], req)
++            return True
++        return self._maybe_session_affinity_routing(req)
++
++    def _maybe_session_affinity_routing(self, req: Req):
++        """Pin multi-turn conversations to one DP rank (radix-cache affinity).
++
++        Clients may pass a stable per-conversation id via
++        ``sampling_params.custom_params["oe_ep"]``. The first request of a
++        conversation picks the least-loaded active rank; later requests of
++        the same conversation go to the same rank so its KV prefix (kept in
++        that rank's radix cache) is reused instead of recomputed. Inert for
++        requests that do not carry the id.
++        """
++        cp = getattr(getattr(req, "sampling_params", None), "custom_params", None)
++        key = cp.get("oe_ep") if isinstance(cp, dict) else None
++        if key is None:
++            return False
++        sticky = getattr(self, "_session_dp_rank", None)
++        if sticky is None:
++            sticky = self._session_dp_rank = {}
++        active = [r for r in self._active_workers if self.status[r] and self.workers[r] is not None]
++        if not active:
++            return False
++        rank = sticky.get(key)
++        if rank is not None and rank in active:
++            sock_send(self.workers[rank], req)
++            return True
++        rank = min(
++            active,
++            key=lambda r: (self.dp_budget.total_tokens[r], self.dp_budget.total_requests[r]),
++        )
++        sticky[key] = rank
++        self.dp_budget.total_requests[rank] += 1
++        self.dp_budget.total_tokens[rank] += len(getattr(req, "input_ids", None) or [])
++        sock_send(self.workers[rank], req)
++        return True
