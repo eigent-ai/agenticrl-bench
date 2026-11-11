@@ -138,7 +138,7 @@ and verifier output, in the layout of `runs/`.
 @techreport{shen2026agenticrlbench,
   title       = {AgenticRL-Bench: Can Agents Do Agentic RL?},
   author      = {Shen*, Qijia and Shi*, Xiangyu and Lai, Yueming and Xie, Yuqin and Fan, Wendong and Li, Guohao},
-  institution = {Eigent AI},
+  institution = {The Environment Lab at Eigent AI},
   year        = {2026},
   url         = {https://agenticrl-bench.env-lab.ai/blog/agentic-rl-bench}
 }
