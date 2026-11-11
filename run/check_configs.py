@@ -59,7 +59,7 @@ def shown(hosts) -> list[str]:
 
 
 META_HOSTS = {"dev.meta.ai", "api.meta.ai", "lookaside.facebook.com"}  # added to the shared list once Muse ran
-# Hosts that left task.toml at v0 and come from the launch for model agents (rollout-time [agent] allowlists).
+# Hosts that left task.toml at v1 and come from the launch for model agents (rollout-time [agent] allowlists).
 NESTED = {
     "harness-harbor_integration-harbor-upgrade-row-parity": {"api.modal.com", "*.w.modal.host"},
     "data-env_synthesis-reward-determinism-under-load": {"api.modal.com", "*.w.modal.host", "app.daytona.io",
@@ -73,7 +73,7 @@ WHY = {
     "agent hosts": "agents[].extra_allowed_hosts: the private gateway/proxy/Vertex hosts instead of the provider's API",
     "gateway host": "environment.extra_allowed_hosts: the private model gateway, not needed by a public run",
     "meta hosts": "environment.extra_allowed_hosts: the 3 Meta hosts, added to the shared list after the first runs",
-    "nested hosts": "nested-sandbox hosts that task.toml listed when the runs were made and the launch adds since v0",
+    "nested hosts": "nested-sandbox hosts that task.toml listed when the runs were made and the launch adds since v1",
     "proxy model name": "agents[].model_name: an API proxy's prefix (<proxy>/<model>)",
     "grok wait": "background_wait_sec: unset (Harbor default 600 s) in the first Grok Build runs, 27000 s after",
     "grok subagents": "grok_config: subagent_model_inheritance, set in the Grok Build re-runs and by these scripts",
