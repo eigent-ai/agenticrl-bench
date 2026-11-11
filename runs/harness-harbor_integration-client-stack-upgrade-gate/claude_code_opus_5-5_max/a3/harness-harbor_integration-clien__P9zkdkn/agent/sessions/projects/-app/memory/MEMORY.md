@@ -1,0 +1,1 @@
+- [Client-stack gate pitfalls](client-stack-gate-pitfalls.md) — gVisor async loopback breaks virtual time; Terminus2 __init__ defaults; reference salvage AttributeError

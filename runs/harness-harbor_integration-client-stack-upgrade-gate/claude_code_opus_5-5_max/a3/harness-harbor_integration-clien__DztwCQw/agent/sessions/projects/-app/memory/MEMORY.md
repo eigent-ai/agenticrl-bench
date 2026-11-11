@@ -1,2 +1,0 @@
-- [Harbor truncated-XML salvage bug](harbor-truncated-xml-salvage-bug.md) — AttributeError ends exp1/RL trials whose output hit max_tokens
-- [Harbor token accounting vs Qwen](harbor-token-accounting-vs-qwen.md) — context budgeted in cl100k, served in Qwen: 1.25x on log output, 1.7x on byte dumps
