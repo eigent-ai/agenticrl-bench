@@ -111,8 +111,8 @@ platform's `preflight()`); GPU and network support are each platform class's cap
 | `runloop` | `runloop` | `RUNLOOP_API_KEY` | no | yes | no |
 | `blaxel` | `blaxel` | a Blaxel login (`BL_WORKSPACE`, `BL_API_KEY`) | no | yes | no |
 | `islo` | `islo` | `ISLO_API_KEY` | no | hostnames only | no |
-| `docker` | none | a local Docker engine | no | with Harbor's egress control | with egress control |
-| `podman`, `apple-container`, `singularity`, `kata`, `openshift`, `ack` | none | the local runtime (`podman`; `container` on macOS; a KVM host for `kata`; `oc` login) | no | no | no |
+| `docker`, `podman`, `kata` | none | a local Docker or Podman engine; a KVM host for `kata` | no | with Harbor's egress control | with egress control |
+| `apple-container`, `singularity`, `openshift`, `ack` | none | the local runtime (`container` on macOS; `oc` login for `openshift`) | no | no | no |
 | `ec2` | `ec2` | AWS credentials and `ssh` | no | no | no |
 | `langsmith` | `langsmith` | `LANGSMITH_API_KEY` | no | no | no |
 | `cwsandbox`, `wandb` | `cwsandbox`, `wandb` | `CWSANDBOX_API_KEY`, `WANDB_API_KEY` | no | no | no |
