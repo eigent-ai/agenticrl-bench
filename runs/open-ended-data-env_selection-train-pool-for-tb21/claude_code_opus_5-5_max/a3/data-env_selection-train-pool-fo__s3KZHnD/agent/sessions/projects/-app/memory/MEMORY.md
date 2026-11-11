@@ -1,0 +1,1 @@
+- [TB2.1 RL session plan](tb21-rl-session-plan.md) — constraints of /opt/task/scripts GRPO setup and chosen plan (Nov 2026)

@@ -1,0 +1,1 @@
+- [TB2.1 RL task setup](tb21-rl-task-setup.md) — box facts, run log, final choice (main2 iter_2) and lessons
