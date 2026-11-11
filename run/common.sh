@@ -20,6 +20,28 @@ if [ -z "${HARBOR:-}" ]; then
   fi
 fi
 
+# ---- platform -----------------------------------------------------------------------------------------------------
+# The outer platform: any environment type of Harbor 0.23.0, passed to `harbor run -e`. Default modal, the platform of
+# every published run. AGENTRL_ENV or --env choose another.
+ENV_TYPE=${AGENTRL_ENV:-modal}
+# The pip extra each type needs in Harbor 0.23.0 (harbor/environments/factory.py, _ENVIRONMENT_REGISTRY; empty: none).
+# Returns 1 for a type Harbor 0.23.0 does not have.
+env_extra() {
+  case "$1" in
+    docker|podman|apple-container|singularity|ack|openshift|kata) echo "" ;;
+    cua-cloud) echo cua ;;
+    modal|daytona|e2b|runloop|langsmith|ec2|gke|novita|islo|tensorlake|cwsandbox|wandb|use-computer|blaxel| \
+    opensandbox|beam|skypilot|hf-sandbox|hyperbrowser|vercel|runta) echo "$1" ;;
+    *) return 1 ;;
+  esac
+}
+# Harbor's own Python (the venv or uv tool dir of $HARBOR); python3 if there is none.
+harbor_python() {
+  local p
+  p=$(dirname "$(readlink -f "$(command -v "$HARBOR" || echo "$HARBOR")")")/python
+  [ -x "$p" ] && echo "$p" || echo python3
+}
+
 # ---- hosts -------------------------------------------------------------------------------------------------------
 # The tasks' own [environment]/[agent] networks are closed (no-network, or an allowlist without these hosts); the box
 # reaches a host only if the launch adds it. Hosts for the box while Harbor sets it up (--allow-environment-host),
@@ -41,6 +63,8 @@ HARNESS_HOSTS=(pypi.org files.pythonhosted.org astral.sh github.com objects.gith
 usage() {
   cat >&2 <<EOF
 usage: bash $(basename "$0") <task dir> <jobs dir> [options] [-- more harbor run arguments]
+  --env E          the platform, any Harbor 0.23.0 environment type (default: \$AGENTRL_ENV, else modal as the
+                   published runs)
   --agent A        oracle | nop | claude-code | codex | antigravity-cli | grok-build | muse-code (published settings)
                    or the release's agent keys cc | ccf | codex | agy | agyc | grok | muse; any other Harbor agent
                    with --model and --key (default: oracle)
@@ -65,6 +89,7 @@ parse_args() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --agent) AGENT=$2; shift 2 ;;
+      --env) ENV_TYPE=$2; shift 2 ;;
       --model) MODEL=$2; shift 2 ;;
       --effort) EFFORT=$2; shift 2 ;;
       --key) KEY=$2; shift 2 ;;
@@ -80,6 +105,9 @@ parse_args() {
   done
   TASK_NAME=$(basename "$(cd "$TASK" && pwd)")
   CONCURRENT=${CONCURRENT:-$ATTEMPTS}
+  env_extra "$ENV_TYPE" >/dev/null || { echo "unknown platform $ENV_TYPE: give a Harbor 0.23.0 environment type" \
+    "(README.md, Platforms)" >&2; exit 2; }
+  CFG=() VE=()   # set by run_broker.sh for a non-Modal inner platform: a job-file layer (-c) and verifier env (--ve)
 }
 
 # ---- agents ------------------------------------------------------------------------------------------------------
@@ -164,11 +192,13 @@ require_key() { auth_ok || exit 2; }
 # ~/.modal.toml), read with Harbor's own Python into this process's environment only. $1/$2: names to set.
 modal_token_into() {
   local hpy
-  hpy=$(dirname "$(readlink -f "$(command -v "$HARBOR")")")/python
+  [ -n "${!1:-}" ] && [ -n "${!2:-}" ] && return 0   # given by the user
+  hpy=$(harbor_python)
   export "$1=$("$hpy" -I -c 'from modal.config import config; print(config.get("token_id") or "")')"
   export "$2=$("$hpy" -I -c 'from modal.config import config; print(config.get("token_secret") or "")')"
   [ -n "${!1}" ] && [ -n "${!2}" ] \
-    || { echo "no Modal login: run 'modal token new' (or set MODAL_TOKEN_ID/MODAL_TOKEN_SECRET)" >&2; exit 2; }
+    || { echo "no Modal login for $1/${2##*_}: run 'uvx modal token new' (or set MODAL_TOKEN_ID/MODAL_TOKEN_SECRET," \
+         "or $1 and $2 themselves; reading the login needs the modal package, harbor[modal])" >&2; exit 2; }
 }
 
 # ---- run ---------------------------------------------------------------------------------------------------------
@@ -185,8 +215,8 @@ launch() {
   name=${JOB_NAME:-${TASK_NAME}__${AGENT_KEY}}
   one() {  # $1: the job name
     [ "${TASK_ENV_APP:-0}" = 1 ] && export AGENTRL_TASK_ENV_APP="agentrl-${1:0:56}"
-    "$HARBOR" run --yes -p "$TASK" "${AGENT_ARGS[@]}" -e modal "${EK[@]}" "${E[@]}" "${A[@]}" \
-      --job-name "$1" -o "$JOBS" -k 1 -n 1 "${P[@]}" "${PASS[@]}"
+    "$HARBOR" run --yes "${CFG[@]}" -p "$TASK" "${AGENT_ARGS[@]}" -e "$ENV_TYPE" "${EK[@]}" "${VE[@]}" "${E[@]}" \
+      "${A[@]}" --job-name "$1" -o "$JOBS" -k 1 -n 1 "${P[@]}" "${PASS[@]}"
   }
   if [ "$ATTEMPTS" -le 1 ] || [ "$PRINT_CONFIG" = 1 ]; then one "$name"; return; fi
   for k in $(seq 1 "$ATTEMPTS"); do
