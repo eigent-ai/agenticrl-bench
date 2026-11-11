@@ -1,0 +1,1 @@
+- [Terminal suite release gate](terminal-suite-release-gate.md) — constraints for editing /app/suite (public comparability) and status of the Nov 2026 fix pass
