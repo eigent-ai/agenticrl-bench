@@ -1,0 +1,1 @@
+- [Zero-pass RL insights](zero-pass-rl-insights.md) — FCR + hindsight re-contextualization + replay worked; format/loop drift pitfalls and fixes

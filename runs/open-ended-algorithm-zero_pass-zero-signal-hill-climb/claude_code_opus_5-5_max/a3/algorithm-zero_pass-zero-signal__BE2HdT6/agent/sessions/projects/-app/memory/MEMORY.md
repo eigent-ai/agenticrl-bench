@@ -1,0 +1,2 @@
+- [Zero-pass RL box learnings](zero-pass-rl-box.md) — FCR + hindsight stripping design, speedups, gotchas
+- [Zero-pass RL results](zero-pass-rl-results.md) — final KL-anchored recipe, checkpoint selection by eval, scores
