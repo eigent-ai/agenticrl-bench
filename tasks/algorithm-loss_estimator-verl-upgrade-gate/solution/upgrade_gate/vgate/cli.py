@@ -69,6 +69,8 @@ def compare(base, cand):
         by_kind = {}
         for key in b:
             kind = key[0]
+            if kind.endswith("_update_ulp"):
+                continue
             gb, gc = b[key], c[key]
             if gb.shape != gc.shape:
                 problems.append((name, f"shape mismatch for {key}"))
@@ -76,7 +78,10 @@ def compare(base, cand):
             if not torch.isfinite(gc).all():
                 problems.append((name, f"non-finite gradient for {kind}"))
                 break
-            d = (gb - gc).abs().max().item() if gb.numel() else 0.0
+            diff = (gb - gc).abs()
+            if (kind + "_ulp", key[1]) in b:
+                diff = (diff - b[(kind + "_ulp", key[1])]).clamp(min=0.0)
+            d = diff.max().item() if gb.numel() else 0.0
             m = gb.abs().max().item() if gb.numel() else 0.0
             acc = by_kind.setdefault(kind, [0.0, 0.0])
             acc[0] = max(acc[0], d)

@@ -386,7 +386,11 @@ def optimizer_job(job, rank, world, dp_group):
                 if gr is not None:
                     out[(f"{role}_optimizer_input_step{t}", i)] = gr.clone()
         for i, (p, p0) in enumerate(zip(model.parameters(), start)):
-            out[(f"{role}_update", i)] = (p.full_tensor().detach().double() - p0).flatten()
+            pf = p.full_tensor().detach()
+            out[(f"{role}_update", i)] = (pf.double() - p0).flatten()
+            # p_final is float32: a rounding-only change can move each element by one ulp of p_final per step
+            ulp = torch.nextafter(pf.abs(), torch.full_like(pf, math.inf)) - pf.abs()
+            out[(f"{role}_update_ulp", i)] = (ulp.double() * len(_OPT_PLAN)).flatten()
     return out if rank == 0 else {}
 def run_job(job, rank, world, dp_group):
     import torch.distributed as dist
