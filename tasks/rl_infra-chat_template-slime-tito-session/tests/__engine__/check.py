@@ -300,6 +300,14 @@ def check(tok, tb, records: list[dict], engine_log: list[dict], samples: dict[st
             lpf = np.zeros(len(toks), dtype=np.float64)
             lpf[start:] = lp
             rows.append({"ep": ep, "k": k, "toks": toks, "m": m, "lp": lpf, "sid": s.get("session_id")})
+    conv_eps = defaultdict(set)
+    for r in recs:
+        if r.get("sid") is not None:
+            conv_eps[r["conv"]].add(r["sid"])
+    for row in rows:
+        if isinstance(row["sid"], str) and row["sid"] in conv_eps and row["ep"] not in conv_eps[row["sid"]]:
+            bad("A", f"{row['ep']} row {row['k']} ({row['sid']}): returned by the finish of episode {row['ep']}, but "
+                     f"that agent's requests came in under episode {'/'.join(sorted(conv_eps[row['sid']]))}")
     trained_in = {}
     claimed = [np.zeros(len(r["toks"]), dtype=bool) for r in rows]
     def hits_of(g):
